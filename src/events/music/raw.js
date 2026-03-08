@@ -32,7 +32,7 @@ class RawEvent extends Event {
         // Update Riffy's voice state with error handling
         if (this.client.riffy) {
             try {
-                this.client.riffy.updateVoiceState(data);
+                await this.client.riffy.updateVoiceState(data);
             } catch (error) {
                 console.error(`[Music] Error updating voice state:`, error.message);
                 // Don't rethrow - this prevents the bot from crashing
