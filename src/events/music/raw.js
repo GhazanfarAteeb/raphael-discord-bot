@@ -15,34 +15,6 @@ class RawEvent extends Event {
 
   async run(data) {
     // Only handle voice state and voice server updates
-    if (
-      ![
-        GatewayDispatchEvents.VoiceStateUpdate,
-        GatewayDispatchEvents.VoiceServerUpdate,
-      ].includes(data.t)
-    ) {
-      return;
-    }
-    console.log(
-      `[RAW DEBUG] Caught ${data.t} for guild ${data.d?.guild_id}. Sending to Riffy!`,
-    );
-
-    // For VOICE_SERVER_UPDATE, check if endpoint exists
-    // Discord sometimes sends this without endpoint during region changes
-    // if (data.t === GatewayDispatchEvents.VoiceServerUpdate) {
-    //   if (!data.d?.endpoint) {
-    //     return;
-    //   }
-    // }
-
-    // Update Riffy's voice state with error handling
-    if (this.client.riffy) {
-      try {
-        await this.client.riffy.updateVoiceState(data);
-      } catch (error) {
-        console.error(`[Music] Error updating voice state:`, error.message);
-      }
-    }
   }
 }
 

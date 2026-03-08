@@ -159,6 +159,19 @@ class RiffyManager {
         console.log(`[RIFFY Debug] ${msg}`);
       }
     });
+
+    this.client.on("raw", (data) => {
+      if (!["VOICE_STATE_UPDATE", "VOICE_SERVER_UPDATE"].includes(data.t))
+        return;
+
+      console.log(
+        `[RAW DEBUG] Caught ${data.t} for guild ${data.d?.guild_id}. Sending to Riffy!`,
+      );
+
+      if (this.riffy) {
+        this.riffy.updateVoiceState(data);
+      }
+    });
   }
 
   /**
