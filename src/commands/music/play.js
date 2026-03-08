@@ -7,6 +7,26 @@ import Command from '../../structures/Command.js';
 import { EmbedBuilder } from 'discord.js';
 import { getRandomFooter } from '../../utils/raphael.js';
 
+/**
+ * Wait for a Riffy player's voice connection to be established.
+ * Polls player.connected with a timeout.
+ */
+function waitForConnection(player, timeout = 10000) {
+    return new Promise((resolve, reject) => {
+        if (player.connected) return resolve();
+        const start = Date.now();
+        const interval = setInterval(() => {
+            if (player.connected) {
+                clearInterval(interval);
+                resolve();
+            } else if (Date.now() - start > timeout) {
+                clearInterval(interval);
+                reject(new Error('Voice connection timed out'));
+            }
+        }, 100);
+    });
+}
+
 export default class Play extends Command {
     constructor(client) {
         super(client, {
@@ -122,7 +142,14 @@ export default class Play extends Command {
             await ctx.sendMessage({ embeds: [embed] });
 
             if (!player.playing && !player.paused) {
-                player.play();
+                try {
+                    await waitForConnection(player);
+                    player.play();
+                } catch (err) {
+                    return ctx.sendMessage({
+                        embeds: [{ color: 0xFF4757, title: '『 Audio System 』', description: '**Warning:** Failed to establish voice connection, Master. Please try again.' }]
+                    });
+                }
             }
 
         } else if (loadType === 'search' || loadType === 'track') {
@@ -158,7 +185,14 @@ export default class Play extends Command {
             await ctx.sendMessage({ embeds: [embed] });
 
             if (!player.playing && !player.paused) {
-                player.play();
+                try {
+                    await waitForConnection(player);
+                    player.play();
+                } catch (err) {
+                    return ctx.sendMessage({
+                        embeds: [{ color: 0xFF4757, title: '『 Audio System 』', description: '**Warning:** Failed to establish voice connection, Master. Please try again.' }]
+                    });
+                }
             }
         }
     }
