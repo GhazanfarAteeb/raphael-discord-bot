@@ -1,20 +1,28 @@
-import 'dotenv/config';
-import { Client, GatewayIntentBits, Partials, Collection, EmbedBuilder, ShardingManager, ShardEvents } from 'discord.js';
-import mongoose from 'mongoose';
+import "dotenv/config";
+import {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  Collection,
+  EmbedBuilder,
+  ShardingManager,
+  ShardEvents,
+} from "discord.js";
+import mongoose from "mongoose";
 // import { fileURLToPath } from 'url';
 // import { dirname, join } from 'path';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import { readdirSync } from 'fs';
-import { initializeSchedulers } from './utils/schedulers.js';
-import { setupGlobalErrorHandlers } from './utils/errorHandlers.js';
-import express from 'express';
-import Guild from './models/Guild.js';
-import logger from './utils/logger.js';
-import ServerData from './database/server.js';
-import Utils from './structures/Utils.js';
-import RiffyManager from './music/RiffyManager.js';
-import redis from './utils/redis.js';
+import path from "path";
+import { fileURLToPath } from "url";
+import { readdirSync } from "fs";
+import { initializeSchedulers } from "./utils/schedulers.js";
+import { setupGlobalErrorHandlers } from "./utils/errorHandlers.js";
+import express from "express";
+import Guild from "./models/Guild.js";
+import logger from "./utils/logger.js";
+import ServerData from "./database/server.js";
+import Utils from "./structures/Utils.js";
+import RiffyManager from "./music/RiffyManager.js";
+import redis from "./utils/redis.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -35,48 +43,48 @@ const client = new Client({
     GatewayIntentBits.GuildMessageReactions,
     GatewayIntentBits.GuildInvites,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildVoiceStates
+    GatewayIntentBits.GuildVoiceStates,
   ],
   partials: [
     Partials.Message,
     Partials.Channel,
     Partials.Reaction,
     Partials.User,
-    Partials.GuildMember
+    Partials.GuildMember,
   ],
   // WebSocket optimizations
   ws: {
     compress: true, // Enable compression for reduced bandwidth
-    large_threshold: 50 // Only request offline members for servers < 50 members
+    large_threshold: 50, // Only request offline members for servers < 50 members
   },
   sweepers: {
     // Sweep messages every 2 minutes to free memory (reduced for fresher data)
     messages: {
       interval: 120,
-      lifetime: 300
+      lifetime: 300,
     },
     // Sweep users every 10 minutes (reduced from 1 hour)
     users: {
       interval: 600,
-      filter: () => user => {
+      filter: () => (user) => {
         // Keep bot users and users in voice channels
         if (user.bot) return false;
-        return !client.guilds.cache.some(guild =>
-          guild.members.cache.get(user.id)?.voice?.channel
+        return !client.guilds.cache.some(
+          (guild) => guild.members.cache.get(user.id)?.voice?.channel,
         );
-      }
+      },
     },
     // Sweep guild members every 10 minutes
     guildMembers: {
       interval: 600,
-      filter: () => member => {
+      filter: () => (member) => {
         // Keep members in voice channels and recent interactions
         if (member.user.bot) return false;
         if (member.voice?.channel) return false;
         return true;
-      }
-    }
-  }
+      },
+    },
+  },
 });
 
 // Collections for commands and events
@@ -97,10 +105,8 @@ client.riffyManager = riffyManager;
 
 // Configuration
 client.config = {
-  logChannelId: process.env.LOG_CHANNEL_ID || null
+  logChannelId: process.env.LOG_CHANNEL_ID || null,
 };
-
-
 
 // Logger setup
 client.logger = logger;
@@ -108,10 +114,10 @@ client.logger = logger;
 // Add embed builder and colors
 client.embed = () => new EmbedBuilder();
 client.color = {
-  main: '#0099ff',
-  red: '#ff0000',
-  green: '#00ff00',
-  yellow: '#ffff00'
+  main: "#0099ff",
+  red: "#ff0000",
+  green: "#00ff00",
+  yellow: "#ffff00",
 };
 
 // Connect to MongoDB with optimized settings
@@ -123,16 +129,16 @@ async function connectDatabase() {
       minPoolSize: 2,
       serverSelectionTimeoutMS: 5000,
       socketTimeoutMS: 45000,
-      family: 4 // Use IPv4, skip trying IPv6
+      family: 4, // Use IPv4, skip trying IPv6
     });
     const duration = Date.now() - startTime;
-    logger.database('MongoDB connection established', true);
-    logger.performance('Database connection', duration);
-    console.log('[RAPHAEL] Database connection established.');
+    logger.database("MongoDB connection established", true);
+    logger.performance("Database connection", duration);
+    console.log("[RAPHAEL] Database connection established.");
   } catch (error) {
-    logger.database('MongoDB connection failed', false, error);
-    logger.error('MongoDB connection error', error);
-    console.error('[RAPHAEL] Database connection failure:', error);
+    logger.database("MongoDB connection failed", false, error);
+    logger.error("MongoDB connection error", error);
+    console.error("[RAPHAEL] Database connection failure:", error);
     process.exit(1);
   }
 }
@@ -143,59 +149,80 @@ async function connectRedis() {
     const connected = await redis.connect();
     if (connected) {
       client.redis = redis;
-      logger.startup('Redis cache initialized');
+      logger.startup("Redis cache initialized");
     } else {
-      console.log('[RAPHAEL] Redis unavailable, utilizing in-memory cache fallback.');
+      console.log(
+        "[RAPHAEL] Redis unavailable, utilizing in-memory cache fallback.",
+      );
     }
   } catch (error) {
-    console.log('[RAPHAEL] Redis connection failure, utilizing in-memory cache fallback.');
-    logger.error('Redis connection error', error);
+    console.log(
+      "[RAPHAEL] Redis connection failure, utilizing in-memory cache fallback.",
+    );
+    logger.error("Redis connection error", error);
   }
 }
 
 // Load commands in parallel for faster startup
 async function loadCommands() {
-  const commandFolders = readdirSync(path.join(__dirname, 'commands'));
+  const commandFolders = readdirSync(path.join(__dirname, "commands"));
   let totalCommands = 0;
 
   // Load all commands in parallel
   const commandPromises = [];
 
   for (const folder of commandFolders) {
-    const commandFiles = readdirSync(path.join(__dirname, 'commands', folder))
-      .filter(file => file.endsWith('.js'));
+    const commandFiles = readdirSync(
+      path.join(__dirname, "commands", folder),
+    ).filter((file) => file.endsWith(".js"));
 
     for (const file of commandFiles) {
       commandPromises.push(
         import(`./commands/${folder}/${file}`)
           .then(({ default: CommandClass }) => {
             // Check if it's a Wave-Music Command class (needs instantiation)
-            if (typeof CommandClass === 'function' && CommandClass.prototype.run) {
+            if (
+              typeof CommandClass === "function" &&
+              CommandClass.prototype.run
+            ) {
               const commandInstance = new CommandClass(client);
               if (commandInstance.name) {
                 client.commands.set(commandInstance.name, commandInstance);
-                if (commandInstance.aliases && Array.isArray(commandInstance.aliases)) {
-                  commandInstance.aliases.forEach(alias => client.aliases.set(alias, commandInstance.name));
+                if (
+                  commandInstance.aliases &&
+                  Array.isArray(commandInstance.aliases)
+                ) {
+                  commandInstance.aliases.forEach((alias) =>
+                    client.aliases.set(alias, commandInstance.name),
+                  );
                 }
-                console.log(`[RAPHAEL] Command loaded: ${commandInstance.name}`);
+                console.log(
+                  `[RAPHAEL] Command loaded: ${commandInstance.name}`,
+                );
                 return 1;
               }
             }
             // Legacy command object format (plain object with execute method)
-            else if (CommandClass && CommandClass.name && CommandClass.execute) {
+            else if (
+              CommandClass &&
+              CommandClass.name &&
+              CommandClass.execute
+            ) {
               client.commands.set(CommandClass.name, CommandClass);
               if (CommandClass.aliases && Array.isArray(CommandClass.aliases)) {
-                CommandClass.aliases.forEach(alias => client.aliases.set(alias, CommandClass.name));
+                CommandClass.aliases.forEach((alias) =>
+                  client.aliases.set(alias, CommandClass.name),
+                );
               }
               console.log(`[RAPHAEL] Command loaded: ${CommandClass.name}`);
               return 1;
             }
             return 0;
           })
-          .catch(error => {
+          .catch((error) => {
             logger.error(`Failed to load command ${file}`, error);
             return 0;
-          })
+          }),
       );
     }
   }
@@ -213,15 +240,23 @@ async function loadEvents() {
   let totalEvents = 0;
 
   // Skip these files - they are initialized separately or called from schedulers
-  const skipFiles = ['antiNuke.js', 'messageLogging.js', 'reminderHandler.js', 'voiceLogging.js', 'memberLogging.js', 'serverLogging.js'];
+  const skipFiles = [
+    "antiNuke.js",
+    "messageLogging.js",
+    "reminderHandler.js",
+    "voiceLogging.js",
+    "memberLogging.js",
+    "serverLogging.js",
+  ];
 
   for (const dir of eventsPath) {
     // Skip music events - they are loaded separately
-    if (dir === 'music') continue;
+    if (dir === "music") continue;
 
     try {
-      const events = readdirSync(path.join(__dirname, `./events/${dir}`))
-        .filter((file) => file.endsWith(".js"));
+      const events = readdirSync(
+        path.join(__dirname, `./events/${dir}`),
+      ).filter((file) => file.endsWith(".js"));
 
       for (const file of events) {
         // Skip special files that are initialized separately
@@ -238,12 +273,12 @@ async function loadEvents() {
           // Handle both Event class format and plain object format
           let evt, eventName, eventHandler;
 
-          if (typeof EventClass === 'function') {
+          if (typeof EventClass === "function") {
             // Event class format (player events)
             evt = new EventClass(client, file);
             eventName = evt.name;
             eventHandler = (...args) => evt.run(...args);
-          } else if (typeof EventClass === 'object' && EventClass.execute) {
+          } else if (typeof EventClass === "object" && EventClass.execute) {
             // Plain object format (client events)
             eventName = EventClass.name;
             eventHandler = (...args) => EventClass.execute(...args, client);
@@ -275,7 +310,9 @@ async function loadMusicEvents() {
   let totalMusicEvents = 0;
 
   try {
-    const events = readdirSync(musicEventsPath).filter((file) => file.endsWith(".js"));
+    const events = readdirSync(musicEventsPath).filter((file) =>
+      file.endsWith(".js"),
+    );
 
     for (const file of events) {
       try {
@@ -283,7 +320,7 @@ async function loadMusicEvents() {
         const EventModule = await import(`./events/music/${file}`);
         const EventClass = EventModule.default || EventModule;
 
-        if (typeof EventClass === 'function') {
+        if (typeof EventClass === "function") {
           const evt = new EventClass(client, file);
           const eventName = evt.name;
           const eventHandler = (...args) => evt.run(...args);
@@ -298,8 +335,8 @@ async function loadMusicEvents() {
       }
     }
   } catch (error) {
-    console.error('Error reading music events directory:', error);
-    logger.error('Failed to read music events directory', error);
+    console.error("Error reading music events directory:", error);
+    logger.error("Failed to read music events directory", error);
   }
 
   logger.startup(`Loaded ${totalMusicEvents} music events`);
@@ -309,11 +346,11 @@ async function loadMusicEvents() {
 // Initialize bot
 async function initialize() {
   const startTime = Date.now();
-  logger.startup('Starting RAPHAEL...');
-  logger.build('Bot version: 2.1.0');
-  logger.build('Node version: ' + process.version);
-  logger.build('Environment: ' + (process.env.NODE_ENV || 'production'));
-  console.log('[RAPHAEL] Initiating system startup...');
+  logger.startup("Starting RAPHAEL...");
+  logger.build("Bot version: 2.1.0");
+  logger.build("Node version: " + process.version);
+  logger.build("Environment: " + (process.env.NODE_ENV || "production"));
+  console.log("[RAPHAEL] Initiating system startup...");
 
   await connectDatabase();
   await connectRedis();
@@ -323,12 +360,12 @@ async function initialize() {
   await client.login(process.env.DISCORD_TOKEN);
 
   const duration = Date.now() - startTime;
-  logger.performance('Bot initialization', duration);
+  logger.performance("Bot initialization", duration);
   logger.startup(`Bot started successfully in ${duration}ms`);
 
   // Initialize events after client is ready
-  client.once('clientReady', async () => {
-    console.log('[RAPHAEL] Client connection established.');
+  client.once("ready", async () => {
+    console.log("[RAPHAEL] Client connection established.");
     console.log(`   Logged in as: ${client.user.tag}`);
     console.log(`   Guilds: ${client.guilds.cache.size}`);
     console.log(`   WS Status: ${client.ws.status}, Ping: ${client.ws.ping}ms`);
@@ -337,10 +374,13 @@ async function initialize() {
     try {
       riffyManager.initialize();
       riffyManager.initializePlayer();
-      console.log('[RAPHAEL] Audio subsystem initialized.');
+      console.log("[RAPHAEL] Audio subsystem initialized.");
     } catch (error) {
-      logger.error('Failed to initialize music system:', error);
-      console.error('[RAPHAEL] Audio subsystem initialization failure:', error.message);
+      logger.error("Failed to initialize music system:", error);
+      console.error(
+        "[RAPHAEL] Audio subsystem initialization failure:",
+        error.message,
+      );
     }
 
     // Load event handlers
@@ -362,9 +402,11 @@ async function initialize() {
     startStatusMonitoring();
 
     // Send initial online message
-    notifyStatusChange('online');
+    notifyStatusChange("online");
 
-    console.log('[RAPHAEL] All systems operational. Awaiting commands, Master.');
+    console.log(
+      "[RAPHAEL] All systems operational. Awaiting commands, Master.",
+    );
   });
 }
 
@@ -372,78 +414,81 @@ async function initialize() {
 async function initializeSecuritySystems(client) {
   try {
     // Initialize anti-nuke
-    const antiNuke = await import('./events/client/antiNuke.js');
+    const antiNuke = await import("./events/client/antiNuke.js");
     if (antiNuke.default?.initialize) {
       await antiNuke.default.initialize(client);
     }
 
     // Initialize message logging
-    const messageLogging = await import('./events/client/messageLogging.js');
+    const messageLogging = await import("./events/client/messageLogging.js");
     if (messageLogging.default?.initialize) {
       await messageLogging.default.initialize(client);
     }
 
     // Initialize voice logging
-    const voiceLogging = await import('./events/client/voiceLogging.js');
+    const voiceLogging = await import("./events/client/voiceLogging.js");
     if (voiceLogging.default?.initialize) {
       await voiceLogging.default.initialize(client);
     }
 
     // Initialize member logging
-    const memberLogging = await import('./events/client/memberLogging.js');
+    const memberLogging = await import("./events/client/memberLogging.js");
     if (memberLogging.default?.initialize) {
       await memberLogging.default.initialize(client);
     }
 
     // Initialize server logging
-    const serverLogging = await import('./events/client/serverLogging.js');
+    const serverLogging = await import("./events/client/serverLogging.js");
     if (serverLogging.default?.initialize) {
       await serverLogging.default.initialize(client);
     }
 
-    console.log('[RAPHAEL] Security and logging subsystems initialized.');
+    console.log("[RAPHAEL] Security and logging subsystems initialized.");
   } catch (error) {
-    console.error('[RAPHAEL] Security systems initialization failure:', error);
-    logger.error('Failed to initialize security systems', error);
+    console.error("[RAPHAEL] Security systems initialization failure:", error);
+    logger.error("Failed to initialize security systems", error);
   }
 }
 
 // Register slash commands
 async function registerSlashCommandsOnReady(client) {
   try {
-    const { registerSlashCommands, clearGuildSlashCommands } = await import('./utils/slashCommands.js');
+    const { registerSlashCommands, clearGuildSlashCommands } =
+      await import("./utils/slashCommands.js");
 
     // Clear guild-specific commands to remove duplicates (one-time cleanup)
-    console.log('[RAPHAEL] Clearing guild-specific commands...');
+    console.log("[RAPHAEL] Clearing guild-specific commands...");
     for (const guild of client.guilds.cache.values()) {
       await clearGuildSlashCommands(client, guild.id);
     }
 
     // Register globally only
     const commandCount = await registerSlashCommands(client);
-    console.log(`[RAPHAEL] Slash commands registered globally: ${commandCount}`);
+    console.log(
+      `[RAPHAEL] Slash commands registered globally: ${commandCount}`,
+    );
   } catch (error) {
-    console.error('[RAPHAEL] Slash command registration failure:', error);
-    logger.error('Failed to register slash commands', error);
+    console.error("[RAPHAEL] Slash command registration failure:", error);
+    logger.error("Failed to register slash commands", error);
   }
 }
 
 // Error handling
-process.on('unhandledRejection', error => {
-  logger.error('Unhandled promise rejection', error);
-  console.error('Unhandled promise rejection:', error);
+process.on("unhandledRejection", (error) => {
+  logger.error("Unhandled promise rejection", error);
+  console.error("Unhandled promise rejection:", error);
 });
 
-process.on('uncaughtException', error => {
-  logger.error('Uncaught exception', error);
-  console.error('Uncaught exception:', error);
+process.on("uncaughtException", (error) => {
+  logger.error("Uncaught exception", error);
+  console.error("Uncaught exception:", error);
   process.exit(1);
 });
 
 // Graceful shutdown
-process.on('SIGINT', async () => {
-  console.log('\n🛑 Shutting down gracefully...');
-  logger.info('Bot shutting down (SIGINT)');
+process.on("SIGINT", async () => {
+  console.log("\n🛑 Shutting down gracefully...");
+  logger.info("Bot shutting down (SIGINT)");
 
   // Stop Spotify token refresh
   // spotifyTokenManager.stop();
@@ -454,13 +499,13 @@ process.on('SIGINT', async () => {
   // Close database connection
   await mongoose.connection.close();
 
-  console.log('[RAPHAEL] Shutdown sequence complete.');
+  console.log("[RAPHAEL] Shutdown sequence complete.");
   process.exit(0);
 });
 
-process.on('SIGTERM', async () => {
-  console.log('\n[RAPHAEL] Initiating graceful shutdown...');
-  logger.info('Bot shutting down (SIGTERM)');
+process.on("SIGTERM", async () => {
+  console.log("\n[RAPHAEL] Initiating graceful shutdown...");
+  logger.info("Bot shutting down (SIGTERM)");
 
   // Stop Spotify token refresh
   // spotifyTokenManager.stop();
@@ -471,49 +516,52 @@ process.on('SIGTERM', async () => {
   // Close database connection
   await mongoose.connection.close();
 
-  console.log('[RAPHAEL] Shutdown sequence complete.');
+  console.log("[RAPHAEL] Shutdown sequence complete.");
   process.exit(0);
 });
 
 // Health check endpoint
-app.get('/health', (req, res) => {
+app.get("/health", (req, res) => {
   const uptime = process.uptime();
   const status = {
-    status: 'online',
+    status: "online",
     uptime: Math.floor(uptime),
     uptimeFormatted: formatUptime(uptime),
     timestamp: new Date().toISOString(),
     bot: {
       ready: client.readyAt ? true : false,
       guilds: client.guilds.cache.size,
-      users: client.guilds.cache.reduce((acc, guild) => acc + guild.memberCount, 0),
-      ping: client.ws.ping
+      users: client.guilds.cache.reduce(
+        (acc, guild) => acc + guild.memberCount,
+        0,
+      ),
+      ping: client.ws.ping,
     },
     database: {
-      connected: mongoose.connection.readyState === 1
-    }
+      connected: mongoose.connection.readyState === 1,
+    },
   };
 
   res.json(status);
 });
 
 // Root endpoint
-app.get('/', (req, res) => {
+app.get("/", (req, res) => {
   res.json({
-    name: 'RAPHAEL',
-    version: '2.1.0',
-    status: 'running',
-    message: 'Bot is online and operational',
+    name: "RAPHAEL",
+    version: "2.1.0",
+    status: "running",
+    message: "Bot is online and operational",
     endpoints: {
-      health: '/health',
-      commands: '/commands'
-    }
+      health: "/health",
+      commands: "/commands",
+    },
   });
 });
 
 // Commands page endpoint
-app.get('/commands', (req, res) => {
-  res.sendFile(path.join(__dirname, '../docs/commands.html'));
+app.get("/commands", (req, res) => {
+  res.sendFile(path.join(__dirname, "../docs/commands.html"));
 });
 
 function formatUptime(seconds) {
@@ -528,7 +576,7 @@ function formatUptime(seconds) {
   if (minutes > 0) parts.push(`${minutes}m`);
   if (secs > 0) parts.push(`${secs}s`);
 
-  return parts.join(' ') || '0s';
+  return parts.join(" ") || "0s";
 }
 
 // Start Express server
@@ -537,12 +585,12 @@ app.listen(PORT, () => {
 });
 
 // Monitor bot status and send updates
-let lastStatus = 'online';
+let lastStatus = "online";
 let statusCheckInterval;
 
 function startStatusMonitoring() {
   statusCheckInterval = setInterval(async () => {
-    const currentStatus = client.ws.status === 0 ? 'online' : 'offline';
+    const currentStatus = client.ws.status === 0 ? "online" : "offline";
 
     if (currentStatus !== lastStatus) {
       lastStatus = currentStatus;
@@ -555,35 +603,48 @@ async function notifyStatusChange(status) {
   logger.event(`Bot status changed to ${status}`);
 
   try {
-    const guilds = await Guild.find({ 'channels.botStatus': { $exists: true, $ne: null } });
+    const guilds = await Guild.find({
+      "channels.botStatus": { $exists: true, $ne: null },
+    });
 
     for (const guildConfig of guilds) {
       try {
         const guild = client.guilds.cache.get(guildConfig.guildId);
         if (!guild) continue;
 
-        const channel = guild.channels.cache.get(guildConfig.channels.botStatus);
+        const channel = guild.channels.cache.get(
+          guildConfig.channels.botStatus,
+        );
         if (!channel) continue;
 
         const embed = new EmbedBuilder()
           .setTitle(`『 System Status Update 』`)
-          .setDescription(status === 'online'
-            ? '**Confirmed:** All systems online and operational, Master.'
-            : '**Warning:** System offline. Initiating reconnection protocol...')
-          .setColor(status === 'online' ? '#00FF7F' : '#ff4757')
+          .setDescription(
+            status === "online"
+              ? "**Confirmed:** All systems online and operational, Master."
+              : "**Warning:** System offline. Initiating reconnection protocol...",
+          )
+          .setColor(status === "online" ? "#00FF7F" : "#ff4757")
           .addFields(
-            { name: '▸ Status', value: status.toUpperCase(), inline: true },
-            { name: '▸ Timestamp', value: `<t:${Math.floor(Date.now() / 1000)}:F>`, inline: true }
+            { name: "▸ Status", value: status.toUpperCase(), inline: true },
+            {
+              name: "▸ Timestamp",
+              value: `<t:${Math.floor(Date.now() / 1000)}:F>`,
+              inline: true,
+            },
           )
           .setTimestamp();
 
         await channel.send({ embeds: [embed] });
       } catch (error) {
-        console.error(`Error sending status update to guild ${guildConfig.guildId}:`, error);
+        console.error(
+          `Error sending status update to guild ${guildConfig.guildId}:`,
+          error,
+        );
       }
     }
   } catch (error) {
-    console.error('Error notifying status change:', error);
+    console.error("Error notifying status change:", error);
   }
 }
 
