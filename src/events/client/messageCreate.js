@@ -82,8 +82,12 @@ class MessageCreate extends Event {
       return;
     }
 
-    if (guildConfig?.commandChannels?.enabled && command.category !== 'config') {
-      const isAllowedChannel = guildConfig.commandChannels.channels.includes(message.channel.id);
+    // Only channels that still exist count: if every allowed channel was deleted, the
+    // restriction is skipped instead of blocking all non-config commands server-wide
+    const allowedChannels = (guildConfig?.commandChannels?.channels || [])
+      .filter(id => message.guild.channels.cache.has(id));
+    if (guildConfig?.commandChannels?.enabled && allowedChannels.length > 0 && command.category !== 'config') {
+      const isAllowedChannel = allowedChannels.includes(message.channel.id);
       const hasBypassRole = guildConfig.commandChannels.bypassRoles?.some(roleId =>
         message.member.roles.cache.has(roleId)
       );
@@ -94,12 +98,12 @@ class MessageCreate extends Event {
       if (!isAllowedChannel && !hasBypassRole && !isMusicCommandInVoice) {
         // Silently ignore commands in non-allowed channels
         // Or optionally send a warning (delete after 5 seconds)
-        const allowedChannelsList = guildConfig.commandChannels.channels
+        const allowedChannelsList = allowedChannels
           .slice(0, 3)
           .map(id => `<#${id}>`)
           .join(', ');
         const msg = await safeReply({
-          content: `**Notice:** Commands are restricted to designated channels: ${allowedChannelsList}${guildConfig.commandChannels.channels.length > 3 ? '...' : ''}`
+          content: `**Notice:** Commands are restricted to designated channels: ${allowedChannelsList}${allowedChannels.length > 3 ? '...' : ''}`
         });
         if (msg) setTimeout(() => msg.delete().catch(() => { }), 5000);
         return;
@@ -202,9 +206,9 @@ class MessageCreate extends Event {
           });
       }
       if (command.player.dj) {
-        const dj = this.client.db.getDj(message.guildId);
+        const dj = await this.client.db.getDj(message.guildId);
         if (dj && dj.mode) {
-          const djRole = this.client.db.getRoles(message.guildId);
+          const djRole = await this.client.db.getRoles(message.guildId);
           if (!djRole)
             return await safeReply({
               content: "**Warning:** DJ role has not been configured.",
@@ -242,11 +246,13 @@ class MessageCreate extends Event {
         return await safeReply({ embeds: [embed] });
       }
     }
-    if (!this.client.cooldowns.has(cmd)) {
-      this.client.cooldowns.set(cmd, new Collection());
+    // Keyed by command name, not the alias typed: otherwise !bj, !21 and !blackjack
+    // each had their own cooldown
+    if (!this.client.cooldowns.has(command.name)) {
+      this.client.cooldowns.set(command.name, new Collection());
     }
     const now = Date.now();
-    const timestamps = this.client.cooldowns.get(cmd);
+    const timestamps = this.client.cooldowns.get(command.name);
     const cooldownAmount = Math.floor(command.cooldown || 10) * 1000;
     if (!timestamps.has(message.author.id)) {
       timestamps.set(message.author.id, now);

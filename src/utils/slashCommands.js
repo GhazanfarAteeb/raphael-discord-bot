@@ -1,10 +1,41 @@
-import { REST, Routes, SlashCommandBuilder, PermissionFlagsBits } from 'discord.js';
-import { readdirSync } from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import { REST, Routes, SlashCommandBuilder, PermissionFlagsBits, ChannelType } from 'discord.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// Channel types an option accepts, so the picker only offers channels its handler can use
+const TEXT_CHANNELS = [ChannelType.GuildText];
+const POSTABLE_CHANNELS = [ChannelType.GuildText, ChannelType.GuildAnnouncement];
+const ANNOUNCEMENT_CHANNELS = [ChannelType.GuildAnnouncement];
+// Anywhere members send messages (voice and stage channels have a text chat; threads have their own ID)
+const MESSAGE_CHANNELS = [
+  ChannelType.GuildText, ChannelType.GuildAnnouncement, ChannelType.GuildVoice, ChannelType.GuildStageVoice,
+  ChannelType.PublicThread, ChannelType.PrivateThread, ChannelType.AnnouncementThread
+];
+const ONBOARDING_CHANNELS = [
+  ChannelType.GuildText, ChannelType.GuildAnnouncement, ChannelType.GuildVoice,
+  ChannelType.GuildStageVoice, ChannelType.GuildForum, ChannelType.GuildMedia
+];
+
+// Text limits that keep the values inside Discord's embed and audit-log limits once stored and shown
+const REASON_MAX = 500;
+const AUDIT_REASON_MAX = 400; // lockdown prefixes its reason before writing the 512-character audit log entry
+const MESSAGE_TEXT_MAX = 1500;
+const RULE_TEXT_MAX = 500; // rules are listed together in one embed description
+const TITLE_MAX = 200;
+const COMMAND_NAME_MAX = 32;
+
+// /logs types: the keys of LOG_TYPES in the prefix setlogs command (src/commands/config/logs.js)
+const LOG_TYPE_CHOICES = [
+  { name: 'Moderation logs', value: 'mod' },
+  { name: 'Message logs', value: 'message' },
+  { name: 'Voice logs', value: 'voice' },
+  { name: 'Member logs (roles, nicknames, bans)', value: 'member' },
+  { name: 'Server logs', value: 'server' },
+  { name: 'Join logs', value: 'join' },
+  { name: 'Leave logs', value: 'leave' },
+  { name: 'Verification logs', value: 'verification' },
+  { name: 'Alert logs', value: 'alert' },
+  { name: 'Ticket logs', value: 'ticket' },
+  { name: 'Bot status notices', value: 'botstatus' }
+];
 
 // Define slash commands for moderation
 const slashCommands = [
@@ -19,19 +50,22 @@ const slashCommands = [
         .setDescription('Select a specific category to view')
         .setRequired(false)
         .addChoices(
-          { name: '🛡️ Moderation', value: 'moderation' },
-          { name: '⚙️ Configuration', value: 'config' },
-          { name: '💰 Economy', value: 'economy' },
-          { name: '📊 Leveling', value: 'leveling' },
-          { name: '🎂 Community', value: 'community' },
-          { name: '🎵 Music', value: 'music' },
-          { name: '🔧 Utility', value: 'utility' },
-          { name: '👑 Admin', value: 'admin' }
+          { name: 'Moderation', value: 'moderation' },
+          { name: 'Configuration', value: 'config' },
+          { name: 'Admin', value: 'admin' },
+          { name: 'Economy', value: 'economy' },
+          { name: 'Community', value: 'community' },
+          { name: 'Social', value: 'social' },
+          { name: 'Fun', value: 'fun' },
+          { name: 'Music', value: 'music' },
+          { name: 'Utility', value: 'utility' },
+          { name: 'Info', value: 'info' }
         ))
     .addStringOption(option =>
       option.setName('command')
         .setDescription('Get detailed help for a specific command')
-        .setRequired(false)),
+        .setRequired(false)
+        .setMaxLength(COMMAND_NAME_MAX)),
 
   // Moderation Commands
   new SlashCommandBuilder()
@@ -44,7 +78,8 @@ const slashCommands = [
     .addStringOption(option =>
       option.setName('reason')
         .setDescription('Reason for the ban')
-        .setRequired(false))
+        .setRequired(false)
+        .setMaxLength(REASON_MAX))
     .addBooleanOption(option =>
       option.setName('delete_messages')
         .setDescription('Delete messages from this user (last 24h)')
@@ -61,7 +96,8 @@ const slashCommands = [
     .addStringOption(option =>
       option.setName('reason')
         .setDescription('Reason for the kick')
-        .setRequired(false))
+        .setRequired(false)
+        .setMaxLength(REASON_MAX))
     .setDefaultMemberPermissions(PermissionFlagsBits.KickMembers),
 
   new SlashCommandBuilder()
@@ -74,7 +110,8 @@ const slashCommands = [
     .addStringOption(option =>
       option.setName('reason')
         .setDescription('Reason for the warning')
-        .setRequired(false))
+        .setRequired(false)
+        .setMaxLength(REASON_MAX))
     .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
 
   new SlashCommandBuilder()
@@ -103,7 +140,8 @@ const slashCommands = [
     .addStringOption(option =>
       option.setName('reason')
         .setDescription('Reason for the timeout')
-        .setRequired(false))
+        .setRequired(false)
+        .setMaxLength(REASON_MAX))
     .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
 
   new SlashCommandBuilder()
@@ -140,7 +178,8 @@ const slashCommands = [
     .addStringOption(option =>
       option.setName('reason')
         .setDescription('Reason for removing the timeout')
-        .setRequired(false))
+        .setRequired(false)
+        .setMaxLength(REASON_MAX))
     .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
 
   new SlashCommandBuilder()
@@ -155,7 +194,8 @@ const slashCommands = [
         .addChannelOption(option =>
           option.setName('channel')
             .setDescription('Channel to send the panel to')
-            .setRequired(false)))
+            .setRequired(false)
+            .addChannelTypes(POSTABLE_CHANNELS)))
     .addSubcommand(subcommand =>
       subcommand.setName('manual')
         .setDescription('Manually verify a user')
@@ -192,7 +232,8 @@ const slashCommands = [
         .addChannelOption(option =>
           option.setName('channel')
             .setDescription('The channel for verification')
-            .setRequired(true)))
+            .setRequired(true)
+            .addChannelTypes(POSTABLE_CHANNELS)))
     .addSubcommand(subcommand =>
       subcommand.setName('settype')
         .setDescription('Set the verification type')
@@ -222,14 +263,21 @@ const slashCommands = [
         .addChannelOption(option =>
           option.setName('channel')
             .setDescription('The channel to allow commands in')
-            .setRequired(true)))
+            .setRequired(true)
+            .addChannelTypes(MESSAGE_CHANNELS)))
     .addSubcommand(subcommand =>
       subcommand.setName('remove')
         .setDescription('Remove an allowed channel')
         .addChannelOption(option =>
           option.setName('channel')
             .setDescription('The channel to remove from allowed list')
-            .setRequired(true)))
+            .setRequired(false)
+            .addChannelTypes(MESSAGE_CHANNELS))
+        .addStringOption(option =>
+          option.setName('channel_id')
+            .setDescription('ID of a deleted channel to remove from the list')
+            .setRequired(false)
+            .setMaxLength(25)))
     .addSubcommand(subcommand =>
       subcommand.setName('bypass')
         .setDescription('Add a role that bypasses channel restrictions')
@@ -260,14 +308,12 @@ const slashCommands = [
           option.setName('type')
             .setDescription('Type of log to enable')
             .setRequired(true)
-            .addChoices(
-              { name: 'All logs', value: 'all' },
-              { name: 'Message logs', value: 'message' },
-              { name: 'Member logs', value: 'member' },
-              { name: 'Voice logs', value: 'voice' },
-              { name: 'Moderation logs', value: 'moderation' },
-              { name: 'Server logs', value: 'server' }
-            )))
+            .addChoices({ name: 'All logs', value: 'all' }, ...LOG_TYPE_CHOICES))
+        .addChannelOption(option =>
+          option.setName('channel')
+            .setDescription('Channel for these logs (required if none is set yet)')
+            .setRequired(false)
+            .addChannelTypes(TEXT_CHANNELS)))
     .addSubcommand(subcommand =>
       subcommand.setName('disable')
         .setDescription('Disable a log type')
@@ -275,14 +321,7 @@ const slashCommands = [
           option.setName('type')
             .setDescription('Type of log to disable')
             .setRequired(true)
-            .addChoices(
-              { name: 'All logs', value: 'all' },
-              { name: 'Message logs', value: 'message' },
-              { name: 'Member logs', value: 'member' },
-              { name: 'Voice logs', value: 'voice' },
-              { name: 'Moderation logs', value: 'moderation' },
-              { name: 'Server logs', value: 'server' }
-            )))
+            .addChoices({ name: 'All logs', value: 'all' }, ...LOG_TYPE_CHOICES)))
     .addSubcommand(subcommand =>
       subcommand.setName('channel')
         .setDescription('Set log channel')
@@ -290,17 +329,12 @@ const slashCommands = [
           option.setName('type')
             .setDescription('Type of log')
             .setRequired(true)
-            .addChoices(
-              { name: 'Message logs', value: 'message' },
-              { name: 'Member logs', value: 'member' },
-              { name: 'Voice logs', value: 'voice' },
-              { name: 'Moderation logs', value: 'moderation' },
-              { name: 'Server logs', value: 'server' }
-            ))
+            .addChoices(...LOG_TYPE_CHOICES))
         .addChannelOption(option =>
           option.setName('channel')
             .setDescription('The channel for logs')
-            .setRequired(true)))
+            .setRequired(true)
+            .addChannelTypes(TEXT_CHANNELS)))
     .addSubcommand(subcommand =>
       subcommand.setName('status')
         .setDescription('View current logging settings'))
@@ -350,14 +384,16 @@ const slashCommands = [
         .addChannelOption(option =>
           option.setName('channel')
             .setDescription('The channel to blacklist')
-            .setRequired(true)))
+            .setRequired(true)
+            .addChannelTypes(TEXT_CHANNELS)))
     .addSubcommand(subcommand =>
       subcommand.setName('remove')
         .setDescription('Remove a channel from the blacklist')
         .addChannelOption(option =>
           option.setName('channel')
             .setDescription('The channel to remove')
-            .setRequired(true)))
+            .setRequired(true)
+            .addChannelTypes(TEXT_CHANNELS)))
     .addSubcommand(subcommand =>
       subcommand.setName('list')
         .setDescription('View all blacklisted channels'))
@@ -471,14 +507,16 @@ const slashCommands = [
         .addChannelOption(option =>
           option.setName('channel')
             .setDescription('The channel to ignore')
-            .setRequired(true)))
+            .setRequired(true)
+            .addChannelTypes(MESSAGE_CHANNELS)))
     .addSubcommand(subcommand =>
       subcommand.setName('ignore-remove-channel')
         .setDescription('Remove a channel from automod ignore list')
         .addChannelOption(option =>
           option.setName('channel')
             .setDescription('The channel to stop ignoring')
-            .setRequired(true)))
+            .setRequired(true)
+            .addChannelTypes(MESSAGE_CHANNELS)))
     .addSubcommand(subcommand =>
       subcommand.setName('ignore-add-role')
         .setDescription('Add a role to automod bypass list')
@@ -530,7 +568,8 @@ const slashCommands = [
     .addStringOption(option =>
       option.setName('reason')
         .setDescription('Reason for lockdown')
-        .setRequired(false))
+        .setRequired(false)
+        .setMaxLength(AUDIT_REASON_MAX))
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   // Set Role Command  
@@ -573,7 +612,8 @@ const slashCommands = [
     .addChannelOption(option =>
       option.setName('channel')
         .setDescription('The channel to set')
-        .setRequired(true))
+        .setRequired(true)
+        .addChannelTypes(POSTABLE_CHANNELS))
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   // Slash Command Management
@@ -586,14 +626,16 @@ const slashCommands = [
         .addStringOption(option =>
           option.setName('command')
             .setDescription('Command to enable')
-            .setRequired(true)))
+            .setRequired(true)
+            .setMaxLength(COMMAND_NAME_MAX)))
     .addSubcommand(subcommand =>
       subcommand.setName('disable')
         .setDescription('Disable a slash command')
         .addStringOption(option =>
           option.setName('command')
             .setDescription('Command to disable')
-            .setRequired(true)))
+            .setRequired(true)
+            .setMaxLength(COMMAND_NAME_MAX)))
     .addSubcommand(subcommand =>
       subcommand.setName('list')
         .setDescription('List all slash commands and their status'))
@@ -703,7 +745,8 @@ const slashCommands = [
         .addChannelOption(option =>
           option.setName('channel')
             .setDescription('Channel for birthday announcements')
-            .setRequired(true)))
+            .setRequired(true)
+            .addChannelTypes(POSTABLE_CHANNELS)))
     .addSubcommand(subcommand =>
       subcommand.setName('role')
         .setDescription('Set the birthday role to assign')
@@ -717,7 +760,8 @@ const slashCommands = [
         .addStringOption(option =>
           option.setName('message')
             .setDescription('Custom message ({user} = mention, {username} = name, {age} = age)')
-            .setRequired(true)))
+            .setRequired(true)
+            .setMaxLength(MESSAGE_TEXT_MAX)))
     .addSubcommand(subcommand =>
       subcommand.setName('enable')
         .setDescription('Enable the birthday system'))
@@ -794,7 +838,8 @@ const slashCommands = [
         .addStringOption(option =>
           option.setName('name')
             .setDescription('Background name')
-            .setRequired(true))
+            .setRequired(true)
+            .setMaxLength(100))
         .addIntegerOption(option =>
           option.setName('price')
             .setDescription('Background price')
@@ -802,12 +847,14 @@ const slashCommands = [
             .setMinValue(0))
         .addStringOption(option =>
           option.setName('image')
-            .setDescription('Background image URL')
-            .setRequired(true))
+            .setDescription('Background image URL (http or https)')
+            .setRequired(true)
+            .setMaxLength(1000))
         .addStringOption(option =>
           option.setName('description')
             .setDescription('Background description')
-            .setRequired(false)))
+            .setRequired(false)
+            .setMaxLength(500)))
     .addSubcommand(subcommand =>
       subcommand.setName('remove')
         .setDescription('Remove an item from the shop')
@@ -848,8 +895,9 @@ const slashCommands = [
             ))
         .addStringOption(option =>
           option.setName('value')
-            .setDescription('New value')
-            .setRequired(true)))
+            .setDescription('New value (name: 100, description: 500 characters; image: http or https URL)')
+            .setRequired(true)
+            .setMaxLength(1000)))
     .addSubcommand(subcommand =>
       subcommand.setName('stock')
         .setDescription('Set stock amount')
@@ -877,7 +925,8 @@ const slashCommands = [
         .addStringOption(option =>
           option.setName('value')
             .setDescription('URL or hex color (e.g., #FF0000)')
-            .setRequired(false)))
+            .setRequired(false)
+            .setMaxLength(1000)))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
   // Feature Management (Enable/Disable commands and features)
@@ -890,44 +939,47 @@ const slashCommands = [
         .setRequired(true)
         .addChoices(
           // Economy
-          { name: '💰 Economy (balance, daily, shop, etc.)', value: 'economy' },
-          { name: '🎰 Gambling (slots, blackjack, coinflip, etc.)', value: 'gambling' },
-          { name: '📊 Leveling (level, xp, rank)', value: 'leveling' },
+          { name: 'Economy (balance, daily, shop, etc.)', value: 'economy' },
+          { name: 'Gambling (slots, blackjack, coinflip, etc.)', value: 'gambling' },
+          { name: 'Leveling (level, leaderboard, levelup)', value: 'leveling' },
           // Fun
-          { name: '🎮 Games (trivia, tictactoe)', value: 'games' },
-          { name: '😂 Fun (meme, gif)', value: 'fun' },
+          { name: 'Games (trivia, tictactoe)', value: 'games' },
+          { name: 'Fun (meme, gif, poll)', value: 'fun' },
           // Community
-          { name: '🎂 Birthdays', value: 'birthdays' },
-          { name: '🎉 Giveaways', value: 'giveaways' },
-          { name: '📅 Events', value: 'events' },
-          { name: '⭐ Starboard', value: 'starboard' },
+          { name: 'Birthdays', value: 'birthdays' },
+          { name: 'Giveaways', value: 'giveaways' },
+          { name: 'Events', value: 'events' },
+          { name: 'Starboard', value: 'starboard' },
           // Server Messages
-          { name: '👋 Welcome Messages', value: 'welcome' },
-          { name: '💎 Server Boost Announcements', value: 'boost' },
+          { name: 'Welcome & Goodbye Messages', value: 'welcome' },
+          { name: 'Server Boost Announcements', value: 'boost' },
           // Utility
-          { name: '🎫 Tickets', value: 'tickets' },
-          { name: '💤 AFK', value: 'afk' },
-          { name: '⏰ Reminders', value: 'reminders' },
+          { name: 'Tickets', value: 'tickets' },
+          { name: 'AFK', value: 'afk' },
+          { name: 'Reminders', value: 'reminders' },
           // Moderation
-          { name: '🛡️ AutoMod', value: 'automod' },
-          { name: '🤖 AI Chat (Raphael)', value: 'aichat' },
-          { name: '😈 Troll Mode (AI Chat)', value: 'troll' },
+          { name: 'AutoMod', value: 'automod' },
+          // Systems
+          { name: 'AI Chat (Raphael)', value: 'aichat' },
+          { name: 'Troll Mode (AI Chat)', value: 'troll' },
+          { name: 'Profile Customization (member overlays)', value: 'profilecustomization' },
           // Single commands
-          { name: '🔧 Custom Command (specify name)', value: 'custom' }
+          { name: 'Custom Command (specify name)', value: 'custom' }
         ))
     .addStringOption(option =>
       option.setName('status')
         .setDescription('Enable or disable')
         .setRequired(true)
         .addChoices(
-          { name: '✅ Enable', value: 'enable' },
-          { name: '❌ Disable', value: 'disable' },
-          { name: '📋 View Status', value: 'status' }
+          { name: 'Enable', value: 'enable' },
+          { name: 'Disable', value: 'disable' },
+          { name: 'View Status', value: 'status' }
         ))
     .addStringOption(option =>
       option.setName('command')
         .setDescription('Command name (only for "Custom Command" type)')
-        .setRequired(false))
+        .setRequired(false)
+        .setMaxLength(COMMAND_NAME_MAX))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
   // Giveaway Command
@@ -960,7 +1012,8 @@ const slashCommands = [
         .addStringOption(option =>
           option.setName('prize')
             .setDescription('What is the prize?')
-            .setRequired(true))
+            .setRequired(true)
+            .setMaxLength(256))
         .addRoleOption(option =>
           option.setName('required_role')
             .setDescription('Role required to enter (optional)')
@@ -978,7 +1031,13 @@ const slashCommands = [
         .addStringOption(option =>
           option.setName('message_id')
             .setDescription('The giveaway message ID')
-            .setRequired(true)))
+            .setRequired(true))
+        .addIntegerOption(option =>
+          option.setName('count')
+            .setDescription('How many new winners to draw (default 1; previous winners are skipped)')
+            .setRequired(false)
+            .setMinValue(1)
+            .setMaxValue(20)))
     .addSubcommand(subcommand =>
       subcommand.setName('list')
         .setDescription('View all active giveaways'))
@@ -1000,9 +1059,9 @@ const slashCommands = [
         .setDescription('What to award')
         .setRequired(true)
         .addChoices(
-          { name: '✨ XP (Experience)', value: 'xp' },
-          { name: '💰 Coins (Currency)', value: 'coins' },
-          { name: '⭐ Rep (Reputation)', value: 'rep' }
+          { name: 'XP (Experience)', value: 'xp' },
+          { name: 'Coins (Currency)', value: 'coins' },
+          { name: 'Rep (Reputation)', value: 'rep' }
         ))
     .addUserOption(option =>
       option.setName('user')
@@ -1017,7 +1076,8 @@ const slashCommands = [
     .addStringOption(option =>
       option.setName('reason')
         .setDescription('Reason for the award (optional)')
-        .setRequired(false))
+        .setRequired(false)
+        .setMaxLength(REASON_MAX))
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   // Welcome System Command
@@ -1051,35 +1111,40 @@ const slashCommands = [
         .addChannelOption(option =>
           option.setName('channel')
             .setDescription('The channel to send welcome messages to')
-            .setRequired(true)))
+            .setRequired(true)
+            .addChannelTypes(POSTABLE_CHANNELS)))
     .addSubcommand(subcommand =>
       subcommand.setName('message')
         .setDescription('Set the welcome message (embed description)')
         .addStringOption(option =>
           option.setName('text')
             .setDescription('The welcome message text. Use {user}, {username}, {server}, {membercount}')
-            .setRequired(true)))
+            .setRequired(true)
+            .setMaxLength(MESSAGE_TEXT_MAX)))
     .addSubcommand(subcommand =>
       subcommand.setName('title')
         .setDescription('Set the embed title')
         .addStringOption(option =>
           option.setName('text')
             .setDescription('Title text (use "reset" for default stars, "none" to remove)')
-            .setRequired(true)))
+            .setRequired(true)
+            .setMaxLength(TITLE_MAX)))
     .addSubcommand(subcommand =>
       subcommand.setName('footer')
         .setDescription('Set the embed footer')
         .addStringOption(option =>
           option.setName('text')
             .setDescription('Footer text (use "reset" for default, "none" to remove)')
-            .setRequired(true)))
+            .setRequired(true)
+            .setMaxLength(MESSAGE_TEXT_MAX)))
     .addSubcommand(subcommand =>
       subcommand.setName('greet')
         .setDescription('Set the greeting text above the embed')
         .addStringOption(option =>
           option.setName('text')
             .setDescription('Greeting text (shown when mention is on). Use {user}')
-            .setRequired(true)))
+            .setRequired(true)
+            .setMaxLength(MESSAGE_TEXT_MAX)))
     .addSubcommand(subcommand =>
       subcommand.setName('color')
         .setDescription('Set the embed color')
@@ -1166,7 +1231,8 @@ const slashCommands = [
         .addChannelOption(option =>
           option.setName('channel')
             .setDescription('The channel to post confessions in')
-            .setRequired(true)))
+            .setRequired(true)
+            .addChannelTypes(TEXT_CHANNELS)))
     .addSubcommand(subcommand =>
       subcommand.setName('disable')
         .setDescription('Disable the confession system'))
@@ -1242,7 +1308,8 @@ const slashCommands = [
         .addChannelOption(option =>
           option.setName('channel')
             .setDescription('Channel to send panel (defaults to confession channel)')
-            .setRequired(false)))
+            .setRequired(false)
+            .addChannelTypes(TEXT_CHANNELS)))
     .addSubcommand(subcommand =>
       subcommand.setName('stats')
         .setDescription('View confession statistics'))
@@ -1276,14 +1343,16 @@ const slashCommands = [
             .addChannelOption(option =>
               option.setName('channel')
                 .setDescription('Channel to add as default')
-                .setRequired(true)))
+                .setRequired(true)
+                .addChannelTypes(ONBOARDING_CHANNELS)))
         .addSubcommand(subcommand =>
           subcommand.setName('remove')
             .setDescription('Remove a default channel')
             .addChannelOption(option =>
               option.setName('channel')
                 .setDescription('Channel to remove')
-                .setRequired(true))))
+                .setRequired(true)
+                .addChannelTypes(ONBOARDING_CHANNELS))))
     .addSubcommandGroup(group =>
       group.setName('questions')
         .setDescription('Manage onboarding questions')
@@ -1310,7 +1379,8 @@ const slashCommands = [
             .addChannelOption(option =>
               option.setName('option_channel')
                 .setDescription('Channel to show for this option (required if no role)')
-                .setRequired(false))
+                .setRequired(false)
+                .addChannelTypes(ONBOARDING_CHANNELS))
             .addBooleanOption(option =>
               option.setName('required')
                 .setDescription('Is this question required?')
@@ -1379,7 +1449,8 @@ const slashCommands = [
             .addChannelOption(option =>
               option.setName('channel')
                 .setDescription('Channel to show when selected (required if no role)')
-                .setRequired(false))
+                .setRequired(false)
+                .addChannelTypes(ONBOARDING_CHANNELS))
             .addStringOption(option =>
               option.setName('description')
                 .setDescription('Option description')
@@ -1439,7 +1510,8 @@ const slashCommands = [
             .addChannelOption(option =>
               option.setName('channel')
                 .setDescription('Channel to assign')
-                .setRequired(true))
+                .setRequired(true)
+                .addChannelTypes(ONBOARDING_CHANNELS))
             .addBooleanOption(option =>
               option.setName('remove')
                 .setDescription('Remove this channel instead of adding?')
@@ -1470,35 +1542,40 @@ const slashCommands = [
         .addChannelOption(option =>
           option.setName('channel')
             .setDescription('Target channel for boost messages')
-            .setRequired(true)))
+            .setRequired(true)
+            .addChannelTypes(TEXT_CHANNELS)))
     .addSubcommand(subcommand =>
       subcommand.setName('message')
         .setDescription('Configure boost message content')
         .addStringOption(option =>
           option.setName('text')
             .setDescription('Message text. Variables: {user}, {username}, {server}, {boostcount}')
-            .setRequired(true)))
+            .setRequired(true)
+            .setMaxLength(MESSAGE_TEXT_MAX)))
     .addSubcommand(subcommand =>
       subcommand.setName('title')
         .setDescription('Set embed title')
         .addStringOption(option =>
           option.setName('text')
             .setDescription('Title text (use "reset" for default, "none" to remove)')
-            .setRequired(true)))
+            .setRequired(true)
+            .setMaxLength(TITLE_MAX)))
     .addSubcommand(subcommand =>
       subcommand.setName('footer')
         .setDescription('Set embed footer')
         .addStringOption(option =>
           option.setName('text')
             .setDescription('Footer text (use "reset" for default, "none" to remove)')
-            .setRequired(true)))
+            .setRequired(true)
+            .setMaxLength(MESSAGE_TEXT_MAX)))
     .addSubcommand(subcommand =>
       subcommand.setName('greeting')
         .setDescription('Set greeting text above embed')
         .addStringOption(option =>
           option.setName('text')
             .setDescription('Greeting text shown above embed. Use {user}')
-            .setRequired(true)))
+            .setRequired(true)
+            .setMaxLength(MESSAGE_TEXT_MAX)))
     .addSubcommand(subcommand =>
       subcommand.setName('color')
         .setDescription('Set embed color')
@@ -1576,7 +1653,8 @@ const slashCommands = [
         .addStringOption(option =>
           option.setName('reason')
             .setDescription('Reason for assignment')
-            .setRequired(false)))
+            .setRequired(false)
+            .setMaxLength(REASON_MAX)))
     .addSubcommand(subcommand =>
       subcommand.setName('take')
         .setDescription('Remove temporary booster role from user')
@@ -1599,120 +1677,6 @@ const slashCommands = [
     .addSubcommand(subcommand =>
       subcommand.setName('clearrole')
         .setDescription('Clear temporary booster role configuration'))
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
-
-  // ============================================
-  // BOOSTER PERKS & TIER REWARDS COMMAND
-  // ============================================
-  new SlashCommandBuilder()
-    .setName('boostperks')
-    .setDescription('『 RAPHAEL 』 Configure boost tier rewards and perks announcements, Master')
-    // Boost Tier Rewards subcommands
-    .addSubcommand(subcommand =>
-      subcommand.setName('addtier')
-        .setDescription('Add a boost tier reward role')
-        .addIntegerOption(option =>
-          option.setName('boosts')
-            .setDescription('Number of boosts required (1-100)')
-            .setRequired(true)
-            .setMinValue(1)
-            .setMaxValue(100))
-        .addRoleOption(option =>
-          option.setName('role')
-            .setDescription('Role to assign at this tier')
-            .setRequired(true))
-        .addBooleanOption(option =>
-          option.setName('stackable')
-            .setDescription('Keep lower tier roles? (default: true)')
-            .setRequired(false)))
-    .addSubcommand(subcommand =>
-      subcommand.setName('removetier')
-        .setDescription('Remove a boost tier reward')
-        .addIntegerOption(option =>
-          option.setName('boosts')
-            .setDescription('Boost count of the tier to remove')
-            .setRequired(true)
-            .setMinValue(1)
-            .setMaxValue(100)))
-    .addSubcommand(subcommand =>
-      subcommand.setName('listtiers')
-        .setDescription('Display all configured boost tier rewards'))
-    .addSubcommand(subcommand =>
-      subcommand.setName('cleartiers')
-        .setDescription('Remove all boost tier rewards'))
-    // Perks Announcement subcommands
-    .addSubcommand(subcommand =>
-      subcommand.setName('status')
-        .setDescription('View booster perks announcement configuration'))
-    .addSubcommand(subcommand =>
-      subcommand.setName('channel')
-        .setDescription('Set the channel for booster perks announcements')
-        .addChannelOption(option =>
-          option.setName('channel')
-            .setDescription('Channel for perks announcements')
-            .setRequired(true)))
-    .addSubcommand(subcommand =>
-      subcommand.setName('message')
-        .setDescription('Set the perks announcement message')
-        .addStringOption(option =>
-          option.setName('text')
-            .setDescription('Message text. Variables: {server}, {boostcount}, {boostlevel}, {membercount}')
-            .setRequired(true)))
-    .addSubcommand(subcommand =>
-      subcommand.setName('title')
-        .setDescription('Set perks embed title')
-        .addStringOption(option =>
-          option.setName('text')
-            .setDescription('Title text (use "reset" for default)')
-            .setRequired(true)))
-    .addSubcommand(subcommand =>
-      subcommand.setName('color')
-        .setDescription('Set perks embed color')
-        .addStringOption(option =>
-          option.setName('hex')
-            .setDescription('Hex color code (e.g., #f47fff)')
-            .setRequired(true)))
-    .addSubcommand(subcommand =>
-      subcommand.setName('image')
-        .setDescription('Set perks banner image')
-        .addStringOption(option =>
-          option.setName('url')
-            .setDescription('Image URL or "remove" to delete')
-            .setRequired(true)))
-    .addSubcommand(subcommand =>
-      subcommand.setName('thumbnail')
-        .setDescription('Set perks thumbnail')
-        .addStringOption(option =>
-          option.setName('type')
-            .setDescription('Thumbnail type')
-            .setRequired(true)
-            .addChoices(
-              { name: 'Server Icon', value: 'server' },
-              { name: 'Remove', value: 'remove' }
-            )))
-    .addSubcommand(subcommand =>
-      subcommand.setName('footer')
-        .setDescription('Set perks embed footer')
-        .addStringOption(option =>
-          option.setName('text')
-            .setDescription('Footer text (use "reset" to remove)')
-            .setRequired(true)))
-    .addSubcommand(subcommand =>
-      subcommand.setName('tierlist')
-        .setDescription('Toggle automatic tier list in perks announcement')
-        .addBooleanOption(option =>
-          option.setName('enabled')
-            .setDescription('Show tier rewards list in announcement?')
-            .setRequired(true)))
-    .addSubcommand(subcommand =>
-      subcommand.setName('preview')
-        .setDescription('Preview booster perks announcement'))
-    .addSubcommand(subcommand =>
-      subcommand.setName('publish')
-        .setDescription('Publish booster perks announcement to configured channel'))
-    .addSubcommand(subcommand =>
-      subcommand.setName('reset')
-        .setDescription('Reset all perks announcement settings'))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
   // ============================================
@@ -1745,28 +1709,32 @@ const slashCommands = [
         .addChannelOption(option =>
           option.setName('channel')
             .setDescription('Target channel for goodbye messages')
-            .setRequired(true)))
+            .setRequired(true)
+            .addChannelTypes(TEXT_CHANNELS)))
     .addSubcommand(subcommand =>
       subcommand.setName('message')
         .setDescription('Configure goodbye message content')
         .addStringOption(option =>
           option.setName('text')
             .setDescription('Message text. Variables: {user}, {username}, {server}, {membercount}')
-            .setRequired(true)))
+            .setRequired(true)
+            .setMaxLength(MESSAGE_TEXT_MAX)))
     .addSubcommand(subcommand =>
       subcommand.setName('title')
         .setDescription('Set embed title')
         .addStringOption(option =>
           option.setName('text')
             .setDescription('Title text (use "reset" for default, "none" to remove)')
-            .setRequired(true)))
+            .setRequired(true)
+            .setMaxLength(TITLE_MAX)))
     .addSubcommand(subcommand =>
       subcommand.setName('footer')
         .setDescription('Set embed footer')
         .addStringOption(option =>
           option.setName('text')
             .setDescription('Footer text (use "reset" for default, "none" to remove)')
-            .setRequired(true)))
+            .setRequired(true)
+            .setMaxLength(MESSAGE_TEXT_MAX)))
     .addSubcommand(subcommand =>
       subcommand.setName('color')
         .setDescription('Set embed color')
@@ -1838,9 +1806,9 @@ const slashCommands = [
             .setRequired(true))
         .addNumberOption(option =>
           option.setName('multiplier')
-            .setDescription('Multiplier value (e.g., 1.5 for 50% more XP)')
+            .setDescription('Multiplier value from 1 to 10 (e.g., 1.5 for 50% more XP)')
             .setRequired(true)
-            .setMinValue(0.1)
+            .setMinValue(1)
             .setMaxValue(10)))
     .addSubcommand(subcommand =>
       subcommand.setName('remove')
@@ -1857,10 +1825,10 @@ const slashCommands = [
         .setDescription('Set multiplier for server boosters')
         .addNumberOption(option =>
           option.setName('multiplier')
-            .setDescription('Multiplier for boosters (default: 1.5)')
+            .setDescription('Multiplier for boosters from 1 to 5 (default: 1.5)')
             .setRequired(true)
             .setMinValue(1)
-            .setMaxValue(10)))
+            .setMaxValue(5)))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
   // ============================================
@@ -1877,7 +1845,7 @@ const slashCommands = [
             .setDescription('Level required to earn the role')
             .setRequired(true)
             .setMinValue(1)
-            .setMaxValue(1000))
+            .setMaxValue(100))
         .addRoleOption(option =>
           option.setName('role')
             .setDescription('Role to assign at this level')
@@ -1890,16 +1858,13 @@ const slashCommands = [
             .setDescription('Level to remove reward from')
             .setRequired(true)
             .setMinValue(1)
-            .setMaxValue(1000)))
+            .setMaxValue(100)))
     .addSubcommand(subcommand =>
       subcommand.setName('list')
         .setDescription('Display all level role rewards'))
     .addSubcommand(subcommand =>
       subcommand.setName('clear')
         .setDescription('Remove all level role rewards'))
-    .addSubcommand(subcommand =>
-      subcommand.setName('sync')
-        .setDescription('Sync all members to their correct level roles'))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageRoles),
 
   // ============================================
@@ -1923,14 +1888,16 @@ const slashCommands = [
         .addChannelOption(option =>
           option.setName('channel')
             .setDescription('Channel for level up messages (leave empty for current channel)')
-            .setRequired(false)))
+            .setRequired(false)
+            .addChannelTypes(TEXT_CHANNELS)))
     .addSubcommand(subcommand =>
       subcommand.setName('message')
         .setDescription('Configure level up message')
         .addStringOption(option =>
           option.setName('text')
             .setDescription('Message text. Variables: {user}, {level}, {xp}')
-            .setRequired(true)))
+            .setRequired(true)
+            .setMaxLength(MESSAGE_TEXT_MAX)))
     .addSubcommand(subcommand =>
       subcommand.setName('embed')
         .setDescription('Toggle embed mode')
@@ -1968,7 +1935,8 @@ const slashCommands = [
         .addChannelOption(option =>
           option.setName('channel')
             .setDescription('Channel for starred messages')
-            .setRequired(true)))
+            .setRequired(true)
+            .addChannelTypes(TEXT_CHANNELS)))
     .addSubcommand(subcommand =>
       subcommand.setName('threshold')
         .setDescription('Set minimum stars required')
@@ -1998,14 +1966,16 @@ const slashCommands = [
         .addChannelOption(option =>
           option.setName('channel')
             .setDescription('Channel to ignore')
-            .setRequired(true)))
+            .setRequired(true)
+            .addChannelTypes(MESSAGE_CHANNELS)))
     .addSubcommand(subcommand =>
       subcommand.setName('unignore')
         .setDescription('Remove channel from starboard ignore list')
         .addChannelOption(option =>
           option.setName('channel')
             .setDescription('Channel to unignore')
-            .setRequired(true)))
+            .setRequired(true)
+            .addChannelTypes(MESSAGE_CHANNELS)))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
   // ============================================
@@ -2020,7 +1990,8 @@ const slashCommands = [
         .addStringOption(option =>
           option.setName('rule')
             .setDescription('The rule text')
-            .setRequired(true)))
+            .setRequired(true)
+            .setMaxLength(RULE_TEXT_MAX)))
     .addSubcommand(subcommand =>
       subcommand.setName('remove')
         .setDescription('Remove a rule')
@@ -2040,7 +2011,8 @@ const slashCommands = [
         .addStringOption(option =>
           option.setName('text')
             .setDescription('New rule text')
-            .setRequired(true)))
+            .setRequired(true)
+            .setMaxLength(RULE_TEXT_MAX)))
     .addSubcommand(subcommand =>
       subcommand.setName('list')
         .setDescription('Display all rules'))
@@ -2050,7 +2022,8 @@ const slashCommands = [
         .addChannelOption(option =>
           option.setName('channel')
             .setDescription('Channel to send rules to')
-            .setRequired(false)))
+            .setRequired(false)
+            .addChannelTypes(TEXT_CHANNELS)))
     .addSubcommand(subcommand =>
       subcommand.setName('clear')
         .setDescription('Clear all rules'))
@@ -2060,7 +2033,8 @@ const slashCommands = [
         .addStringOption(option =>
           option.setName('text')
             .setDescription('Title for rules embed')
-            .setRequired(true)))
+            .setRequired(true)
+            .setMaxLength(TITLE_MAX)))
     .addSubcommand(subcommand =>
       subcommand.setName('color')
         .setDescription('Set rules embed color')
@@ -2088,44 +2062,20 @@ const slashCommands = [
         .addChannelOption(option =>
           option.setName('channel')
             .setDescription('Announcement channel')
-            .setRequired(true)))
+            .setRequired(true)
+            .addChannelTypes(ANNOUNCEMENT_CHANNELS)))
     .addSubcommand(subcommand =>
       subcommand.setName('remove')
         .setDescription('Remove channel from auto-publish')
         .addChannelOption(option =>
           option.setName('channel')
             .setDescription('Channel to remove')
-            .setRequired(true)))
+            .setRequired(true)
+            .addChannelTypes(POSTABLE_CHANNELS)))
     .addSubcommand(subcommand =>
       subcommand.setName('list')
         .setDescription('View auto-publish channels'))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels),
-
-  // ============================================
-  // CLEANUP COMMAND (Admin)
-  // ============================================
-  new SlashCommandBuilder()
-    .setName('cleanup')
-    .setDescription('『 RAPHAEL 』 Purge old data and perform maintenance, Master')
-    .addSubcommand(subcommand =>
-      subcommand.setName('inactive')
-        .setDescription('Remove data for inactive members')
-        .addIntegerOption(option =>
-          option.setName('days')
-            .setDescription('Days of inactivity threshold')
-            .setRequired(true)
-            .setMinValue(30)
-            .setMaxValue(365)))
-    .addSubcommand(subcommand =>
-      subcommand.setName('left')
-        .setDescription('Remove data for members who left'))
-    .addSubcommand(subcommand =>
-      subcommand.setName('bots')
-        .setDescription('Remove data for bot accounts'))
-    .addSubcommand(subcommand =>
-      subcommand.setName('stats')
-        .setDescription('View cleanup statistics'))
-    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   // ============================================
   // DEPLOYMENT COMMAND (Admin)
@@ -2153,7 +2103,8 @@ const slashCommands = [
         .addStringOption(option =>
           option.setName('reason')
             .setDescription('Reason for rollback')
-            .setRequired(false)))
+            .setRequired(false)
+            .setMaxLength(REASON_MAX)))
     .addSubcommand(subcommand =>
       subcommand.setName('status')
         .setDescription('View deployment logs status'))
@@ -2236,7 +2187,7 @@ export async function clearGuildSlashCommands(client, guildId) {
       { body: [] }
     );
 
-    console.log(`🧹 Cleared guild-specific slash commands for ${guildId}`);
+    console.log(`[RAPHAEL] Cleared guild-specific slash commands for ${guildId}`);
     return true;
   } catch (error) {
     console.error(`Error clearing slash commands for guild ${guildId}:`, error);

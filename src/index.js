@@ -378,7 +378,7 @@ async function initialize() {
   logger.startup(`Bot started successfully in ${duration}ms`);
 
   // Initialize events after client is ready
-  client.once("ready", async () => {
+  client.once("clientReady", async () => {
     console.log("[RAPHAEL] Client connection established.");
     console.log(`   Logged in as: ${client.user.tag}`);
     console.log(`   Guilds: ${client.guilds.cache.size}`);

@@ -1,7 +1,36 @@
-import { Events, Collection, PermissionFlagsBits, MessageFlags, GuildOnboardingPromptType, ApplicationCommandOptionType } from 'discord.js';
+import { Events, Collection, PermissionFlagsBits, MessageFlags, GuildOnboardingPromptType, ApplicationCommandOptionType, ChannelType } from 'discord.js';
 import logger from '../../utils/logger.js';
 import Guild from '../../models/Guild.js';
-import { hasModPerms, isServerAdmin, normalizeAntiNukeAction } from '../../utils/helpers.js';
+import { hasModPerms, isServerAdmin, normalizeAntiNukeAction, getAssignableRoleError } from '../../utils/helpers.js';
+import { COLORS } from '../../utils/embeds.js';
+import { getRandomFooter } from '../../utils/raphael.js';
+import { getSlashCommands } from '../../utils/slashCommands.js';
+
+// Names of the slash commands this build defines. A command dropped from the definitions can
+// still be offered by Discord until the next registration, and must not run in the meantime.
+const SLASH_COMMAND_NAMES = new Set(getSlashCommands().map(command => command.name));
+
+// Defined option order per command and subcommand path ("ban", "goodbye embed"). Discord lists
+// options in the order the user filled them in; the bridge passes them to prefix commands as
+// positional args, so it puts them back in the defined order first.
+const OPTION_ORDER = new Map();
+for (const command of getSlashCommands()) {
+  const record = (options = [], path) => {
+    OPTION_ORDER.set(path, options.map(option => option.name));
+    for (const option of options) {
+      if (option.type === ApplicationCommandOptionType.Subcommand || option.type === ApplicationCommandOptionType.SubcommandGroup) {
+        record(option.options, `${path} ${option.name}`);
+      }
+    }
+  };
+  record(command.toJSON().options, command.name);
+}
+
+// Commands /slashcommands can never disable, and that the disabled list never blocks:
+// without them an administrator could lock the server out of re-enabling anything.
+const PROTECTED_SLASH_COMMANDS = ['slashcommands', 'feature', 'help'];
+
+const GENERIC_FAILURE = '**Alert:** An anomaly occurred while executing this skill, Master. Please try again.';
 
 export default {
   name: Events.InteractionCreate,
@@ -16,7 +45,14 @@ export default {
     // Ignore DM interactions - commands only work in guilds
     if (!interaction.guild) {
       return interaction.reply({
-        content: '❌ Commands can only be used in servers, not in DMs.',
+        content: '**Notice:** My skills can only be invoked within a server, Master, not in direct messages.',
+        flags: MessageFlags.Ephemeral
+      }).catch(() => { });
+    }
+
+    if (!SLASH_COMMAND_NAMES.has(interaction.commandName)) {
+      return interaction.reply({
+        content: '**Notice:** This skill has been retired and is no longer available, Master.',
         flags: MessageFlags.Ephemeral
       }).catch(() => { });
     }
@@ -25,7 +61,10 @@ export default {
     const guildConfig = await Guild.getGuild(interaction.guild.id, interaction.guild.name);
 
     // Check if command is disabled
-    if (guildConfig.slashCommands?.disabledCommands?.includes(interaction.commandName)) {
+    if (
+      !PROTECTED_SLASH_COMMANDS.includes(interaction.commandName) &&
+      guildConfig.slashCommands?.disabledCommands?.includes(interaction.commandName)
+    ) {
       return interaction.reply({
         content: '**Notice:** This command has been deactivated by an administrator, Master.',
         flags: MessageFlags.Ephemeral
@@ -103,13 +142,15 @@ export default {
         channels: new Collection(),
         roles: new Collection()
       };
-      const collectOptions = (options) => {
-        for (const option of options) {
+      const collectOptions = (options, path) => {
+        const order = OPTION_ORDER.get(path) ?? [];
+        const ordered = [...options].sort((a, b) => order.indexOf(a.name) - order.indexOf(b.name));
+        for (const option of ordered) {
           switch (option.type) {
             case ApplicationCommandOptionType.SubcommandGroup:
             case ApplicationCommandOptionType.Subcommand:
               args.push(option.name);
-              collectOptions(option.options ?? []);
+              collectOptions(option.options ?? [], `${path} ${option.name}`);
               break;
             case ApplicationCommandOptionType.User:
               args.push(`<@${option.value}>`);
@@ -124,12 +165,22 @@ export default {
               args.push(`<@&${option.value}>`);
               if (option.role) mentions.roles.set(option.value, option.role);
               break;
+            case ApplicationCommandOptionType.Boolean:
+              // The prefix toggles (boost, goodbye, levelup, starboard) parse on/off.
+              // ban.js reads a trailing true/false as /ban's delete_messages flag.
+              args.push(interaction.commandName === 'ban' ? String(option.value) : (option.value ? 'on' : 'off'));
+              break;
             default:
               if (option.value !== undefined) args.push(String(option.value));
           }
         }
       };
-      collectOptions(interaction.options.data);
+      collectOptions(interaction.options.data, interaction.commandName);
+      // Always end /ban with the flag (true is ban.js's default), so a reason that happens to
+      // end in "true" or "false" is never read as delete_messages
+      if (interaction.commandName === 'ban' && interaction.options.getBoolean('delete_messages') === null) {
+        args.push('true');
+      }
 
       // Convert interaction to message-like object with Collection instead of Map
       const fakeMessage = {
@@ -227,25 +278,51 @@ export default {
       logger.error(`Slash command execution failed: ${command.name}`, error);
       console.error(`Error executing ${interaction.commandName}:`, error);
 
-      const errorMessage = '**Alert:** An anomaly occurred while executing this skill, Master. Please try again.';
-
       // Replace the deferred "thinking" placeholder rather than leaving it hanging
       if (interaction.replied || interaction.deferred) {
-        await interaction.editReply({ content: errorMessage, embeds: [], components: [] }).catch(() => {});
+        await interaction.editReply({ content: GENERIC_FAILURE, embeds: [], components: [] }).catch(() => {});
       } else {
-        await interaction.reply({ content: errorMessage, flags: MessageFlags.Ephemeral }).catch(() => {});
+        await interaction.reply({ content: GENERIC_FAILURE, flags: MessageFlags.Ephemeral }).catch(() => {});
       }
     }
   },
 };
 
+/**
+ * Message-shaped wrapper for running a prefix command inside a slash interaction that was
+ * already deferred. reply() edits the deferred reply and returns a handle whose edit() keeps
+ * editing it: an ephemeral reply can't be edited through Message#edit.
+ */
+function createDeferredCommandMessage(interaction, client, { args = [], users = [] } = {}) {
+  const editReply = async (options) => {
+    try {
+      await interaction.editReply(options);
+    } catch (error) {
+      console.error(`[/${interaction.commandName}] Failed to edit the reply:`, error);
+    }
+    return replyHandle;
+  };
+  const replyHandle = { edit: editReply };
+
+  return {
+    author: interaction.user,
+    client,
+    content: `/${interaction.commandName} ${args.join(' ')}`.trim(),
+    guild: interaction.guild,
+    channel: interaction.channel,
+    member: interaction.member,
+    mentions: {
+      users: new Collection(users.map(user => [user.id, user])),
+      members: new Collection(),
+      channels: new Collection(),
+      roles: new Collection()
+    },
+    reply: editReply
+  };
+}
+
 // Handle special slash commands that need custom implementations
 async function handleSpecialCommand(interaction, client, guildConfig, hasAdminRole, hasModRole) {
-  const { successEmbed, errorEmbed, infoEmbed, GLYPHS } = await import('../../utils/embeds.js');
-
-  // Commands that only require ManageGuild permission (or mod role)
-  const manageGuildCommands = ['feature'];
-
   // Commands that moderators/staff can use (not just admins)
   const moderatorCommands = ['welcome', 'giveaway', 'automod', 'logs', 'noxp', 'manageshop', 'confession', 'cmdchannels', 'setoverlay', 'verify', 'birthdaysettings', 'setbirthday', 'feature'];
 
@@ -273,14 +350,6 @@ async function handleSpecialCommand(interaction, client, guildConfig, hasAdminRo
         flags: MessageFlags.Ephemeral
       });
     }
-  } else if (manageGuildCommands.includes(interaction.commandName)) {
-    // For manage guild commands, check ManageGuild permission
-    if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild) && !hasAdminRole && !hasModRole) {
-      return interaction.reply({
-        content: '**Error:** Manage Server permissions required for this function, Master.',
-        flags: MessageFlags.Ephemeral
-      });
-    }
   } else {
     // Default: require Administrator permissions
     if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator) && !hasAdminRole) {
@@ -291,7 +360,22 @@ async function handleSpecialCommand(interaction, client, guildConfig, hasAdminRo
     }
   }
 
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  try {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  } catch (error) {
+    console.error(`Could not defer /${interaction.commandName}:`, error);
+    return;
+  }
+
+  // Remember whether the handler already answered, so a failure in a later side effect
+  // (an alert post, a DM) can't overwrite a reply that reported success
+  let answered = false;
+  const editReply = interaction.editReply.bind(interaction);
+  interaction.editReply = async (options) => {
+    const reply = await editReply(options);
+    answered = true;
+    return reply;
+  };
 
   try {
     switch (interaction.commandName) {
@@ -299,7 +383,7 @@ async function handleSpecialCommand(interaction, client, guildConfig, hasAdminRo
         await handleAutomodCommand(interaction, guildConfig);
         break;
       case 'lockdown':
-        await handleLockdownCommand(interaction, guildConfig);
+        await handleLockdownCommand(interaction, client);
         break;
       case 'setrole':
         await handleSetroleCommand(interaction, guildConfig);
@@ -311,19 +395,19 @@ async function handleSpecialCommand(interaction, client, guildConfig, hasAdminRo
         await handleSlashcommandsCommand(interaction, guildConfig);
         break;
       case 'refreshcache':
-        await handleRefreshCacheCommand(interaction, client, guildConfig);
+        await handleRefreshCacheCommand(interaction, client);
         break;
       case 'birthdaysettings':
         await handleBirthdaySettingsCommand(interaction, guildConfig);
         break;
       case 'setbirthday':
-        await handleSetBirthdayCommand(interaction, client, guildConfig);
+        await handleSetBirthdayCommand(interaction, client);
         break;
       case 'config':
         await handleConfigCommand(interaction, guildConfig);
         break;
       case 'setup':
-        await handleSetupCommand(interaction, client, guildConfig);
+        await handleSetupCommand(interaction, client);
         break;
       case 'welcome':
         await handleWelcomeCommand(interaction, guildConfig);
@@ -332,7 +416,7 @@ async function handleSpecialCommand(interaction, client, guildConfig, hasAdminRo
         await handleManageshopCommand(interaction, guildConfig);
         break;
       case 'verify':
-        await handleVerifyCommand(interaction, client, guildConfig);
+        await handleVerifyCommand(interaction, guildConfig);
         break;
       case 'cmdchannels':
         await handleCmdchannelsCommand(interaction, guildConfig);
@@ -347,7 +431,7 @@ async function handleSpecialCommand(interaction, client, guildConfig, hasAdminRo
         await handleFeatureCommand(interaction, client, guildConfig);
         break;
       case 'giveaway':
-        await handleGiveawayCommand(interaction, client, guildConfig);
+        await handleGiveawayCommand(interaction, client);
         break;
       case 'award':
         await handleAwardCommand(interaction, client, guildConfig);
@@ -358,11 +442,8 @@ async function handleSpecialCommand(interaction, client, guildConfig, hasAdminRo
       case 'setoverlay':
         await handleSetoverlayCommand(interaction, guildConfig);
         break;
-      case 'setprofile':
-        await handleSetprofileCommand(interaction);
-        break;
       case 'confession':
-        await handleConfessionCommand(interaction, client, guildConfig);
+        await handleConfessionCommand(interaction);
         break;
       case 'onboarding':
         await handleOnboardingCommand(interaction, guildConfig);
@@ -370,9 +451,8 @@ async function handleSpecialCommand(interaction, client, guildConfig, hasAdminRo
     }
   } catch (error) {
     console.error(`Error handling ${interaction.commandName}:`, error);
-    await interaction.editReply({
-      content: '**Error:** Command execution failure detected, Master.',
-    });
+    if (answered) return;
+    await interaction.editReply({ content: GENERIC_FAILURE, embeds: [], components: [] }).catch(() => { });
   }
 }
 
@@ -397,29 +477,31 @@ async function handleAutomodCommand(interaction, guildConfig) {
       });
       break;
 
-    case 'status':
+    case 'status': {
       const autoMod = guildConfig.features.autoMod;
       // Helper to safely check if a feature is enabled (handles boolean or object)
       const isEnabled = (feature) => {
         if (typeof feature === 'boolean') return feature;
         return feature?.enabled ?? false;
       };
-      const getSpamLimit = () => typeof autoMod.antiSpam === 'object' ? autoMod.antiSpam.messageLimit : 5;
-      const getSpamWindow = () => typeof autoMod.antiSpam === 'object' ? autoMod.antiSpam.timeWindow : 5;
+      const state = (feature) => isEnabled(feature) ? '◉ Active' : '◇ Inactive';
+      const spamLimit = typeof autoMod.antiSpam === 'object' ? autoMod.antiSpam.messageLimit : 5;
+      const spamWindow = typeof autoMod.antiSpam === 'object' ? autoMod.antiSpam.timeWindow : 5;
 
-      const statusEmbed = await infoEmbed(interaction.guild.id, '『 AutoMod Status 』',
-        `**▸ Overall:** ${autoMod.enabled ? '◉ Active' : '○ Inactive'}\n\n` +
-        `**Features:**\n` +
-        `${GLYPHS.DOT} Anti-Spam: ${isEnabled(autoMod.antiSpam) ? '◉' : '○'} (${getSpamLimit()} msgs/${getSpamWindow()}s)\n` +
-        `${GLYPHS.DOT} Anti-Raid: ${isEnabled(autoMod.antiRaid) ? '◉' : '○'} (${autoMod.antiRaid?.joinThreshold || 10} joins/${autoMod.antiRaid?.timeWindow || 30}s)\n` +
-        `${GLYPHS.DOT} Anti-Nuke: ${isEnabled(autoMod.antiNuke) ? '◉' : '○'}\n` +
-        `${GLYPHS.DOT} Anti-Invites: ${isEnabled(autoMod.antiInvites) ? '◉' : '○'}\n` +
-        `${GLYPHS.DOT} Anti-Links: ${isEnabled(autoMod.antiLinks) ? '◉' : '○'}\n` +
-        `${GLYPHS.DOT} Bad Words: ${isEnabled(autoMod.badWords) ? '◉' : '○'} (${autoMod.badWords?.words?.length || 0} words)\n` +
-        `${GLYPHS.DOT} Mass Mention: ${isEnabled(autoMod.antiMassMention) ? '◉' : '○'} (limit: ${autoMod.antiMassMention?.limit || 5})`
+      const statusEmbed = await infoEmbed(interaction.guild.id, 'AutoMod Status',
+        `**▸ Overall:** ${autoMod.enabled ? '◉ Active' : '◇ Inactive'}`);
+      statusEmbed.addFields(
+        { name: '▸ Anti-Spam', value: `${state(autoMod.antiSpam)}\n${spamLimit} msgs / ${spamWindow}s`, inline: true },
+        { name: '▸ Anti-Raid', value: `${state(autoMod.antiRaid)}\n${autoMod.antiRaid?.joinThreshold || 10} joins / ${autoMod.antiRaid?.timeWindow || 30}s`, inline: true },
+        { name: '▸ Anti-Nuke', value: state(autoMod.antiNuke), inline: true },
+        { name: '▸ Anti-Invites', value: state(autoMod.antiInvites), inline: true },
+        { name: '▸ Anti-Links', value: state(autoMod.antiLinks), inline: true },
+        { name: '▸ Bad Words', value: `${state(autoMod.badWords)}\n${autoMod.badWords?.words?.length || 0} custom words`, inline: true },
+        { name: '▸ Mass Mention', value: `${state(autoMod.antiMassMention)}\nLimit: ${autoMod.antiMassMention?.limit || 5}`, inline: true }
       );
       await interaction.editReply({ embeds: [statusEmbed] });
       break;
+    }
 
     case 'badwords':
       await handleBadwordsSubcommand(interaction, guildConfig);
@@ -858,91 +940,16 @@ async function handleBadwordsIgnoredList(interaction, guildConfig) {
   });
 }
 
-async function handleLockdownCommand(interaction, guildConfig) {
-  const { successEmbed, infoEmbed, GLYPHS } = await import('../../utils/embeds.js');
-  const { ChannelType } = await import('discord.js');
+// /lockdown runs the prefix command, so both save the channels' original @everyone overwrites
+// to security.lockdownPermissions and restore them on unlock, whichever form locked the server
+async function handleLockdownCommand(interaction, client) {
+  const lockdownCommand = (await import('../../commands/moderation/lockdown.js')).default;
 
   const action = interaction.options.getString('action');
-  const reason = interaction.options.getString('reason') || 'No reason provided';
+  const reason = interaction.options.getString('reason');
+  const args = [action, ...(reason ? reason.trim().split(/\s+/) : [])];
 
-  if (action === 'on') {
-    // Enable lockdown
-    await Guild.updateGuild(interaction.guild.id, {
-      $set: {
-        'security.lockdownActive': true,
-        'security.lockdownReason': reason,
-        'security.lockdownBy': interaction.user.id,
-        'security.lockdownAt': new Date()
-      }
-    });
-
-    // Lock all text channels
-    const textChannels = interaction.guild.channels.cache.filter(
-      c => c.type === ChannelType.GuildText
-    );
-
-    let lockedCount = 0;
-    for (const [, channel] of textChannels) {
-      try {
-        await channel.permissionOverwrites.edit(interaction.guild.id, {
-          SendMessages: false
-        }, { reason: `[Lockdown] ${reason}` });
-        lockedCount++;
-      } catch (error) {
-        // Channel might not be editable
-      }
-    }
-
-    await interaction.editReply({
-      embeds: [await successEmbed(interaction.guild.id, '🔒 Server Lockdown Enabled',
-        `${GLYPHS.SUCCESS} Locked ${lockedCount} channels.\n\n` +
-        `**Reason:** ${reason}\n` +
-        `**By:** ${interaction.user.tag}\n\n` +
-        `Use \`/lockdown off\` to unlock the server.`)]
-    });
-
-    // Announce in alert channel
-    if (guildConfig.channels.alertLog) {
-      const alertChannel = interaction.guild.channels.cache.get(guildConfig.channels.alertLog);
-      if (alertChannel) {
-        await alertChannel.send({
-          embeds: [await infoEmbed(interaction.guild.id, '🔒 SERVER LOCKDOWN',
-            `**Activated By:** ${interaction.user.tag}\n` +
-            `**Reason:** ${reason}\n` +
-            `**Channels Locked:** ${lockedCount}`)]
-        });
-      }
-    }
-
-  } else {
-    // Disable lockdown
-    await Guild.updateGuild(interaction.guild.id, {
-      $set: { 'security.lockdownActive': false }
-    });
-
-    // Unlock all text channels
-    const textChannels = interaction.guild.channels.cache.filter(
-      c => c.type === ChannelType.GuildText
-    );
-
-    let unlockedCount = 0;
-    for (const [, channel] of textChannels) {
-      try {
-        await channel.permissionOverwrites.edit(interaction.guild.id, {
-          SendMessages: null
-        }, { reason: 'Lockdown ended' });
-        unlockedCount++;
-      } catch (error) {
-        // Channel might not be editable
-      }
-    }
-
-    await interaction.editReply({
-      embeds: [await successEmbed(interaction.guild.id, '🔓 Server Lockdown Disabled',
-        `${GLYPHS.SUCCESS} Unlocked ${unlockedCount} channels.\n\n` +
-        `Server is now back to normal operation.`)]
-    });
-  }
+  await lockdownCommand.execute(createDeferredCommandMessage(interaction, client, { args }), args, client);
 }
 
 async function handleSetroleCommand(interaction, guildConfig) {
@@ -1049,76 +1056,91 @@ async function handleSetchannelCommand(interaction, guildConfig) {
 }
 
 async function handleSlashcommandsCommand(interaction, guildConfig) {
-  const { successEmbed, infoEmbed, GLYPHS } = await import('../../utils/embeds.js');
+  const { successEmbed, errorEmbed, infoEmbed, GLYPHS } = await import('../../utils/embeds.js');
 
   const subcommand = interaction.options.getSubcommand();
-
-  // Get current slashCommands config or initialize
-  const slashCommandsConfig = guildConfig.slashCommands || { enabled: true, disabledCommands: [] };
+  const disabledCommands = guildConfig.slashCommands?.disabledCommands || [];
+  const commandName = interaction.options.getString('command')?.trim().toLowerCase().replace(/^\//, '');
 
   switch (subcommand) {
-    case 'enable':
-      const enableCmd = interaction.options.getString('command').toLowerCase();
-      const enabledList = (slashCommandsConfig.disabledCommands || []).filter(c => c !== enableCmd);
-      await Guild.updateGuild(interaction.guild.id, { $set: { 'slashCommands.disabledCommands': enabledList } });
+    case 'enable': {
+      if (!disabledCommands.includes(commandName)) {
+        return interaction.editReply({
+          embeds: [await errorEmbed(interaction.guild.id, 'Not Disabled',
+            SLASH_COMMAND_NAMES.has(commandName)
+              ? `\`/${commandName}\` is already enabled, Master.`
+              : `\`/${commandName}\` is not one of my slash commands, Master. Use \`/slashcommands list\` to view them.`)]
+        });
+      }
+      await Guild.updateGuild(interaction.guild.id, { $pull: { 'slashCommands.disabledCommands': commandName } });
 
       await interaction.editReply({
         embeds: [await successEmbed(interaction.guild.id, 'Command Enabled',
-          `${GLYPHS.SUCCESS} Slash command \`/${enableCmd}\` is now enabled.`)]
+          `${GLYPHS.SUCCESS} Slash command \`/${commandName}\` is now enabled.`)]
       });
       break;
+    }
 
-    case 'disable':
-      const disableCmd = interaction.options.getString('command').toLowerCase();
-      const disabledList = slashCommandsConfig.disabledCommands || [];
-      if (!disabledList.includes(disableCmd)) {
-        disabledList.push(disableCmd);
+    case 'disable': {
+      if (!SLASH_COMMAND_NAMES.has(commandName)) {
+        return interaction.editReply({
+          embeds: [await errorEmbed(interaction.guild.id, 'Unknown Command',
+            `\`/${commandName}\` is not one of my slash commands, Master. Use \`/slashcommands list\` to view them.`)]
+        });
       }
-      await Guild.updateGuild(interaction.guild.id, { $set: { 'slashCommands.disabledCommands': disabledList } });
+      if (PROTECTED_SLASH_COMMANDS.includes(commandName)) {
+        return interaction.editReply({
+          embeds: [await errorEmbed(interaction.guild.id, 'Protected Command',
+            `\`/${commandName}\` cannot be disabled, Master: administrators need it to manage the others.`)]
+        });
+      }
+      await Guild.updateGuild(interaction.guild.id, { $addToSet: { 'slashCommands.disabledCommands': commandName } });
 
       await interaction.editReply({
         embeds: [await successEmbed(interaction.guild.id, 'Command Disabled',
-          `${GLYPHS.SUCCESS} Slash command \`/${disableCmd}\` is now disabled.`)]
+          `${GLYPHS.SUCCESS} Slash command \`/${commandName}\` is now disabled.`)]
       });
       break;
+    }
 
-    case 'list':
-      const { getSlashCommands } = await import('../../utils/slashCommands.js');
-      const allCommands = getSlashCommands();
-      const disabled = slashCommandsConfig.disabledCommands || [];
+    case 'list': {
+      const names = [...SLASH_COMMAND_NAMES].sort();
+      const formatNames = (list) => truncateList(list.map(name => `\`/${name}\``).join(', '), 1024) || 'None';
+      const enabled = names.filter(name => !disabledCommands.includes(name));
+      const disabled = names.filter(name => disabledCommands.includes(name));
 
-      const commandList = allCommands.map(cmd => {
-        const name = cmd.name;
-        const isDisabled = disabled.includes(name);
-        return `${isDisabled ? '◎' : '◉'} \`/${name}\``;
-      }).join('\n');
-
-      await interaction.editReply({
-        embeds: [await infoEmbed(interaction.guild.id, '『 Slash Commands 』',
-          `**▸ Status:** ${slashCommandsConfig.enabled ? '◉ Active' : '◎ Inactive'}\n\n` +
-          `**Commands:**\n${commandList}`)]
-      });
+      const embed = await infoEmbed(interaction.guild.id, 'Slash Commands',
+        `**▸ Status:** ${guildConfig.slashCommands?.enabled !== false ? '◉ Active' : '◇ Inactive'}`);
+      embed.addFields(
+        { name: `◉ Enabled (${enabled.length})`, value: formatNames(enabled) },
+        { name: `◇ Disabled (${disabled.length})`, value: formatNames(disabled) }
+      );
+      await interaction.editReply({ embeds: [embed] });
       break;
+    }
   }
 }
 
-async function handleRefreshCacheCommand(interaction, client, guildConfig) {
-  const { successEmbed, infoEmbed, GLYPHS } = await import('../../utils/embeds.js');
-  const Guild = (await import('../../models/Guild.js')).default;
+// Shorten a comma-separated list to fit a Discord length limit, cutting at an item boundary
+function truncateList(text, limit) {
+  if (text.length <= limit) return text;
+  const suffix = ', …';
+  const cut = text.slice(0, limit - suffix.length);
+  return `${cut.slice(0, cut.lastIndexOf(','))}${suffix}`;
+}
+
+async function handleRefreshCacheCommand(interaction, client) {
+  const { successEmbed } = await import('../../utils/embeds.js');
 
   const cacheType = interaction.options.getString('type') || 'all';
   const guild = interaction.guild;
   const refreshed = [];
 
   try {
-    // Refresh Guild Settings from database
+    // Drop the cached settings (Redis and in-memory) and reload them from the database
     if (cacheType === 'all' || cacheType === 'guild') {
-      // Clear mongoose cache and re-fetch
-      const freshGuildConfig = await Guild.findOne({ guildId: guild.id });
-      if (freshGuildConfig) {
-        // Force update the cached version
-        Object.assign(guildConfig, freshGuildConfig.toObject());
-      }
+      await Guild.invalidateCache(guild.id);
+      await Guild.getGuild(guild.id, guild.name);
       refreshed.push('◉ Guild Settings');
     }
 
@@ -1147,11 +1169,11 @@ async function handleRefreshCacheCommand(interaction, client, guildConfig) {
         client.invites.set(guild.id, new Map(invites.map(inv => [inv.code, inv.uses])));
         refreshed.push(`◉ Invites (${invites.size} cached)`);
       } catch (invErr) {
-        refreshed.push('◎ Invites (no permission)');
+        refreshed.push('◇ Invites (no permission)');
       }
     }
 
-    const embed = await successEmbed(interaction.guild.id, '『 Cache Refreshed 』',
+    const embed = await successEmbed(interaction.guild.id, 'Cache Refreshed',
       `**Confirmed:** Cache refresh complete for **${guild.name}**, Master.\n\n` +
       `**Refreshed:**\n${refreshed.join('\n')}\n\n` +
       `**Refreshed at:** <t:${Math.floor(Date.now() / 1000)}:F>`
@@ -1163,7 +1185,7 @@ async function handleRefreshCacheCommand(interaction, client, guildConfig) {
     console.error('Error refreshing cache:', error);
     const { errorEmbed } = await import('../../utils/embeds.js');
     await interaction.editReply({
-      embeds: [await errorEmbed(interaction.guild.id, `Failed to refresh cache: ${error.message}`)]
+      embeds: [await errorEmbed(interaction.guild.id, 'Refresh Failed', `Cache refresh failed: ${error.message}`)]
     });
   }
 }
@@ -1183,7 +1205,7 @@ async function handleBirthdaySettingsCommand(interaction, guildConfig) {
         }
       });
       await interaction.editReply({
-        embeds: [await successEmbed(interaction.guild.id, '🎂 Birthday Channel Set',
+        embeds: [await successEmbed(interaction.guild.id, 'Birthday Channel Set',
           `${GLYPHS.SUCCESS} Birthday announcements will be sent to ${channel}`)]
       });
       break;
@@ -1191,9 +1213,15 @@ async function handleBirthdaySettingsCommand(interaction, guildConfig) {
 
     case 'role': {
       const role = interaction.options.getRole('role');
+      const roleError = getAssignableRoleError(role, interaction.member);
+      if (roleError) {
+        return interaction.editReply({
+          embeds: [await errorEmbed(interaction.guild.id, 'Role Not Allowed', roleError)]
+        });
+      }
       await Guild.updateGuild(interaction.guild.id, { $set: { 'features.birthdaySystem.role': role.id } });
       await interaction.editReply({
-        embeds: [await successEmbed(interaction.guild.id, '🎂 Birthday Role Set',
+        embeds: [await successEmbed(interaction.guild.id, 'Birthday Role Set',
           `${GLYPHS.SUCCESS} Birthday role set to ${role}\n\nThis role will be assigned to users on their birthday.`)]
       });
       break;
@@ -1203,8 +1231,8 @@ async function handleBirthdaySettingsCommand(interaction, guildConfig) {
       const message = interaction.options.getString('message');
       await Guild.updateGuild(interaction.guild.id, { $set: { 'features.birthdaySystem.message': message } });
       await interaction.editReply({
-        embeds: [await successEmbed(interaction.guild.id, '🎂 Birthday Message Set',
-          `${GLYPHS.SUCCESS} Custom birthday message set!\n\n**Preview:**\n${message.replace('{user}', interaction.user.toString()).replace('{username}', interaction.user.username).replace('{age}', '25')}`)]
+        embeds: [await successEmbed(interaction.guild.id, 'Birthday Message Set',
+          `${GLYPHS.SUCCESS} Custom birthday message set.\n\n**Preview:**\n${message.replace('{user}', interaction.user.toString()).replace('{username}', interaction.user.username).replace('{age}', '25')}`)]
       });
       break;
     }
@@ -1212,8 +1240,8 @@ async function handleBirthdaySettingsCommand(interaction, guildConfig) {
     case 'enable': {
       await Guild.updateGuild(interaction.guild.id, { $set: { 'features.birthdaySystem.enabled': true } });
       await interaction.editReply({
-        embeds: [await successEmbed(interaction.guild.id, '🎂 Birthday System Enabled',
-          `${GLYPHS.SUCCESS} Birthday celebrations are now enabled!`)]
+        embeds: [await successEmbed(interaction.guild.id, 'Birthday System Enabled',
+          `${GLYPHS.SUCCESS} Birthday celebrations are now enabled.`)]
       });
       break;
     }
@@ -1221,7 +1249,7 @@ async function handleBirthdaySettingsCommand(interaction, guildConfig) {
     case 'disable': {
       await Guild.updateGuild(interaction.guild.id, { $set: { 'features.birthdaySystem.enabled': false } });
       await interaction.editReply({
-        embeds: [await successEmbed(interaction.guild.id, '🎂 Birthday System Disabled',
+        embeds: [await successEmbed(interaction.guild.id, 'Birthday System Disabled',
           `${GLYPHS.SUCCESS} Birthday celebrations are now disabled.`)]
       });
       break;
@@ -1234,8 +1262,8 @@ async function handleBirthdaySettingsCommand(interaction, guildConfig) {
       const message = bs.message || '**Notice:** Birthday celebration detected for {user}. Congratulations, Master.';
 
       await interaction.editReply({
-        embeds: [await infoEmbed(interaction.guild.id, '『 Birthday Settings 』',
-          `**▸ Status:** ${bs.enabled ? '◉ Active' : '◎ Inactive'}\n` +
+        embeds: [await infoEmbed(interaction.guild.id, 'Birthday Settings',
+          `**▸ Status:** ${bs.enabled ? '◉ Active' : '◇ Inactive'}\n` +
           `**▸ Channel:** ${channel}\n` +
           `**▸ Role:** ${role}\n` +
           `**▸ Message:** ${message}\n\n` +
@@ -1249,105 +1277,24 @@ async function handleBirthdaySettingsCommand(interaction, guildConfig) {
   }
 }
 
-// Set Birthday Handler (Admin)
-async function handleSetBirthdayCommand(interaction, client, guildConfig) {
-  const { successEmbed, errorEmbed, GLYPHS } = await import('../../utils/embeds.js');
-  const Birthday = (await import('../../models/Birthday.js')).default;
+// /setbirthday runs the prefix command, so a staff-set birthday is recorded the same way
+// (source, setBy, verification) and the role and announcement only happen on the day itself
+async function handleSetBirthdayCommand(interaction, client) {
+  const setBirthdayCommand = (await import('../../commands/community/setbirthday.js')).default;
 
   const user = interaction.options.getUser('user');
-  const month = interaction.options.getInteger('month');
-  const day = interaction.options.getInteger('day');
   const year = interaction.options.getInteger('year');
-  const isPrivate = interaction.options.getBoolean('private') || false;
+  // private:true hides the age, private:false shows it, unset keeps the prefix default (hidden)
+  const isPrivate = interaction.options.getBoolean('private');
+  const args = [
+    `<@${user.id}>`,
+    String(interaction.options.getInteger('month')),
+    String(interaction.options.getInteger('day')),
+    ...(year ? [String(year)] : []),
+    ...(isPrivate === true ? ['--private'] : isPrivate === false ? ['--showage'] : [])
+  ];
 
-  // Validate date
-  const testDate = new Date(year || 2000, month - 1, day);
-  if (testDate.getMonth() !== month - 1 || testDate.getDate() !== day) {
-    return interaction.editReply({
-      embeds: [await errorEmbed(interaction.guild.id, 'Invalid Date',
-        '**Error:** This date does not exist. Please verify the month and day, Master.')]
-    });
-  }
-
-  try {
-    // Find or create birthday
-    let birthday = await Birthday.findOne({ guildId: interaction.guild.id, userId: user.id });
-
-    if (birthday) {
-      birthday.birthday = { month, day, year };
-      birthday.username = user.username;
-      birthday.showAge = !isPrivate;
-    } else {
-      birthday = new Birthday({
-        guildId: interaction.guild.id,
-        userId: user.id,
-        username: user.username,
-        birthday: { month, day, year },
-        showAge: !isPrivate
-      });
-    }
-
-    await birthday.save();
-
-    // Assign birthday role if configured
-    const birthdayRole = guildConfig.features.birthdaySystem.role;
-    const member = await interaction.guild.members.fetch(user.id).catch(() => null);
-
-    if (birthdayRole && member) {
-      const role = interaction.guild.roles.cache.get(birthdayRole);
-      if (role && !member.roles.cache.has(birthdayRole)) {
-        await member.roles.add(role, 'Birthday set by admin').catch(() => { });
-      }
-    }
-
-    // Send announcement in birthday channel
-    const birthdayChannel = guildConfig.features.birthdaySystem.channel || guildConfig.channels.birthdayChannel;
-    if (birthdayChannel) {
-      const channel = interaction.guild.channels.cache.get(birthdayChannel);
-      if (channel) {
-        const dateStr = `${month}/${day}${year ? `/${year}` : ''}`;
-        const announceEmbed = await successEmbed(interaction.guild.id, '『 Birthday Registered 』',
-          `**${user}**'s birthday has been registered as **${dateStr}**, Master.\n\n` +
-          `**Notice:** A special celebration will be conducted on their birthday.`
-        );
-        await channel.send({ embeds: [announceEmbed] }).catch(() => { });
-      }
-    }
-
-    // Success message
-    const dateStr = `${month}/${day}${year ? `/${year}` : ''}`;
-    let description = `${GLYPHS.SUCCESS} Birthday for **${user.tag}** set to **${dateStr}**, Master.`;
-
-    if (isPrivate) {
-      description += '\n**Notice:** Age will remain concealed in announcements.';
-    }
-
-    if (year) {
-      const age = birthday.getAge ? birthday.getAge() : null;
-      if (age !== null) {
-        description += `\n🎂 They'll turn ${age + 1} on their next birthday!`;
-      }
-    }
-
-    if (birthdayRole) {
-      description += `\n🎀 Birthday role assigned`;
-    }
-
-    if (birthdayChannel) {
-      description += `\n📢 Announcement sent to <#${birthdayChannel}>`;
-    }
-
-    await interaction.editReply({
-      embeds: [await successEmbed(interaction.guild.id, '🎂 Birthday Set!', description)]
-    });
-
-  } catch (error) {
-    console.error('Error setting birthday:', error);
-    await interaction.editReply({
-      embeds: [await errorEmbed(interaction.guild.id, 'Error',
-        'Failed to set birthday. Please try again.')]
-    });
-  }
+  await setBirthdayCommand.execute(createDeferredCommandMessage(interaction, client, { args, users: [user] }), args, client);
 }
 
 // Config Handler
@@ -1358,19 +1305,30 @@ async function handleConfigCommand(interaction, guildConfig) {
   switch (subcommand) {
     case 'view': {
       const config = guildConfig;
-      const embed = await infoEmbed(interaction.guild.id, '『 Server Configuration 』',
-        `**▸ Prefix:** \`${config.prefix}\`\n\n` +
-        `**Channels:**\n` +
-        `◇ Mod Log: ${config.channels.modLog ? `<#${config.channels.modLog}>` : 'Not configured'}\n` +
-        `◇ Alert Log: ${config.channels.alertLog ? `<#${config.channels.alertLog}>` : 'Not configured'}\n` +
-        `◇ Join Log: ${config.channels.joinLog ? `<#${config.channels.joinLog}>` : 'Not configured'}\n` +
-        `◇ Birthday: ${config.channels.birthdayChannel ? `<#${config.channels.birthdayChannel}>` : 'Not configured'}\n` +
-        `◇ Welcome: ${config.channels.welcomeChannel ? `<#${config.channels.welcomeChannel}>` : 'Not configured'}\n\n` +
-        `**Features:**\n` +
-        `◇ AutoMod: ${config.features.autoMod?.enabled ? '◉ Active' : '◎ Inactive'}\n` +
-        `◇ Birthdays: ${config.features.birthdaySystem?.enabled ? '◉ Active' : '◎ Inactive'}\n` +
-        `◇ Levels: ${config.features.levelSystem?.enabled ? '◉ Active' : '◎ Inactive'}\n` +
-        `◇ Welcome: ${config.features.welcomeSystem?.enabled ? '◉ Active' : '◎ Inactive'}`
+      const channel = (id) => id ? `<#${id}>` : 'Not configured';
+      const state = (enabled) => enabled ? '◉ Active' : '◇ Inactive';
+      const embed = await infoEmbed(interaction.guild.id, 'Server Configuration',
+        `**▸ Prefix:** \`${config.prefix}\``);
+      embed.addFields(
+        {
+          name: '▸ Channels',
+          value:
+            `• Mod Log: ${channel(config.channels.modLog)}\n` +
+            `• Alert Log: ${channel(config.channels.alertLog)}\n` +
+            `• Join Log: ${channel(config.channels.joinLog)}\n` +
+            `• Birthday: ${channel(config.channels.birthdayChannel)}\n` +
+            `• Welcome: ${channel(config.channels.welcomeChannel)}`,
+          inline: true
+        },
+        {
+          name: '▸ Features',
+          value:
+            `• AutoMod: ${state(config.features.autoMod?.enabled)}\n` +
+            `• Birthdays: ${state(config.features.birthdaySystem?.enabled)}\n` +
+            `• Levels: ${state(config.features.levelSystem?.enabled)}\n` +
+            `• Welcome: ${state(config.features.welcomeSystem?.enabled)}`,
+          inline: true
+        }
       );
       await interaction.editReply({ embeds: [embed] });
       break;
@@ -1380,7 +1338,7 @@ async function handleConfigCommand(interaction, guildConfig) {
       const newPrefix = interaction.options.getString('prefix');
       if (newPrefix.length > 5) {
         return interaction.editReply({
-          embeds: [await errorEmbed(interaction.guild.id, 'Prefix too long (max 5 characters)')]
+          embeds: [await errorEmbed(interaction.guild.id, 'Invalid Prefix', 'The prefix may be at most 5 characters, Master.')]
         });
       }
       await Guild.updateGuild(interaction.guild.id, { $set: { prefix: newPrefix } });
@@ -1393,31 +1351,18 @@ async function handleConfigCommand(interaction, guildConfig) {
   }
 }
 
-// Setup Handler
-async function handleSetupCommand(interaction, client, guildConfig) {
-  const { successEmbed, errorEmbed, infoEmbed, GLYPHS } = await import('../../utils/embeds.js');
-  const { ChannelType } = await import('discord.js');
+// Setup Handler: runs the prefix setup wizard, which reports progress by editing its first reply
+async function handleSetupCommand(interaction, client) {
+  const { errorEmbed } = await import('../../utils/embeds.js');
 
-  // Import the setup command and run it
   try {
-    const setupModule = await import('../../commands/config/setup.js');
-    const setupCommand = setupModule.default;
-
-    // Create a fake message object for the setup command
-    const fakeMessage = {
-      guild: interaction.guild,
-      member: interaction.member,
-      author: interaction.user,
-      reply: async (options) => interaction.editReply(options),
-      channel: interaction.channel
-    };
-
-    await setupCommand.execute(fakeMessage);
+    const setupCommand = (await import('../../commands/config/setup.js')).default;
+    await setupCommand.execute(createDeferredCommandMessage(interaction, client), [], client);
   } catch (error) {
     console.error('Setup command error:', error);
     await interaction.editReply({
       embeds: [await errorEmbed(interaction.guild.id, 'Setup Failed',
-        'An error occurred during setup. Please ensure I have Administrator permissions.')]
+        'An error occurred during setup. Please ensure I have Administrator permissions, Master.')]
     });
   }
 }
@@ -1477,7 +1422,7 @@ async function handleWelcomeCommand(interaction, guildConfig) {
 
       await interaction.editReply({
         embeds: [await successEmbed(interaction.guild.id, 'Welcome Message Set',
-          `${GLYPHS.SUCCESS} Welcome message updated!\n\n**Preview:**\n${previewMsg}`)]
+          `${GLYPHS.SUCCESS} Welcome message updated, Master.\n\n**Preview:**\n${previewMsg}`)]
       });
       break;
     }
@@ -1691,6 +1636,12 @@ async function handleWelcomeCommand(interaction, guildConfig) {
             `${GLYPHS.SUCCESS} Welcome auto role has been disabled.`)]
         });
       } else {
+        const roleError = getAssignableRoleError(role, interaction.member);
+        if (roleError) {
+          return interaction.editReply({
+            embeds: [await errorEmbed(interaction.guild.id, 'Role Not Allowed', roleError)]
+          });
+        }
         await Guild.updateGuild(interaction.guild.id, { $set: { 'features.welcomeSystem.autoRole': role.id } });
         await interaction.editReply({
           embeds: [await successEmbed(interaction.guild.id, 'Auto Role Set',
@@ -1704,22 +1655,37 @@ async function handleWelcomeCommand(interaction, guildConfig) {
       const channel = welcome.channel ? interaction.guild.channels.cache.get(welcome.channel) : null;
       const autoRole = welcome.autoRole ? interaction.guild.roles.cache.get(welcome.autoRole) : null;
 
-      await interaction.editReply({
-        embeds: [await infoEmbed(interaction.guild.id, '『 Welcome System Status 』',
-          `**▸ Status:** ${welcome.enabled ? '◉ Active' : '○ Inactive'}\n` +
-          `**▸ Channel:** ${channel || 'Not configured'}\n` +
-          `**▸ Embed Mode:** ${welcome.embedEnabled !== false ? '◉' : '○'}\n` +
-          `**▸ DM Welcome:** ${welcome.dmWelcome ? '◉' : '○'}\n` +
-          `**▸ Mention User:** ${welcome.mentionUser ? '◉' : '○'}\n` +
-          `**▸ Timestamp:** ${welcome.showTimestamp !== false ? '◉' : '○'}\n` +
-          `**▸ Auto Role:** ${autoRole || 'None'}\n\n` +
-          `**▸ Color:** ${welcome.embedColor || 'Default'}\n` +
-          `**▸ Title:** ${welcome.embedTitle ? 'Custom' : 'Decorative stars'}\n` +
-          `**▸ Author:** ${welcome.authorType || 'username'}\n` +
-          `**▸ Thumbnail:** ${welcome.thumbnailType || welcome.thumbnailUrl || 'None'}\n` +
-          `**▸ Banner:** ${welcome.bannerUrl ? '◉ Set' : '○ Not set'}\n\n` +
-          `**Current Message:**\n\`\`\`${welcome.message || 'Welcome {user} to {server}!'}\`\`\``)]
-      });
+      const flag = (enabled) => enabled ? '◉ On' : '◇ Off';
+      const statusEmbed = await infoEmbed(interaction.guild.id, 'Welcome System Status',
+        `**▸ Status:** ${welcome.enabled ? '◉ Active' : '◇ Inactive'}\n` +
+        `**▸ Channel:** ${channel || 'Not configured'}`);
+      statusEmbed.addFields(
+        {
+          name: '▸ Behaviour',
+          value:
+            `• Embed Mode: ${flag(welcome.embedEnabled !== false)}\n` +
+            `• DM Welcome: ${flag(welcome.dmWelcome)}\n` +
+            `• Mention User: ${flag(welcome.mentionUser)}\n` +
+            `• Timestamp: ${flag(welcome.showTimestamp !== false)}\n` +
+            `• Auto Role: ${autoRole || 'None'}`,
+          inline: true
+        },
+        {
+          name: '▸ Appearance',
+          value:
+            `• Color: ${welcome.embedColor || 'Default'}\n` +
+            `• Title: ${welcome.embedTitle ? 'Custom' : 'Decorative stars'}\n` +
+            `• Author: ${welcome.authorType || 'username'}\n` +
+            `• Thumbnail: ${welcome.thumbnailType || welcome.thumbnailUrl || 'None'}\n` +
+            `• Banner: ${welcome.bannerUrl ? 'Set' : 'Not set'}`,
+          inline: true
+        },
+        {
+          name: '▸ Current Message',
+          value: `\`\`\`${(welcome.message || 'Welcome {user} to {server}!').replace(/`/g, "'").slice(0, 1000)}\`\`\``
+        }
+      );
+      await interaction.editReply({ embeds: [statusEmbed] });
       break;
     }
 
@@ -1835,14 +1801,31 @@ async function handleWelcomeCommand(interaction, guildConfig) {
   }
 }
 
+// Shop item text limits: names appear in embed field names (256) and descriptions in field values (1024)
+const SHOP_NAME_MAX = 100;
+const SHOP_DESCRIPTION_MAX = 500;
+
+// Embed images only accept http(s) URLs; anything else makes EmbedBuilder#setImage throw
+function isHttpUrl(value) {
+  try {
+    const { protocol } = new URL(value);
+    return protocol === 'http:' || protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 // Handle manageshop slash command (Backgrounds only)
 async function handleManageshopCommand(interaction, guildConfig) {
   const { successEmbed, errorEmbed, infoEmbed, GLYPHS } = await import('../../utils/embeds.js');
   const { formatNumber } = await import('../../utils/helpers.js');
-  const { EmbedBuilder } = await import('discord.js');
 
   const subcommand = interaction.options.getSubcommand();
-  const coinEmoji = guildConfig.economy?.coinEmoji || '💰';
+  const currency = guildConfig.economy?.coinName || 'coins';
+  const invalidImage = async () => interaction.editReply({
+    embeds: [await errorEmbed(interaction.guild.id, 'Invalid Image URL',
+      `${GLYPHS.ERROR} Please provide a direct image link starting with http:// or https://, Master.`)]
+  });
 
   // Initialize if not exists
   if (!guildConfig.customShopItems) {
@@ -1851,13 +1834,22 @@ async function handleManageshopCommand(interaction, guildConfig) {
 
   switch (subcommand) {
     case 'add': {
-      const itemName = interaction.options.getString('name');
+      const itemName = interaction.options.getString('name').trim();
       const price = interaction.options.getInteger('price');
-      const image = interaction.options.getString('image');
+      const image = interaction.options.getString('image').trim();
       const description = interaction.options.getString('description');
 
+      // Validate before writing: a bad URL used to throw after the item was saved, and retries duplicated it
+      if (!isHttpUrl(image)) return invalidImage();
+      if (itemName.length > SHOP_NAME_MAX || (description?.length ?? 0) > SHOP_DESCRIPTION_MAX) {
+        return interaction.editReply({
+          embeds: [await errorEmbed(interaction.guild.id, 'Text Too Long',
+            `${GLYPHS.ERROR} Names are limited to ${SHOP_NAME_MAX} characters and descriptions to ${SHOP_DESCRIPTION_MAX}, Master.`)]
+        });
+      }
+
       // Generate unique ID
-      const itemId = `custom_${Date.now().toString(36)}_${Math.random().toString(36).substr(2, 4)}`;
+      const itemId = `custom_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
 
       const newItem = {
         id: itemId,
@@ -1873,16 +1865,13 @@ async function handleManageshopCommand(interaction, guildConfig) {
 
       await Guild.updateGuild(interaction.guild.id, { $push: { customShopItems: newItem } });
 
-      const embed = new EmbedBuilder()
-        .setColor('#667eea')
-        .setTitle('✅ Background Added to Shop')
-        .addFields(
-          { name: '🖼️ Name', value: itemName, inline: true },
-          { name: '💰 Price', value: `${formatNumber(price)} ${coinEmoji}`, inline: true },
-          { name: '🆔 ID', value: `\`${itemId}\``, inline: true }
-        )
-        .setImage(image)
-        .setFooter({ text: 'Background preview shown above' });
+      const embed = await successEmbed(interaction.guild.id, 'Background Added to Shop',
+        `${GLYPHS.SUCCESS} **${itemName}** is now available in the shop. Preview below, Master.`);
+      embed.addFields(
+        { name: '▸ Name', value: itemName, inline: true },
+        { name: '▸ Price', value: `${formatNumber(price)} ${currency}`, inline: true },
+        { name: '▸ ID', value: `\`${itemId}\``, inline: true }
+      ).setImage(image);
 
       await interaction.editReply({ embeds: [embed] });
       break;
@@ -1914,28 +1903,23 @@ async function handleManageshopCommand(interaction, guildConfig) {
       if (guildConfig.customShopItems.length === 0) {
         await interaction.editReply({
           embeds: [await infoEmbed(interaction.guild.id, 'No Backgrounds',
-            `${GLYPHS.INFO} No custom backgrounds in the shop yet.\n\nUse \`/manageshop add\` to add backgrounds!`)]
+            `${GLYPHS.INFO} No custom backgrounds in the shop yet.\n\nUse \`/manageshop add\` to add backgrounds, Master.`)]
         });
         return;
       }
 
-      const embed = new EmbedBuilder()
-        .setTitle('🖼️ Shop Backgrounds')
-        .setColor(guildConfig.embedStyle?.color || '#667eea')
-        .setFooter({ text: `Total: ${guildConfig.customShopItems.length} backgrounds` });
+      const total = guildConfig.customShopItems.length;
+      const embed = await infoEmbed(interaction.guild.id, 'Shop Backgrounds',
+        total > 10 ? `Showing 10 of ${total} backgrounds, Master.` : `${total} background(s) in the shop, Master.`);
 
       guildConfig.customShopItems.slice(0, 10).forEach(item => {
-        const stockText = item.stock === -1 ? '∞' : item.stock;
+        const stockText = item.stock === -1 ? 'Unlimited' : item.stock;
         embed.addFields({
-          name: `🖼️ ${item.name}`,
-          value: `**ID:** \`${item.id}\`\n**Price:** ${formatNumber(item.price)} ${coinEmoji}\n**Stock:** ${stockText}${item.image ? `\n**Image:** [Preview](${item.image})` : ''}`,
+          name: `▸ ${item.name}`.slice(0, 256),
+          value: `**ID:** \`${item.id}\`\n**Price:** ${formatNumber(item.price)} ${currency}\n**Stock:** ${stockText}${isHttpUrl(item.image) ? `\n**Image:** [Preview](${item.image})` : ''}`,
           inline: false
         });
       });
-
-      if (guildConfig.customShopItems.length > 10) {
-        embed.setDescription(`Showing 10 of ${guildConfig.customShopItems.length} backgrounds`);
-      }
 
       await interaction.editReply({ embeds: [embed] });
       break;
@@ -1962,8 +1946,8 @@ async function handleManageshopCommand(interaction, guildConfig) {
       await interaction.editReply({
         embeds: [await successEmbed(interaction.guild.id, 'Price Updated',
           `${GLYPHS.SUCCESS} Updated **${item.name}** price:\n\n` +
-          `**Old Price:** ${formatNumber(oldPrice)} ${coinEmoji}\n` +
-          `**New Price:** ${formatNumber(newPrice)} ${coinEmoji}`)]
+          `**Old Price:** ${formatNumber(oldPrice)} ${currency}\n` +
+          `**New Price:** ${formatNumber(newPrice)} ${currency}`)]
       });
       break;
     }
@@ -1982,26 +1966,24 @@ async function handleManageshopCommand(interaction, guildConfig) {
         return;
       }
 
-      switch (field) {
-        case 'name':
-          item.name = value;
-          break;
-        case 'description':
-          item.description = value;
-          break;
-        case 'image':
-          item.image = value;
-          break;
+      const newValue = value.trim();
+      const limits = { name: SHOP_NAME_MAX, description: SHOP_DESCRIPTION_MAX };
+      if (field === 'image' && !isHttpUrl(newValue)) return invalidImage();
+      if (limits[field] && newValue.length > limits[field]) {
+        return interaction.editReply({
+          embeds: [await errorEmbed(interaction.guild.id, 'Text Too Long',
+            `${GLYPHS.ERROR} The ${field} is limited to ${limits[field]} characters, Master.`)]
+        });
       }
 
       await Guild.updateGuild(interaction.guild.id, {
-        $set: { [`customShopItems.$[elem].${field}`]: value }
+        $set: { [`customShopItems.$[elem].${field}`]: newValue }
       }, { arrayFilters: [{ 'elem.id': itemId }] });
 
-      await interaction.editReply({
-        embeds: [await successEmbed(interaction.guild.id, 'Background Updated',
-          `${GLYPHS.SUCCESS} Updated **${item.name}**'s ${field} to: **${value}**`)]
-      });
+      const embed = await successEmbed(interaction.guild.id, 'Background Updated',
+        `${GLYPHS.SUCCESS} Updated the ${field} of **${item.name}** to: ${field === 'image' ? newValue : `**${newValue}**`}`);
+      if (field === 'image') embed.setImage(newValue);
+      await interaction.editReply({ embeds: [embed] });
       break;
     }
 
@@ -2051,21 +2033,13 @@ async function handleManageshopCommand(interaction, guildConfig) {
           return;
         }
 
-        if (!value.startsWith('http://') && !value.startsWith('https://')) {
-          await interaction.editReply({
-            embeds: [await errorEmbed(interaction.guild.id, 'Invalid URL',
-              `${GLYPHS.ERROR} Please provide a valid image URL starting with http:// or https://`)]
-          });
-          return;
-        }
+        if (!isHttpUrl(value)) return invalidImage();
 
         await Guild.updateGuild(interaction.guild.id, { $set: { 'economy.fallbackBackground.image': value } });
 
-        const embed = new EmbedBuilder()
-          .setColor('#00FF00')
-          .setTitle('✅ Fallback Background Updated')
-          .setDescription(`${GLYPHS.SUCCESS} Default background image set!`)
-          .setImage(value);
+        const embed = await successEmbed(interaction.guild.id, 'Fallback Background Updated',
+          `${GLYPHS.SUCCESS} Default background image set. Preview below, Master.`);
+        embed.setImage(value);
         await interaction.editReply({ embeds: [embed] });
 
       } else if (type === 'color') {
@@ -2087,10 +2061,10 @@ async function handleManageshopCommand(interaction, guildConfig) {
 
         await Guild.updateGuild(interaction.guild.id, { $set: { 'economy.fallbackBackground.color': value } });
 
-        const embed = new EmbedBuilder()
-          .setColor(value)
-          .setTitle('✅ Fallback Color Updated')
-          .setDescription(`${GLYPHS.SUCCESS} Default background color set to: **${value}**`);
+        // Shown in the new color as a preview
+        const embed = await successEmbed(interaction.guild.id, 'Fallback Color Updated',
+          `${GLYPHS.SUCCESS} Default background color set to: **${value}**`);
+        embed.setColor(value);
         await interaction.editReply({ embeds: [embed] });
 
       } else if (type === 'clear') {
@@ -2107,23 +2081,57 @@ async function handleManageshopCommand(interaction, guildConfig) {
     }
   }
 }
-// Handle verify command
-async function handleVerifyCommand(interaction, client, guildConfig) {
-  const { successEmbed, errorEmbed, infoEmbed, GLYPHS } = await import('../../utils/embeds.js');
+// Verification panel, matching the one the prefix verify command sends: a button for the
+// button and captcha types (custom IDs handled by verificationHandler.js), a reaction otherwise
+async function sendVerificationPanel(channel, type) {
   const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = await import('discord.js');
+
+  const instructions = {
+    button: '**Activate the button below to proceed.**',
+    captcha: '**Activate the button below to receive a verification code.**',
+    reaction: '**Apply the reaction below to verify.**'
+  };
+  const embed = new EmbedBuilder()
+    .setColor(COLORS.RAPHAEL)
+    .setTitle('『 Server Verification 』')
+    .setDescription(`**Notice:** Access to this server requires verification, Master.\n\n${instructions[type] || instructions.button}`)
+    .setFooter({ text: 'Security protocol active.' });
+
+  if (type === 'reaction') {
+    const panel = await channel.send({ embeds: [embed] });
+    await panel.react('✅');
+    return;
+  }
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(type === 'captcha' ? 'verify_captcha' : 'verify_button')
+      .setLabel(type === 'captcha' ? 'Get Captcha' : 'Verify')
+      .setStyle(ButtonStyle.Success)
+  );
+  await channel.send({ embeds: [embed], components: [row] });
+}
+
+// Handle verify command
+async function handleVerifyCommand(interaction, guildConfig) {
+  const { successEmbed, errorEmbed, infoEmbed, GLYPHS } = await import('../../utils/embeds.js');
   const subcommand = interaction.options.getSubcommand();
+  const vs = guildConfig.features?.verificationSystem || {};
 
   switch (subcommand) {
     case 'setup': {
-      const embed = new EmbedBuilder()
-        .setColor('#5865F2')
-        .setTitle('🔐 Verification Setup')
-        .setDescription('To complete setup via slash command, use these subcommands:\n\n' +
-          '`/verify setrole @role` - Set the verified role\n' +
-          '`/verify setunverifiedrole @role` - Set the role to remove on verification\n' +
-          '`/verify setchannel #channel` - Set the verification channel\n' +
-          '`/verify enable` - Enable the system\n' +
-          '`/verify panel` - Send the verification panel');
+      const embed = await infoEmbed(interaction.guild.id, 'Verification Setup',
+        `${GLYPHS.ARROW_RIGHT} Configure verification with these subcommands, Master:`);
+      embed.addFields({
+        name: '▸ Steps',
+        value:
+          '1. `/verify setrole` — Set the verified role\n' +
+          '2. `/verify setunverifiedrole` — Set the role removed on verification\n' +
+          '3. `/verify setchannel` — Set the verification channel\n' +
+          '4. `/verify settype` — Choose button, captcha or reaction\n' +
+          '5. `/verify enable` — Enable the system\n' +
+          '6. `/verify panel` — Send the verification panel'
+      });
       await interaction.editReply({ embeds: [embed] });
       break;
     }
@@ -2131,86 +2139,92 @@ async function handleVerifyCommand(interaction, client, guildConfig) {
     case 'panel': {
       const channel = interaction.options.getChannel('channel') || interaction.channel;
 
-      if (!guildConfig.features?.verificationSystem?.role) {
+      if (!vs.role) {
         await interaction.editReply({
           embeds: [await errorEmbed(interaction.guild.id, 'Setup Required',
-            `${GLYPHS.ERROR} Please set a verified role first with \`/verify setrole @role\``)]
+            `${GLYPHS.ERROR} Please set a verified role first with \`/verify setrole\`, Master.`)]
         });
         return;
       }
 
-      const verificationType = guildConfig.features?.verificationSystem?.type || 'button';
+      try {
+        await sendVerificationPanel(channel, vs.type || 'button');
+      } catch (error) {
+        console.error('Error sending verification panel:', error);
+        return interaction.editReply({
+          embeds: [await errorEmbed(interaction.guild.id, 'Panel Not Sent',
+            `${GLYPHS.ERROR} I could not post the panel in ${channel}. Please check my permissions there, Master.`)]
+        });
+      }
 
-      const panelEmbed = new EmbedBuilder()
-        .setColor('#5865F2')
-        .setTitle('🔐 Server Verification')
-        .setDescription(
-          verificationType === 'captcha'
-            ? 'Click the button below to start captcha verification and gain access to the server!'
-            : 'Click the button below to verify yourself and gain access to the server!'
-        )
-        .setFooter({ text: 'This helps us prevent bots and raiders.' });
-
-      const row = new ActionRowBuilder()
-        .addComponents(
-          new ButtonBuilder()
-            .setCustomId(verificationType === 'captcha' ? 'verify_captcha' : 'verify_button')
-            .setLabel(verificationType === 'captcha' ? '🔐 Verify (Captcha)' : '✅ Verify')
-            .setStyle(ButtonStyle.Success)
-        );
-
-      await channel.send({ embeds: [panelEmbed], components: [row] });
       await interaction.editReply({
         embeds: [await successEmbed(interaction.guild.id, 'Verification Panel Sent',
-          `${GLYPHS.SUCCESS} Verification panel has been sent to ${channel}`)]
+          `${GLYPHS.SUCCESS} Verification panel has been sent to ${channel}.` +
+          (vs.enabled ? '' : '\n\n**Note:** The verification system is currently disabled. Use `/verify enable` to activate it.'))]
       });
       break;
     }
 
     case 'manual': {
+      const Verification = (await import('../../models/Verification.js')).default;
+      const { logManualVerification } = await import('./verificationHandler.js');
+
       const user = interaction.options.getUser('user');
       const member = await interaction.guild.members.fetch(user.id).catch(() => null);
 
       if (!member) {
         await interaction.editReply({
           embeds: [await errorEmbed(interaction.guild.id, 'User Not Found',
-            `${GLYPHS.ERROR} Could not find that user in this server.`)]
+            `${GLYPHS.ERROR} Could not find that user in this server, Master.`)]
         });
         return;
       }
 
-      const verifiedRoleId = guildConfig.features?.verificationSystem?.role || guildConfig.roles?.verifiedRole;
+      const verifiedRoleId = vs.role || guildConfig.roles?.verifiedRole;
       if (!verifiedRoleId) {
         await interaction.editReply({
           embeds: [await errorEmbed(interaction.guild.id, 'No Verified Role',
-            `${GLYPHS.ERROR} No verified role is configured. Use \`/verify setrole @role\``)]
+            `${GLYPHS.ERROR} No verified role is configured. Use \`/verify setrole\`, Master.`)]
         });
         return;
       }
 
-      await member.roles.add(verifiedRoleId);
+      try {
+        await member.roles.add(verifiedRoleId, `Manually verified by ${interaction.user.tag}`);
+      } catch (error) {
+        return interaction.editReply({
+          embeds: [await errorEmbed(interaction.guild.id, 'Verification Failed',
+            `${GLYPHS.ERROR} I could not assign <@&${verifiedRoleId}>: ${error.message}`)]
+        });
+      }
 
       // Remove unverified role if configured
-      const unverifiedRoleId = guildConfig.features?.verificationSystem?.unverifiedRole;
-      if (unverifiedRoleId && member.roles.cache.has(unverifiedRoleId)) {
-        await member.roles.remove(unverifiedRoleId).catch(() => { });
+      if (vs.unverifiedRole && member.roles.cache.has(vs.unverifiedRole)) {
+        await member.roles.remove(vs.unverifiedRole).catch(() => { });
       }
+
+      // Record and log it the same way the prefix command does
+      const verification = await Verification.getVerification(interaction.guild.id, member.id);
+      await verification.verify(`staff:${interaction.user.id}`);
 
       await interaction.editReply({
         embeds: [await successEmbed(interaction.guild.id, 'User Verified',
-          `${GLYPHS.SUCCESS} ${user} has been manually verified.`)]
+          `${GLYPHS.SUCCESS} ${user} has been manually verified, Master.`)]
       });
+
+      await logManualVerification(member, interaction.user, guildConfig);
       break;
     }
 
     case 'status': {
-      const vs = guildConfig.features?.verificationSystem || {};
-      const statusEmbed = await infoEmbed(interaction.guild.id, '🔐 Verification Status',
-        `**Enabled:** ${vs.enabled ? '✅ Yes' : '❌ No'}\n` +
-        `**Type:** ${vs.type || 'button'}\n` +
-        `**Verified Role:** ${vs.role ? `<@&${vs.role}>` : 'Not set'}\n` +
-        `**Unverified Role:** ${vs.unverifiedRole ? `<@&${vs.unverifiedRole}>` : 'Not set'}\n` +
-        `**Channel:** ${vs.channel ? `<#${vs.channel}>` : 'Not set'}`);
+      const statusEmbed = await infoEmbed(interaction.guild.id, 'Verification Status',
+        `**▸ Status:** ${vs.enabled ? '◉ Active' : '◇ Inactive'}`);
+      statusEmbed.addFields(
+        { name: '▸ Type', value: vs.type || 'button', inline: true },
+        { name: '▸ Verified Role', value: vs.role ? `<@&${vs.role}>` : 'Not set', inline: true },
+        { name: '▸ Unverified Role', value: vs.unverifiedRole ? `<@&${vs.unverifiedRole}>` : 'Not set', inline: true },
+        { name: '▸ Channel', value: vs.channel ? `<#${vs.channel}>` : 'Not set', inline: true }
+      );
       await interaction.editReply({ embeds: [statusEmbed] });
       break;
     }
@@ -2235,6 +2249,13 @@ async function handleVerifyCommand(interaction, client, guildConfig) {
 
     case 'setrole': {
       const role = interaction.options.getRole('role');
+      // Every member who verifies receives this role, so it must be safe to hand out
+      const roleError = getAssignableRoleError(role, interaction.member);
+      if (roleError) {
+        return interaction.editReply({
+          embeds: [await errorEmbed(interaction.guild.id, 'Role Not Allowed', roleError)]
+        });
+      }
       await Guild.updateGuild(interaction.guild.id, {
         $set: {
           'features.verificationSystem.role': role.id,
@@ -2292,7 +2313,8 @@ async function handleVerifyCommand(interaction, client, guildConfig) {
 
       await interaction.editReply({
         embeds: [await successEmbed(interaction.guild.id, 'Verification Type Set',
-          `${GLYPHS.SUCCESS} Verification type set to **${type}**\n\n${typeDescriptions[type]}\n\n⚠️ **Note:** You need to re-send the verification panel with \`/verify panel\` for changes to take effect.`)]
+          `${GLYPHS.SUCCESS} Verification type set to **${type}**\n\n${typeDescriptions[type]}\n\n` +
+          `**Note:** Re-send the verification panel with \`/verify panel\` for the change to take effect, Master.`)]
       });
       break;
     }
@@ -2302,25 +2324,36 @@ async function handleVerifyCommand(interaction, client, guildConfig) {
 // Handle cmdchannels command
 async function handleCmdchannelsCommand(interaction, guildConfig) {
   const { successEmbed, errorEmbed, infoEmbed, GLYPHS } = await import('../../utils/embeds.js');
-  const { EmbedBuilder } = await import('discord.js');
   const subcommand = interaction.options.getSubcommand();
 
-  // Initialize if not exists
-  const cmdChannels = guildConfig.commandChannels || { enabled: false, channels: [], bypassRoles: [] };
+  const cmdChannels = {
+    enabled: guildConfig.commandChannels?.enabled ?? false,
+    channels: guildConfig.commandChannels?.channels || [],
+    bypassRoles: guildConfig.commandChannels?.bypassRoles || []
+  };
+  const channelExists = (id) => interaction.guild.channels.cache.has(id);
 
   switch (subcommand) {
     case 'enable': {
-      if (cmdChannels.channels.length === 0) {
+      // Enabling with only deleted channels would block every command outside config ones
+      const existing = cmdChannels.channels.filter(channelExists);
+      if (existing.length === 0) {
         await interaction.editReply({
           embeds: [await errorEmbed(interaction.guild.id, 'No Channels Added',
-            `${GLYPHS.ERROR} Please add at least one channel first with \`/cmdchannels add\``)]
+            `${GLYPHS.ERROR} Please add at least one existing channel first with \`/cmdchannels add\`, Master.`)]
         });
         return;
       }
-      await Guild.updateGuild(interaction.guild.id, { $set: { 'commandChannels.enabled': true } });
+      const stale = cmdChannels.channels.length - existing.length;
+      await Guild.updateGuild(interaction.guild.id, {
+        $set: { 'commandChannels.enabled': true, 'commandChannels.channels': existing }
+      });
       await interaction.editReply({
         embeds: [await successEmbed(interaction.guild.id, 'Channel Restrictions Enabled',
-          `${GLYPHS.SUCCESS} Bot commands will now only work in allowed channels.`)]
+          `${GLYPHS.SUCCESS} Bot commands will now only work in the allowed channels.\n\n` +
+          `**Allowed Channels:** ${existing.length}\n` +
+          `**Bypass Roles:** ${cmdChannels.bypassRoles.length}` +
+          (stale ? `\n\n${GLYPHS.INFO} Removed ${stale} deleted channel(s) from the list.` : ''))]
       });
       break;
     }
@@ -2343,7 +2376,14 @@ async function handleCmdchannelsCommand(interaction, guildConfig) {
         });
         return;
       }
-      await Guild.updateGuild(interaction.guild.id, { $push: { 'commandChannels.channels': channel.id } });
+      if (!channel.isTextBased()) {
+        await interaction.editReply({
+          embeds: [await errorEmbed(interaction.guild.id, 'Invalid Channel Type',
+            `${GLYPHS.ERROR} Please select a channel members can send messages in, Master.`)]
+        });
+        return;
+      }
+      await Guild.updateGuild(interaction.guild.id, { $addToSet: { 'commandChannels.channels': channel.id } });
       await interaction.editReply({
         embeds: [await successEmbed(interaction.guild.id, 'Channel Added',
           `${GLYPHS.SUCCESS} ${channel} has been added to allowed channels.`)]
@@ -2352,18 +2392,43 @@ async function handleCmdchannelsCommand(interaction, guildConfig) {
     }
 
     case 'remove': {
-      const channel = interaction.options.getChannel('channel');
-      if (!cmdChannels.channels.includes(channel.id)) {
+      // A deleted channel can't be picked, so its ID (or mention) is accepted as text
+      const channelId = interaction.options.getChannel('channel')?.id ||
+        interaction.options.getString('channel_id')?.trim().match(/^(?:<#)?(\d{17,20})>?$/)?.[1];
+      if (!channelId) {
         await interaction.editReply({
-          embeds: [await errorEmbed(interaction.guild.id, 'Not Found',
-            `${GLYPHS.ERROR} ${channel} is not in the allowed channels list.`)]
+          embeds: [await errorEmbed(interaction.guild.id, 'Channel Required',
+            `${GLYPHS.ERROR} Please pick a \`channel\`, or give the \`channel_id\` of a deleted one, Master.`)]
         });
         return;
       }
-      await Guild.updateGuild(interaction.guild.id, { $pull: { 'commandChannels.channels': channel.id } });
+      if (!cmdChannels.channels.includes(channelId)) {
+        await interaction.editReply({
+          embeds: [await errorEmbed(interaction.guild.id, 'Not Found',
+            `${GLYPHS.ERROR} <#${channelId}> is not in the allowed channels list.`)]
+        });
+        return;
+      }
+
+      // Also drop channels that were deleted since they were added
+      const stale = cmdChannels.channels.filter(id => id !== channelId && !channelExists(id));
+      const remaining = cmdChannels.channels.filter(id => id !== channelId && !stale.includes(id));
+      const update = { $pull: { 'commandChannels.channels': { $in: [channelId, ...stale] } } };
+
+      // With no channels left, an active restriction would block every non-config command
+      const autoDisabled = cmdChannels.enabled && remaining.length === 0;
+      if (autoDisabled) update.$set = { 'commandChannels.enabled': false };
+
+      await Guild.updateGuild(interaction.guild.id, update);
+
+      const label = channelExists(channelId) ? `<#${channelId}>` : `Deleted channel (\`${channelId}\`)`;
+      let description = `${GLYPHS.SUCCESS} ${label} has been removed from the allowed channels.\n\n` +
+        `**Remaining Channels:** ${remaining.length}`;
+      if (stale.length) description += `\n${GLYPHS.INFO} Also removed ${stale.length} deleted channel(s).`;
+      if (autoDisabled) description += `\n\n${GLYPHS.WARNING} No allowed channels remain, so channel restrictions have been disabled.`;
+
       await interaction.editReply({
-        embeds: [await successEmbed(interaction.guild.id, 'Channel Removed',
-          `${GLYPHS.SUCCESS} ${channel} has been removed from allowed channels.`)]
+        embeds: [await successEmbed(interaction.guild.id, 'Channel Removed', description)]
       });
       break;
     }
@@ -2411,170 +2476,155 @@ async function handleCmdchannelsCommand(interaction, guildConfig) {
         ? cmdChannels.bypassRoles.map(id => `<@&${id}>`).join('\n')
         : '*No bypass roles*';
 
-      const embed = new EmbedBuilder()
-        .setTitle('📢 Command Channel Settings')
-        .setColor(guildConfig.embedStyle?.color || '#5865F2')
-        .addFields(
-          { name: '📊 Status', value: cmdChannels.enabled ? '✅ Enabled' : '❌ Disabled', inline: true },
-          { name: '💬 Allowed Channels', value: channelsList, inline: false },
-          { name: '👑 Bypass Roles', value: bypassList, inline: false }
-        );
+      const embed = await infoEmbed(interaction.guild.id, 'Command Channel Settings',
+        `**▸ Status:** ${cmdChannels.enabled ? '◉ Restrictions active' : '◇ Restrictions inactive'}`);
+      embed.addFields(
+        { name: '▸ Allowed Channels', value: truncateList(channelsList.replace(/\n/g, ', '), 1024), inline: false },
+        { name: '▸ Bypass Roles', value: truncateList(bypassList.replace(/\n/g, ', '), 1024), inline: false }
+      );
       await interaction.editReply({ embeds: [embed] });
       break;
     }
   }
 }
 
-// Handle logs command
+// Handle logs command. Log types come from the prefix setlogs command (LOG_TYPES in
+// src/commands/config/logs.js), so both forms write the same channel fields. There is no
+// separate on/off flag: a log type is active while its channel is set, which is what the
+// logging events check.
 async function handleLogsCommand(interaction, guildConfig) {
-  const { successEmbed, infoEmbed, GLYPHS } = await import('../../utils/embeds.js');
-  const { EmbedBuilder } = await import('discord.js');
+  const { successEmbed, errorEmbed, infoEmbed, GLYPHS } = await import('../../utils/embeds.js');
+  const { LOG_TYPES } = await import('../../commands/config/logs.js');
+  const guildId = interaction.guild.id;
   const subcommand = interaction.options.getSubcommand();
+  const rawType = interaction.options.getString('type');
+  const type = rawType === 'moderation' ? 'mod' : rawType; // value used before the choices matched LOG_TYPES
+  const channel = interaction.options.getChannel('channel');
+  const channels = guildConfig.channels || {};
 
-  const logTypes = {
-    message: 'logging.messages',
-    member: 'logging.members',
-    voice: 'logging.voice',
-    moderation: 'logging.moderation',
-    server: 'logging.server'
-  };
+  if (type && type !== 'all' && !LOG_TYPES[type]) {
+    return interaction.editReply({
+      embeds: [await errorEmbed(guildId, 'Invalid Log Type', `${GLYPHS.ERROR} \`${rawType}\` is not a log type I know, Master.`)]
+    });
+  }
+  // Same rule as setlogs: log channels must be text channels
+  if (channel && channel.type !== ChannelType.GuildText) {
+    return interaction.editReply({
+      embeds: [await errorEmbed(guildId, 'Invalid Channel', `${GLYPHS.ERROR} Please select a text channel, Master.`)]
+    });
+  }
 
-  const channelTypes = {
-    message: 'channels.messageLog',
-    member: 'channels.joinLog',
-    voice: 'channels.voiceLog',
-    moderation: 'channels.modLog',
-    server: 'channels.serverLog'
+  const logs = type === 'all' ? Object.values(LOG_TYPES) : [LOG_TYPES[type]].filter(Boolean);
+  const typeLabel = type === 'all' ? 'All logs' : LOG_TYPES[type]?.name;
+  // Point the selected log types, and any config paths that share their channel, at channelId
+  const setChannel = async (channelId) => {
+    const update = {};
+    for (const log of logs) {
+      update[`channels.${log.field}`] = channelId;
+      for (const path of log.alsoSets || []) update[path] = channelId;
+    }
+    await Guild.updateGuild(guildId, { $set: update });
   };
 
   switch (subcommand) {
     case 'enable': {
-      const type = interaction.options.getString('type');
-      if (type === 'all') {
-        await Guild.updateGuild(interaction.guild.id, {
-          $set: {
-            'logging.messages': true,
-            'logging.members': true,
-            'logging.voice': true,
-            'logging.moderation': true,
-            'logging.server': true
-          }
-        });
-        await interaction.editReply({
-          embeds: [await successEmbed(interaction.guild.id, 'All Logs Enabled',
-            `${GLYPHS.SUCCESS} All logging types have been enabled.`)]
-        });
-      } else {
-        await Guild.updateGuild(interaction.guild.id, { $set: { [logTypes[type]]: true } });
-        await interaction.editReply({
-          embeds: [await successEmbed(interaction.guild.id, 'Logging Enabled',
-            `${GLYPHS.SUCCESS} ${type.charAt(0).toUpperCase() + type.slice(1)} logging is now enabled.`)]
+      if (channel) {
+        await setChannel(channel.id);
+        return interaction.editReply({
+          embeds: [await successEmbed(guildId, 'Logging Enabled',
+            `${GLYPHS.SUCCESS} **${typeLabel}** will now be sent to ${channel}, Master.`)]
         });
       }
-      break;
+
+      // Without a channel there is nothing to switch on: report what is already routed
+      const missing = logs.filter(log => !channels[log.field]);
+      if (missing.length === 0) {
+        return interaction.editReply({
+          embeds: [await successEmbed(guildId, 'Logging Active',
+            `${GLYPHS.SUCCESS} ${logs.map(log => `**${log.name}** ${GLYPHS.ARROW_RIGHT} <#${channels[log.field]}>`).join('\n')}`)]
+        });
+      }
+      return interaction.editReply({
+        embeds: [await errorEmbed(guildId, 'Channel Required',
+          `${GLYPHS.ERROR} No channel is set for: ${missing.map(log => `**${log.name}**`).join(', ')}.\n\n` +
+          `Use \`/logs enable type:${rawType} channel:#channel\` to choose where these logs go, Master.`)]
+      });
     }
 
     case 'disable': {
-      const type = interaction.options.getString('type');
-      if (type === 'all') {
-        await Guild.updateGuild(interaction.guild.id, {
-          $set: {
-            'logging.messages': false,
-            'logging.members': false,
-            'logging.voice': false,
-            'logging.moderation': false,
-            'logging.server': false
-          }
-        });
-        await interaction.editReply({
-          embeds: [await successEmbed(interaction.guild.id, 'All Logs Disabled',
-            `${GLYPHS.SUCCESS} All logging types have been disabled.`)]
-        });
-      } else {
-        await Guild.updateGuild(interaction.guild.id, { $set: { [logTypes[type]]: false } });
-        await interaction.editReply({
-          embeds: [await successEmbed(interaction.guild.id, 'Logging Disabled',
-            `${GLYPHS.SUCCESS} ${type.charAt(0).toUpperCase() + type.slice(1)} logging is now disabled.`)]
-        });
-      }
-      break;
+      await setChannel(null);
+      return interaction.editReply({
+        embeds: [await successEmbed(guildId, 'Logging Disabled',
+          `${GLYPHS.SUCCESS} **${typeLabel}** ${type === 'all' ? 'have' : 'has'} been disabled. Set a channel again to resume, Master.`)]
+      });
     }
 
     case 'channel': {
-      const type = interaction.options.getString('type');
-      const channel = interaction.options.getChannel('channel');
-      await Guild.updateGuild(interaction.guild.id, { $set: { [channelTypes[type]]: channel.id } });
-      await interaction.editReply({
-        embeds: [await successEmbed(interaction.guild.id, 'Log Channel Set',
-          `${GLYPHS.SUCCESS} ${type.charAt(0).toUpperCase() + type.slice(1)} logs will be sent to ${channel}`)]
+      await setChannel(channel.id);
+      return interaction.editReply({
+        embeds: [await successEmbed(guildId, 'Log Channel Set',
+          `${GLYPHS.SUCCESS} **${typeLabel}** will now be sent to ${channel}.\n\n**Logs:** ${LOG_TYPES[type].description}`)]
       });
-      break;
     }
 
     case 'status': {
-      const logging = guildConfig.logging || {};
-      const channels = guildConfig.channels || {};
-
-      const statusEmbed = new EmbedBuilder()
-        .setTitle('📋 Logging Status')
-        .setColor(guildConfig.embedStyle?.color || '#5865F2')
-        .addFields(
-          { name: '📝 Message Logs', value: `${logging.messages ? '✅' : '❌'} ${channels.messageLog ? `<#${channels.messageLog}>` : 'No channel'}`, inline: true },
-          { name: '👥 Member Logs', value: `${logging.members ? '✅' : '❌'} ${channels.joinLog ? `<#${channels.joinLog}>` : 'No channel'}`, inline: true },
-          { name: '🔊 Voice Logs', value: `${logging.voice ? '✅' : '❌'} ${channels.voiceLog ? `<#${channels.voiceLog}>` : 'No channel'}`, inline: true },
-          { name: '🔨 Moderation Logs', value: `${logging.moderation ? '✅' : '❌'} ${channels.modLog ? `<#${channels.modLog}>` : 'No channel'}`, inline: true },
-          { name: '⚙️ Server Logs', value: `${logging.server ? '✅' : '❌'} ${channels.serverLog ? `<#${channels.serverLog}>` : 'No channel'}`, inline: true }
-        );
-      await interaction.editReply({ embeds: [statusEmbed] });
-      break;
+      const embed = await infoEmbed(guildId, 'Logging Status',
+        `${GLYPHS.ARROW_RIGHT} A log type is active while it has a channel, Master.`);
+      embed.addFields(Object.values(LOG_TYPES).slice(0, 25).map(log => ({
+        name: `▸ ${log.name}`,
+        value: !channels[log.field]
+          ? '◇ Not configured'
+          : interaction.guild.channels.cache.has(channels[log.field]) ? `◉ <#${channels[log.field]}>` : '◈ Channel deleted',
+        inline: true
+      })));
+      return interaction.editReply({ embeds: [embed] });
     }
   }
 }
 
+// Auto-roles live in the autoRole block of the schema, which the guildMemberAdd autoRole event
+// reads: roles go to every human who joins, botRoles to bots.
+const AUTOROLE_TARGETS = {
+  all: { paths: ['autoRole.roles', 'autoRole.botRoles'], label: 'all new members and bots' },
+  humans: { paths: ['autoRole.roles'], label: 'new members (humans only)' },
+  bots: { paths: ['autoRole.botRoles'], label: 'bots only' }
+};
+
 // Handle autorole command
 async function handleAutoroleCommand(interaction, guildConfig) {
   const { successEmbed, errorEmbed, infoEmbed, GLYPHS } = await import('../../utils/embeds.js');
-  const { EmbedBuilder } = await import('discord.js');
   const subcommand = interaction.options.getSubcommand();
-
-  const autoroles = guildConfig.autorole || { enabled: true, roles: [], humanRoles: [], botRoles: [] };
+  const autoRole = guildConfig.autoRole || {};
 
   switch (subcommand) {
     case 'add': {
       const role = interaction.options.getRole('role');
-      const type = interaction.options.getString('type') || 'all';
+      const target = AUTOROLE_TARGETS[interaction.options.getString('type') || 'all'];
 
-      // Prevent adding color roles to autorole
-      if (role.name.startsWith('🎨 ')) {
-        await interaction.editReply({
-          embeds: [await errorEmbed(interaction.guild.id, 'Color Role Detected',
-            `${GLYPHS.ERROR} ${role} is a color role and should not be added to auto-roles!\n\n` +
-            `Color roles are meant to be selected by members via the color roles panel, not assigned automatically.`)]
+      const roleError = getAssignableRoleError(role, interaction.member);
+      if (roleError) {
+        return interaction.editReply({
+          embeds: [await errorEmbed(interaction.guild.id, 'Role Not Allowed', roleError)]
         });
-        return;
       }
 
-      let targetArray;
-      let displayType;
-      if (type === 'humans') {
-        targetArray = 'autorole.humanRoles';
-        displayType = 'humans only';
-      } else if (type === 'bots') {
-        targetArray = 'autorole.botRoles';
-        displayType = 'bots only';
-      } else {
-        targetArray = 'autorole.roles';
-        displayType = 'all members';
+      // Color roles are picked by members from the color roles panel, never assigned automatically
+      if (role.name.startsWith('🎨 ')) {
+        return interaction.editReply({
+          embeds: [await errorEmbed(interaction.guild.id, 'Color Role Detected',
+            `${GLYPHS.ERROR} ${role} is a color role and should not be added to auto-roles, Master.\n\n` +
+            `Color roles are meant to be selected by members via the color roles panel, not assigned automatically.`)]
+        });
       }
 
       await Guild.updateGuild(interaction.guild.id, {
-        $addToSet: { [targetArray]: role.id },
-        $set: { 'autorole.enabled': true }
+        $addToSet: Object.fromEntries(target.paths.map(path => [path, role.id])),
+        $set: { 'autoRole.enabled': true }
       });
 
       await interaction.editReply({
         embeds: [await successEmbed(interaction.guild.id, 'Auto-Role Added',
-          `${GLYPHS.SUCCESS} ${role} will be given to ${displayType} when they join.`)]
+          `${GLYPHS.SUCCESS} ${role} will be given to ${target.label} when they join.\n\n**Status:** Auto-roles are active.`)]
       });
       break;
     }
@@ -2583,9 +2633,8 @@ async function handleAutoroleCommand(interaction, guildConfig) {
       const role = interaction.options.getRole('role');
       await Guild.updateGuild(interaction.guild.id, {
         $pull: {
-          'autorole.roles': role.id,
-          'autorole.humanRoles': role.id,
-          'autorole.botRoles': role.id
+          'autoRole.roles': role.id,
+          'autoRole.botRoles': role.id
         }
       });
       await interaction.editReply({
@@ -2596,17 +2645,13 @@ async function handleAutoroleCommand(interaction, guildConfig) {
     }
 
     case 'list': {
-      const allRoles = (autoroles.roles || []).map(id => `<@&${id}> (all)`);
-      const humanRoles = (autoroles.humanRoles || []).map(id => `<@&${id}> (humans)`);
-      const botRoles = (autoroles.botRoles || []).map(id => `<@&${id}> (bots)`);
-      const combined = [...allRoles, ...humanRoles, ...botRoles];
-
-      const embed = new EmbedBuilder()
-        .setTitle('🎭 Auto-Roles')
-        .setColor(guildConfig.embedStyle?.color || '#5865F2')
-        .setDescription(combined.length > 0 ? combined.join('\n') : '*No auto-roles configured*')
-        .setFooter({ text: `Status: ${autoroles.enabled ? 'Enabled' : 'Disabled'}` });
-
+      const format = (ids = []) => truncateList(ids.map(id => `<@&${id}>`).join(', '), 1024) || 'None';
+      const embed = await infoEmbed(interaction.guild.id, 'Auto-Roles',
+        `**▸ Status:** ${autoRole.enabled ? '◉ Active' : '◇ Inactive'}`);
+      embed.addFields(
+        { name: '▸ New Members', value: format(autoRole.roles), inline: false },
+        { name: '▸ Bots', value: format(autoRole.botRoles), inline: false }
+      );
       await interaction.editReply({ embeds: [embed] });
       break;
     }
@@ -2614,9 +2659,8 @@ async function handleAutoroleCommand(interaction, guildConfig) {
     case 'clear': {
       await Guild.updateGuild(interaction.guild.id, {
         $set: {
-          'autorole.roles': [],
-          'autorole.humanRoles': [],
-          'autorole.botRoles': []
+          'autoRole.roles': [],
+          'autoRole.botRoles': []
         }
       });
       await interaction.editReply({
@@ -2628,476 +2672,156 @@ async function handleAutoroleCommand(interaction, guildConfig) {
   }
 }
 
-// Feature management slash command handler
+// Feature management slash command handler. /feature runs the prefix feature command, so both
+// use the same categories (built from the loaded commands), system flags and protected commands.
 async function handleFeatureCommand(interaction, client, guildConfig) {
-  const { successEmbed, errorEmbed, infoEmbed, GLYPHS } = await import('../../utils/embeds.js');
-  const { EmbedBuilder } = await import('discord.js');
+  const { errorEmbed, infoEmbed, GLYPHS } = await import('../../utils/embeds.js');
+  const featureCommand = (await import('../../commands/config/feature.js')).default;
 
-  const guildId = interaction.guild.id;
   const featureType = interaction.options.getString('type');
   const status = interaction.options.getString('status');
-  const customCommand = interaction.options.getString('command')?.toLowerCase();
+  const customCommand = interaction.options.getString('command')?.trim().toLowerCase().replace(/^\//, '');
 
-  // Define feature categories and their associated commands
-  const featureCategories = {
-    economy: ['balance', 'daily', 'shop', 'inventory', 'profile', 'setprofile', 'setbackground', 'claim', 'addcoins', 'rep'],
-    gambling: ['slots', 'blackjack', 'coinflip', 'dice', 'roulette', 'adventure'],
-    leveling: ['level', 'rank', 'top', 'leaderboard', 'xp'],
-    games: ['trivia', 'tictactoe'],
-    fun: ['meme', 'gif', 'poll'],
-    birthdays: ['birthday', 'setbirthday', 'mybirthday', 'birthdays', 'requestbirthday', 'approvebday', 'rejectbday', 'cancelbirthday', 'removebirthday', 'birthdaypreference', 'birthdayrequests'],
-    giveaways: ['giveaway', 'gstart', 'gend', 'greroll'],
-    events: ['createevent', 'events', 'joinevent', 'cancelevent'],
-    starboard: ['starboard'],
-    tickets: ['ticket', 'ticketpanel'],
-    afk: ['afk'],
-    reminders: ['remind', 'reminder'],
-    automod: ['automod'],
-    welcome: ['welcome'],
-    boost: ['boost'] // Special feature toggle
-  };
-
-  // Handle Boost System specially (feature toggle + commands)
-  if (featureType === 'boost') {
-    if (status === 'status') {
-      const boostConfig = guildConfig.features?.boostSystem || {};
-      const boostChannel = boostConfig.channel ? interaction.guild.channels.cache.get(boostConfig.channel) : null;
-
-      const embed = new EmbedBuilder()
-        .setTitle('💎 Server Boost Announcements Status')
-        .setColor(boostConfig.enabled ? '#FF73FA' : '#FF4757')
-        .setDescription(
-          `**Status:** ${boostConfig.enabled ? '✅ Enabled' : '❌ Disabled'}\n` +
-          `**Channel:** ${boostChannel ? `<#${boostChannel.id}>` : 'Not set'}\n` +
-          `**Embed Mode:** ${boostConfig.embedEnabled !== false ? '✅' : '❌'}\n\n` +
-          `**Configure with:**\n` +
-          `• \`/boost channel\` - Set announcement channel\n` +
-          `• \`/boost message\` - Customize message\n` +
-          `• \`/boost test\` - Preview message`
-        )
-        .setFooter({ text: 'Use /feature type:boost to toggle on/off' });
-
-      return interaction.editReply({ embeds: [embed] });
-    }
-
-    const isEnabling = status === 'enable';
-    await Guild.updateGuild(guildId, {
-      $set: { 'features.boostSystem.enabled': isEnabling }
-    });
-
-    return interaction.editReply({
-      embeds: [await successEmbed(guildId,
-        `Boost Announcements ${isEnabling ? 'Enabled' : 'Disabled'}`,
-        `${GLYPHS.SUCCESS} **💎 Server Boost Announcements** have been ${isEnabling ? 'enabled' : 'disabled'}.\n\n` +
-        (isEnabling
-          ? `The bot will now send thank you messages when members boost the server.\n\n` +
-          `**Configure with:**\n` +
-          `• \`/boost channel\` - Set announcement channel\n` +
-          `• \`/boost message\` - Customize message\n` +
-          `• \`/boost test\` - Preview message`
-          : `Boost thank you messages have been disabled.`)
-      )]
-    });
-  }
-
-  // Handle AI Chat specially (it's a feature toggle, not command-based)
-  if (featureType === 'aichat') {
-    if (status === 'status') {
-      const aiConfig = guildConfig.features?.aiChat || {};
-      const embed = new EmbedBuilder()
-        .setTitle('🤖 AI Chat (Raphael) Status')
-        .setColor(aiConfig.enabled ? '#00FF7F' : '#FF4757')
-        .setDescription(
-          `**Status:** ${aiConfig.enabled ? '✅ Enabled' : '❌ Disabled'}\n` +
-          `**Troll Mode:** ${aiConfig.trollMode ? '😈 Enabled' : '😇 Disabled'}\n\n` +
-          `**How to use:**\n` +
-          `• Mention the bot: <@${client.user.id}> hello!\n` +
-          `• Reply to the bot's messages\n\n` +
-          `**Personality:** Raphael (from Tensura)\n` +
-          `**Powered by:** Pollinations AI (Free)`
-        )
-        .setFooter({ text: 'Use /feature type:troll to toggle chaos mode' });
-
-      return interaction.editReply({ embeds: [embed] });
-    }
-
-    const isEnabling = status === 'enable';
-    await Guild.updateGuild(guildId, {
-      $set: { 'features.aiChat.enabled': isEnabling }
-    });
-
-    return interaction.editReply({
-      embeds: [await successEmbed(guildId,
-        `AI Chat ${isEnabling ? 'Enabled' : 'Disabled'}`,
-        `${GLYPHS.SUCCESS} **🤖 AI Chat (Raphael)** has been ${isEnabling ? 'enabled' : 'disabled'}.\n\n` +
-        (isEnabling
-          ? `Users can now chat with Raphael by mentioning <@${client.user.id}> or replying to the bot's messages.`
-          : `The AI chat feature is now disabled.`)
-      )]
-    });
-  }
-
-  // Handle Troll Mode toggle
-  if (featureType === 'troll') {
-    if (status === 'status') {
-      const aiConfig = guildConfig.features?.aiChat || {};
-      const embed = new EmbedBuilder()
-        .setTitle('😈 Troll Mode Status')
-        .setColor(aiConfig.trollMode ? '#FF4757' : '#667eea')
-        .setDescription(
-          `**AI Chat:** ${aiConfig.enabled ? '✅ Enabled' : '❌ Disabled'}\n` +
-          `**Troll Mode:** ${aiConfig.trollMode ? '😈 Enabled' : '😇 Disabled'}\n\n` +
-          (aiConfig.trollMode
-            ? `Raphael is in **chaos mode** - expect unhinged, chaotic responses! 💀`
-            : `Raphael is being normal... for now.`)
-        )
-        .setFooter({ text: 'Enable troll mode for maximum chaos' });
-
-      return interaction.editReply({ embeds: [embed] });
-    }
-
-    // Check if AI Chat is enabled first
-    const aiEnabled = guildConfig.features?.aiChat?.enabled;
-    const isEnabling = status === 'enable';
-
-    if (!aiEnabled && isEnabling) {
-      return interaction.editReply({
-        embeds: [await errorEmbed(guildId, 'AI Chat Disabled',
-          `${GLYPHS.ERROR} AI Chat must be enabled before you can enable Troll Mode!\n\n` +
-          `Use \`/feature type:aichat status:enable\` first.`
-        )]
-      });
-    }
-
-    await Guild.updateGuild(guildId, {
-      $set: { 'features.aiChat.trollMode': isEnabling }
-    });
-
-    return interaction.editReply({
-      embeds: [await successEmbed(guildId,
-        `Troll Mode ${isEnabling ? 'Enabled 😈' : 'Disabled 😇'}`,
-        `${GLYPHS.SUCCESS} **Troll Mode** has been ${isEnabling ? 'enabled' : 'disabled'}.\n\n` +
-        (isEnabling
-          ? `Raphael is now in **chaos mode** - expect unhinged, chaotic, and absolutely based responses. 💀`
-          : `Raphael is back to normal - cheeky but reasonable.`)
-      )]
-    });
-  }
-
-  // Get commands for the selected feature
-  let commandsToManage = [];
-  let featureName = '';
-
+  let target = featureType;
   if (featureType === 'custom') {
     if (!customCommand) {
       return interaction.editReply({
-        embeds: [await errorEmbed(guildId, 'Missing Command',
-          `${GLYPHS.ERROR} Please specify a command name using the \`command\` option.`)]
+        embeds: [await errorEmbed(interaction.guild.id, 'Missing Command',
+          `${GLYPHS.ERROR} Please specify a command name using the \`command\` option, Master.`)]
       });
     }
-    commandsToManage = [customCommand];
-    featureName = `Command: ${customCommand}`;
-  } else {
-    commandsToManage = featureCategories[featureType] || [];
-    const featureNames = {
-      economy: '💰 Economy',
-      gambling: '🎰 Gambling',
-      leveling: '📊 Leveling',
-      games: '🎮 Games',
-      fun: '😂 Fun',
-      birthdays: '🎂 Birthdays',
-      giveaways: '🎉 Giveaways',
-      events: '📅 Events',
-      starboard: '⭐ Starboard',
-      tickets: '🎫 Tickets',
-      afk: '💤 AFK',
-      reminders: '⏰ Reminders',
-      automod: '🛡️ AutoMod',
-      welcome: '👋 Welcome',
-      boost: '💎 Server Boost'
-    };
-    featureName = featureNames[featureType] || featureType;
-  }
+    target = customCommand;
 
-  // Handle status view
-  if (status === 'status') {
-    const disabledText = guildConfig.textCommands?.disabledCommands || [];
-    const disabledSlash = guildConfig.slashCommands?.disabledCommands || [];
-
-    const commandStatus = commandsToManage.map(cmd => {
-      const textDisabled = disabledText.includes(cmd);
-      const slashDisabled = disabledSlash.includes(cmd);
-      const icon = (!textDisabled && !slashDisabled) ? '✅' : (textDisabled && slashDisabled) ? '❌' : '⚠️';
-      return `${icon} \`${cmd}\``;
-    });
-
-    const embed = new EmbedBuilder()
-      .setTitle(`${featureName} Status`)
-      .setDescription(commandStatus.join('\n') || 'No commands in this category')
-      .setColor('#667eea')
-      .setFooter({ text: '✅ Enabled | ❌ Disabled | ⚠️ Partially disabled' });
-
-    return interaction.editReply({ embeds: [embed] });
-  }
-
-  // Enable or disable
-  const isEnabling = status === 'enable';
-  const disabledText = [...(guildConfig.textCommands?.disabledCommands || [])];
-  const disabledSlash = [...(guildConfig.slashCommands?.disabledCommands || [])];
-
-  // Protected commands that cannot be disabled
-  const protectedCommands = ['help', 'config', 'feature', 'setup'];
-
-  let modifiedCount = 0;
-  let skippedProtected = [];
-
-  for (const cmd of commandsToManage) {
-    if (!isEnabling && protectedCommands.includes(cmd)) {
-      skippedProtected.push(cmd);
-      continue;
-    }
-
-    if (isEnabling) {
-      // Remove from disabled lists
-      const textIdx = disabledText.indexOf(cmd);
-      if (textIdx > -1) { disabledText.splice(textIdx, 1); modifiedCount++; }
-      const slashIdx = disabledSlash.indexOf(cmd);
-      if (slashIdx > -1) { disabledSlash.splice(slashIdx, 1); modifiedCount++; }
-    } else {
-      // Add to disabled lists
-      if (!disabledText.includes(cmd)) { disabledText.push(cmd); modifiedCount++; }
-      if (!disabledSlash.includes(cmd)) { disabledSlash.push(cmd); modifiedCount++; }
+    // The prefix command reports status per feature, not per command
+    if (status === 'status') {
+      const name = client.commands.get(customCommand)?.name ||
+        client.commands.get(client.aliases?.get(customCommand))?.name ||
+        (SLASH_COMMAND_NAMES.has(customCommand) ? customCommand : null);
+      if (!name) {
+        return interaction.editReply({
+          embeds: [await errorEmbed(interaction.guild.id, 'Unknown Command',
+            `${GLYPHS.ERROR} \`${customCommand}\` is not one of my commands, Master.`)]
+        });
+      }
+      const textDisabled = guildConfig.textCommands?.disabledCommands?.includes(name);
+      const slashDisabled = guildConfig.slashCommands?.disabledCommands?.includes(name);
+      const embed = await infoEmbed(interaction.guild.id, `Command: ${name}`,
+        `**▸ Status:** ${textDisabled && slashDisabled ? '◇ Disabled' : textDisabled || slashDisabled ? '◈ Partly disabled' : '◉ Enabled'}`);
+      embed.addFields(
+        { name: '▸ Text Command', value: textDisabled ? '◇ Disabled' : '◉ Enabled', inline: true },
+        { name: '▸ Slash Command', value: slashDisabled ? '◇ Disabled' : '◉ Enabled', inline: true }
+      );
+      return interaction.editReply({ embeds: [embed] });
     }
   }
 
-  await Guild.updateGuild(guildId, {
-    $set: {
-      'textCommands.disabledCommands': disabledText,
-      'slashCommands.disabledCommands': disabledSlash
-    }
-  });
-
-  let description = `${GLYPHS.SUCCESS} **${featureName}** has been ${isEnabling ? 'enabled' : 'disabled'}.\n\n`;
-  description += `**Commands affected:** ${commandsToManage.length}\n`;
-  description += `**Commands:** ${commandsToManage.map(c => `\`${c}\``).join(', ')}`;
-
-  if (skippedProtected.length > 0) {
-    description += `\n\n⚠️ **Skipped (protected):** ${skippedProtected.map(c => `\`${c}\``).join(', ')}`;
-  }
-
-  return interaction.editReply({
-    embeds: [await successEmbed(guildId,
-      `Feature ${isEnabling ? 'Enabled' : 'Disabled'}`,
-      description)]
-  });
+  const args = [status, target];
+  await featureCommand.execute(createDeferredCommandMessage(interaction, client, { args }), args, client);
 }
 
-async function handleGiveawayCommand(interaction, client, guildConfig) {
-  const { successEmbed, errorEmbed, infoEmbed, GLYPHS } = await import('../../utils/embeds.js');
-  const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = await import('discord.js');
+// Giveaway durations offered by /giveaway start
+const GIVEAWAY_DURATION_UNITS = { s: 1000, m: 60000, h: 3600000, d: 86400000, w: 604800000 };
+
+// /giveaway start posts the shared giveaway message (buildGiveawayMessage, also used by the
+// prefix command and the entry button handler); end, reroll, list and delete run the prefix
+// command, so winners are drawn the same way (members only, no repeat winners on reroll)
+async function handleGiveawayCommand(interaction, client) {
+  const { successEmbed, errorEmbed, GLYPHS } = await import('../../utils/embeds.js');
   const Giveaway = (await import('../../models/Giveaway.js')).default;
-  const { endGiveawayById } = await import('../../commands/community/giveaway.js');
+  const giveawayModule = await import('../../commands/community/giveaway.js');
 
   const subcommand = interaction.options.getSubcommand();
 
-  switch (subcommand) {
-    case 'start': {
-      const durationStr = interaction.options.getString('duration');
-      const winners = interaction.options.getInteger('winners');
-      const prize = interaction.options.getString('prize');
-      const requiredRole = interaction.options.getRole('required_role');
-
-      // Parse duration
-      const durationMatch = durationStr.match(/^(\d+)(s|m|h|d|w)$/i);
-      if (!durationMatch) {
-        return interaction.editReply({
-          embeds: [await errorEmbed(interaction.guild.id, 'Invalid Duration',
-            'Please provide a valid duration.')]
-        });
-      }
-
-      const value = parseInt(durationMatch[1]);
-      const unit = durationMatch[2].toLowerCase();
-      const multipliers = { s: 1000, m: 60000, h: 3600000, d: 86400000, w: 604800000 };
-      const duration = value * multipliers[unit];
-
-      const endsAt = new Date(Date.now() + duration);
-
-      // Create giveaway embed
-      const embed = new EmbedBuilder()
-        .setColor(guildConfig.embedStyle?.color || '#FF69B4')
-        .setTitle('🎉 GIVEAWAY 🎉')
-        .setDescription(
-          `**Prize:** ${prize}\n\n` +
-          `**Winners:** ${winners}\n` +
-          `**Hosted by:** ${interaction.user}\n` +
-          (requiredRole ? `**Required Role:** ${requiredRole}\n\n` : '\n') +
-          `**Ends:** <t:${Math.floor(endsAt.getTime() / 1000)}:R>\n\n` +
-          `Click the button below to enter!`
-        )
-        .setFooter({ text: 'Ends at' })
-        .setTimestamp(endsAt);
-
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId('giveaway_enter')
-          .setLabel('🎉 Enter (0)')
-          .setStyle(ButtonStyle.Primary),
-        new ButtonBuilder()
-          .setCustomId('giveaway_participants')
-          .setLabel('👥 Participants')
-          .setStyle(ButtonStyle.Secondary)
-      );
-
-      const giveawayMessage = await interaction.channel.send({
-        embeds: [embed],
-        components: [row]
-      });
-
-      // Save to database
-      await Giveaway.create({
-        guildId: interaction.guild.id,
-        channelId: interaction.channel.id,
-        messageId: giveawayMessage.id,
-        hostId: interaction.user.id,
-        prize,
-        winners,
-        endsAt,
-        participants: [],
-        requirements: requiredRole ? { roleId: requiredRole.id } : undefined
-      });
-
-      return interaction.editReply({
-        embeds: [await successEmbed(interaction.guild.id, 'Giveaway Started!',
-          `${GLYPHS.SUCCESS} Giveaway for **${prize}** has started!\n` +
-          `Ends <t:${Math.floor(endsAt.getTime() / 1000)}:R>`)]
-      });
-    }
-
-    case 'end': {
-      const messageId = interaction.options.getString('message_id');
-      const giveaway = await Giveaway.findOne({ messageId, guildId: interaction.guild.id });
-
-      if (!giveaway) {
-        return interaction.editReply({
-          embeds: [await errorEmbed(interaction.guild.id, 'Not Found',
-            'Could not find a giveaway with that message ID.')]
-        });
-      }
-
-      if (giveaway.ended) {
-        return interaction.editReply({
-          embeds: [await errorEmbed(interaction.guild.id, 'Already Ended',
-            'This giveaway has already ended.')]
-        });
-      }
-
-      await endGiveawayById(interaction.guild, giveaway);
-
-      return interaction.editReply({
-        embeds: [await successEmbed(interaction.guild.id, 'Giveaway Ended',
-          `${GLYPHS.SUCCESS} The giveaway has been ended!`)]
-      });
-    }
-
-    case 'reroll': {
-      const messageId = interaction.options.getString('message_id');
-      const giveaway = await Giveaway.findOne({ messageId, guildId: interaction.guild.id });
-
-      if (!giveaway) {
-        return interaction.editReply({
-          embeds: [await errorEmbed(interaction.guild.id, 'Not Found',
-            'Could not find a giveaway with that message ID.')]
-        });
-      }
-
-      if (!giveaway.ended) {
-        return interaction.editReply({
-          embeds: [await errorEmbed(interaction.guild.id, 'Not Ended',
-            'This giveaway has not ended yet. Use `/giveaway end` first.')]
-        });
-      }
-
-      if (giveaway.participants.length === 0) {
-        return interaction.editReply({
-          embeds: [await errorEmbed(interaction.guild.id, 'No Participants',
-            'There were no participants in this giveaway.')]
-        });
-      }
-
-      // Pick new winners
-      const newWinners = giveaway.pickWinners();
-      giveaway.winnerIds = newWinners;
-      await giveaway.save();
-
-      const channel = interaction.guild.channels.cache.get(giveaway.channelId);
-      if (channel) {
-        const winnerMentions = newWinners.map(id => `<@${id}>`).join(', ');
-        await channel.send({
-          content: `🎉 **REROLL!** New winner(s): ${winnerMentions}\n**Prize:** ${giveaway.prize}`
-        });
-      }
-
-      return interaction.editReply({
-        embeds: [await successEmbed(interaction.guild.id, 'Giveaway Rerolled',
-          `${GLYPHS.SUCCESS} New winners have been selected!`)]
-      });
-    }
-
-    case 'list': {
-      const giveaways = await Giveaway.getGuildGiveaways(interaction.guild.id);
-
-      if (giveaways.length === 0) {
-        return interaction.editReply({
-          embeds: [await infoEmbed(interaction.guild.id, 'No Active Giveaways',
-            'There are no active giveaways in this server.')]
-        });
-      }
-
-      const giveawayList = giveaways.map((g, i) =>
-        `**${i + 1}.** ${g.prize}\n` +
-        `   ${GLYPHS.DOT} Ends: <t:${Math.floor(g.endsAt.getTime() / 1000)}:R>\n` +
-        `   ${GLYPHS.DOT} Participants: ${g.participants.length}\n` +
-        `   ${GLYPHS.DOT} Message ID: \`${g.messageId}\``
-      ).join('\n\n');
-
-      return interaction.editReply({
-        embeds: [await infoEmbed(interaction.guild.id, '🎉 Active Giveaways', giveawayList)]
-      });
-    }
-
-    case 'delete': {
-      const messageId = interaction.options.getString('message_id');
-      const giveaway = await Giveaway.findOneAndDelete({ messageId, guildId: interaction.guild.id });
-
-      if (!giveaway) {
-        return interaction.editReply({
-          embeds: [await errorEmbed(interaction.guild.id, 'Not Found',
-            'Could not find a giveaway with that message ID.')]
-        });
-      }
-
-      // Try to delete the giveaway message
-      try {
-        const channel = interaction.guild.channels.cache.get(giveaway.channelId);
-        const msg = await channel?.messages.fetch(giveaway.messageId);
-        await msg?.delete();
-      } catch {
-        // Message might already be deleted
-      }
-
-      return interaction.editReply({
-        embeds: [await successEmbed(interaction.guild.id, 'Giveaway Deleted',
-          `${GLYPHS.SUCCESS} The giveaway has been cancelled and deleted.`)]
-      });
-    }
+  if (subcommand !== 'start') {
+    const messageId = interaction.options.getString('message_id');
+    const count = interaction.options.getInteger('count');
+    const args = [subcommand, ...(messageId ? [messageId] : []), ...(count ? [String(count)] : [])];
+    return giveawayModule.default.execute(createDeferredCommandMessage(interaction, client, { args }), args, client);
   }
+
+  const durationStr = interaction.options.getString('duration');
+  const winners = interaction.options.getInteger('winners');
+  const prize = interaction.options.getString('prize').trim();
+  const requiredRole = interaction.options.getRole('required_role');
+
+  const durationMatch = durationStr.match(/^(\d+)([smhdw])$/i);
+  if (!durationMatch) {
+    return interaction.editReply({
+      embeds: [await errorEmbed(interaction.guild.id, 'Invalid Duration', 'Please provide a valid duration, Master.')]
+    });
+  }
+  if (!prize || prize.length > 256) {
+    return interaction.editReply({
+      embeds: [await errorEmbed(interaction.guild.id, 'Invalid Prize', 'The prize must be between 1 and 256 characters, Master.')]
+    });
+  }
+
+  const duration = parseInt(durationMatch[1], 10) * GIVEAWAY_DURATION_UNITS[durationMatch[2].toLowerCase()];
+  const endsAt = new Date(Date.now() + duration);
+  const draft = {
+    guildId: interaction.guild.id,
+    hostId: interaction.user.id,
+    prize,
+    winners,
+    endsAt,
+    participants: [],
+    requirements: requiredRole ? { roleId: requiredRole.id } : undefined
+  };
+
+  const payload = await giveawayModule.buildGiveawayMessage(draft);
+  // The entry handler enforces the role; show it on the announcement too
+  const [embed] = payload.embeds;
+  if (requiredRole && !embed.data.description?.includes(requiredRole.id)) {
+    embed.addFields({ name: '▸ Required Role', value: `${requiredRole}` });
+  }
+
+  let giveawayMessage;
+  try {
+    giveawayMessage = await interaction.channel.send(payload);
+  } catch (error) {
+    console.error('Error posting giveaway:', error);
+    return interaction.editReply({
+      embeds: [await errorEmbed(interaction.guild.id, 'Giveaway Not Started',
+        `${GLYPHS.ERROR} I could not post the giveaway in this channel. Please check my permissions here, Master.`)]
+    });
+  }
+
+  try {
+    await Giveaway.create({
+      ...draft,
+      channelId: interaction.channel.id,
+      messageId: giveawayMessage.id
+    });
+  } catch (error) {
+    // Without a record the buttons would only answer "no longer exists"
+    await giveawayMessage.delete().catch(() => { });
+    throw error;
+  }
+
+  return interaction.editReply({
+    embeds: [await successEmbed(interaction.guild.id, 'Lottery Initiated',
+      `**Confirmed:** Lottery for **${prize}** has been activated, Master.\n` +
+      `Concludes <t:${Math.floor(endsAt.getTime() / 1000)}:R>`)]
+  });
+}
+
+// Matches the /award reason option's max length
+const AWARD_REASON_MAX = 500;
+
+// Applies `amount` to a numeric Economy field in one atomic update, as the prefix award command
+// does, so an award can't overwrite a change made at the same moment (a game payout, a purchase).
+// Deductions floor at 0 via an update pipeline; grants are a plain $inc (plus any extra counters).
+async function applyAtomicEconomyChange(userId, guildId, field, amount, extraInc = {}) {
+  const Economy = (await import('../../models/Economy.js')).default;
+  await Economy.getEconomy(userId, guildId); // ensure the record exists
+  const update = amount > 0
+    ? { $inc: { [field]: amount, ...extraInc } }
+    : [{ $set: { [field]: { $max: [0, { $add: [{ $ifNull: [`$${field}`, 0] }, amount] }] } } }];
+  return Economy.findOneAndUpdate({ userId, guildId }, update, { new: true });
 }
 
 async function handleAwardCommand(interaction, client, guildConfig) {
-  const { successEmbed, errorEmbed, GLYPHS, createEmbed } = await import('../../utils/embeds.js');
-  const { EmbedBuilder } = await import('discord.js');
-  const Economy = (await import('../../models/Economy.js')).default;
+  const { successEmbed, errorEmbed, warningEmbed, GLYPHS, createEmbed } = await import('../../utils/embeds.js');
   const Level = (await import('../../models/Level.js')).default;
   const ModLog = (await import('../../models/ModLog.js')).default;
 
@@ -3105,6 +2829,15 @@ async function handleAwardCommand(interaction, client, guildConfig) {
   const targetUser = interaction.options.getUser('user');
   const amount = interaction.options.getInteger('amount');
   const reason = interaction.options.getString('reason') || 'No reason provided';
+
+  // Checked before anything is written: an over-long reason used to break the confirmation
+  // embed after the award was saved, and a retry then awarded twice
+  if (reason.length > AWARD_REASON_MAX) {
+    return interaction.editReply({
+      embeds: [await errorEmbed(interaction.guild.id, 'Reason Too Long',
+        `The reason is limited to ${AWARD_REASON_MAX} characters, Master.`)]
+    });
+  }
 
   // Only the server owner may award themselves
   if (targetUser.id === interaction.user.id && interaction.user.id !== interaction.guild.ownerId) {
@@ -3117,29 +2850,28 @@ async function handleAwardCommand(interaction, client, guildConfig) {
   if (targetUser.bot) {
     return interaction.editReply({
       embeds: [await errorEmbed(interaction.guild.id, 'Invalid Target',
-        'Automated systems cannot receive awards.')]
+        '**Warning:** Automated systems cannot receive awards, Master.')]
     });
   }
 
   if (amount === 0) {
     return interaction.editReply({
-      embeds: [await errorEmbed(interaction.guild.id, 'Invalid Amount',
-        'Amount cannot be zero.')]
+      embeds: [await errorEmbed(interaction.guild.id, 'Invalid Quantity',
+        '**Warning:** Please provide a valid quantity (positive to grant, negative to revoke), Master.')]
     });
   }
 
   const guildId = interaction.guild.id;
   const isAdding = amount > 0;
   const absAmount = Math.abs(amount);
+  let applied = false;
 
   try {
     let result;
-    let leveledUp = [];
-    let levelData = null;
 
     switch (type) {
       case 'xp': {
-        levelData = await Level.findOne({ userId: targetUser.id, guildId });
+        let levelData = await Level.findOne({ userId: targetUser.id, guildId });
 
         if (!levelData) {
           levelData = new Level({
@@ -3149,6 +2881,7 @@ async function handleAwardCommand(interaction, client, guildConfig) {
           });
         }
 
+        let leveledUp = [];
         if (amount < 0) {
           // Remove XP
           levelData.totalXP = Math.max(0, levelData.totalXP - absAmount);
@@ -3175,32 +2908,26 @@ async function handleAwardCommand(interaction, client, guildConfig) {
 
         levelData.username = targetUser.username;
         await levelData.save();
+        applied = true;
 
         result = {
-          emoji: '✨',
+          unit: 'XP',
           typeName: 'XP',
           newValue: levelData.totalXP,
-          levelInfo: `**Level:** ${levelData.level} • **Current XP:** ${levelData.xp}/${levelData.xpForNextLevel()}`
+          levelInfo: `**Level:** ${levelData.level} • **Current XP:** ${levelData.xp}/${levelData.xpForNextLevel()}`,
+          leveledUp,
+          levelData
         };
         break;
       }
 
       case 'coins': {
-        const economy = await Economy.getEconomy(targetUser.id, guildId);
-
-        if (amount < 0) {
-          economy.coins = Math.max(0, economy.coins - absAmount);
-        } else {
-          economy.coins += amount;
-          economy.stats.totalEarned = (economy.stats.totalEarned || 0) + amount;
-        }
-
-        await economy.save();
-
-        const coinEmoji = guildConfig.economy?.coinEmoji || '💰';
+        const economy = await applyAtomicEconomyChange(targetUser.id, guildId, 'coins', amount,
+          amount > 0 ? { 'stats.totalEarned': amount } : {});
+        applied = true;
 
         result = {
-          emoji: coinEmoji,
+          unit: guildConfig.economy?.coinName || 'coins',
           typeName: 'Coins',
           newValue: economy.coins,
           levelInfo: `**Wallet:** ${economy.coins.toLocaleString()}`
@@ -3209,18 +2936,11 @@ async function handleAwardCommand(interaction, client, guildConfig) {
       }
 
       case 'rep': {
-        const economy = await Economy.getEconomy(targetUser.id, guildId);
-
-        if (amount < 0) {
-          economy.reputation = Math.max(0, economy.reputation - absAmount);
-        } else {
-          economy.reputation = (economy.reputation || 0) + amount;
-        }
-
-        await economy.save();
+        const economy = await applyAtomicEconomyChange(targetUser.id, guildId, 'reputation', amount);
+        applied = true;
 
         result = {
-          emoji: '⭐',
+          unit: 'reputation',
           typeName: 'Reputation',
           newValue: economy.reputation
         };
@@ -3228,11 +2948,11 @@ async function handleAwardCommand(interaction, client, guildConfig) {
       }
     }
 
-    const actionWord = isAdding ? 'Added' : 'Removed';
+    const actionWord = isAdding ? 'Granted' : 'Revoked';
     const embed = await successEmbed(guildId,
-      `${result.emoji} ${result.typeName} ${actionWord}!`,
-      `${GLYPHS.SUCCESS} Successfully ${isAdding ? 'added' : 'removed'} **${absAmount.toLocaleString()}** ${result.emoji} ${result.typeName.toLowerCase()} ${isAdding ? 'to' : 'from'} ${targetUser}!\n\n` +
-      `**${targetUser.username}'s New ${result.typeName}:** ${result.newValue.toLocaleString()} ${result.emoji}` +
+      `${result.typeName} ${actionWord}`,
+      `**Confirmed:** Successfully ${isAdding ? 'granted' : 'revoked'} **${absAmount.toLocaleString()}** ${result.unit} ${isAdding ? 'to' : 'from'} ${targetUser}, Master.\n\n` +
+      `**${targetUser.username}'s New ${result.typeName}:** ${result.newValue.toLocaleString()}` +
       (result.levelInfo ? `\n${result.levelInfo}` : '') +
       `\n\n**Reason:** ${reason}`
     );
@@ -3240,27 +2960,25 @@ async function handleAwardCommand(interaction, client, guildConfig) {
     await interaction.editReply({ embeds: [embed] });
 
     // Send level up announcement if user leveled up
-    if (type === 'xp' && leveledUp && leveledUp.length > 0 && levelData) {
-      await announceLevelUpFromAward(interaction.guild, guildConfig, targetUser, levelData, leveledUp);
+    if (type === 'xp' && result.leveledUp?.length > 0) {
+      await announceLevelUpFromAward(interaction.guild, guildConfig, targetUser, result.levelData, result.leveledUp);
     }
 
     // Try to DM the user
     try {
-      const dmEmbed = new EmbedBuilder()
-        .setColor(isAdding ? '#00FF00' : '#FF6B6B')
-        .setTitle(`${result.emoji} ${result.typeName} ${actionWord}`)
-        .setDescription(
-          `An administrator in **${interaction.guild.name}** has ${isAdding ? 'given you' : 'removed'} **${absAmount.toLocaleString()}** ${result.emoji} ${result.typeName.toLowerCase()}.\n\n` +
-          `**Your new ${result.typeName.toLowerCase()}:** ${result.newValue.toLocaleString()} ${result.emoji}\n` +
-          `**Reason:** ${reason}`
-        )
-        .setTimestamp();
+      const dmDescription =
+        `**Notice:** An administrator in **${interaction.guild.name}** has ${isAdding ? 'granted you' : 'removed'} **${absAmount.toLocaleString()}** ${result.unit}.\n\n` +
+        `${GLYPHS.ARROW_RIGHT} **New ${result.typeName} Total:** ${result.newValue.toLocaleString()}\n` +
+        `${GLYPHS.ARROW_RIGHT} **Reason:** ${reason}`;
+      const dmEmbed = isAdding
+        ? await successEmbed(guildId, `${result.typeName} ${actionWord}`, dmDescription)
+        : await warningEmbed(guildId, `${result.typeName} ${actionWord}`, dmDescription);
       await targetUser.send({ embeds: [dmEmbed] });
     } catch {
       // User has DMs disabled
     }
 
-    // Log to mod log channel
+    // Log to mod log channel (as the prefix command's logAward does, plus the slash-only reason)
     try {
       if (guildConfig?.channels?.modLog) {
         const modLogChannel = interaction.guild.channels.cache.get(guildConfig.channels.modLog);
@@ -3268,13 +2986,13 @@ async function handleAwardCommand(interaction, client, guildConfig) {
           const caseNumber = await ModLog.getNextCaseNumber(guildId);
 
           const logEmbed = await createEmbed(guildId, isAdding ? 'success' : 'warning');
-          logEmbed.setTitle(`${result.emoji} ${isAdding ? 'AWARD' : 'DEDUCT'} | Case #${caseNumber}`)
+          logEmbed.setTitle(`${isAdding ? GLYPHS.STAR : GLYPHS.DIAMOND} ${isAdding ? 'AWARD' : 'DEDUCT'} | Case #${caseNumber}`)
             .setDescription(`**${result.typeName}** has been ${isAdding ? 'awarded to' : 'deducted from'} a member.`)
             .addFields(
               { name: `${GLYPHS.ARROW_RIGHT} User`, value: `${targetUser.tag}\n\`${targetUser.id}\``, inline: true },
               { name: `${GLYPHS.ARROW_RIGHT} Moderator`, value: `${interaction.user.tag}`, inline: true },
-              { name: `${GLYPHS.ARROW_RIGHT} Amount`, value: `${isAdding ? '+' : '-'}${absAmount.toLocaleString()} ${result.emoji}`, inline: true },
-              { name: `${GLYPHS.ARROW_RIGHT} New Total`, value: `${result.newValue.toLocaleString()} ${result.emoji}`, inline: true },
+              { name: `${GLYPHS.ARROW_RIGHT} Amount`, value: `${isAdding ? '+' : '-'}${absAmount.toLocaleString()} ${result.unit}`, inline: true },
+              { name: `${GLYPHS.ARROW_RIGHT} New Total`, value: `${result.newValue.toLocaleString()} ${result.unit}`, inline: true },
               { name: `${GLYPHS.ARROW_RIGHT} Reason`, value: reason, inline: false }
             )
             .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
@@ -3308,8 +3026,11 @@ async function handleAwardCommand(interaction, client, guildConfig) {
 
   } catch (error) {
     console.error('Error in award command:', error);
+    // Once saved, say so: reporting a plain failure invites a retry that awards twice
     return interaction.editReply({
-      embeds: [await errorEmbed(guildId, 'Error', 'An error occurred while processing the award.')]
+      embeds: [await errorEmbed(guildId, 'Award Failed', applied
+        ? 'The award was applied, but I could not complete the confirmation. Please do not repeat it, Master.'
+        : 'An anomaly occurred while processing the award, Master. Nothing was changed.')]
     });
   }
 }
@@ -3317,7 +3038,6 @@ async function handleAwardCommand(interaction, client, guildConfig) {
 // Handle noxp command
 async function handleNoxpCommand(interaction, guildConfig) {
   const { successEmbed, errorEmbed, infoEmbed, GLYPHS } = await import('../../utils/embeds.js');
-  const { EmbedBuilder, ChannelType } = await import('discord.js');
   const subcommand = interaction.options.getSubcommand();
 
   // Initialize noXpChannels array if not exists
@@ -3380,7 +3100,7 @@ async function handleNoxpCommand(interaction, guildConfig) {
       if (noXpChannels.length === 0) {
         await interaction.editReply({
           embeds: [await infoEmbed(interaction.guild.id, 'No Blacklisted Channels',
-            `${GLYPHS.INFO} No channels are blacklisted from earning XP.\n\nUse \`/noxp add #channel\` to add one!`)]
+            `${GLYPHS.INFO} No channels are blacklisted from earning XP.\n\nUse \`/noxp add\` to add one, Master.`)]
         });
         return;
       }
@@ -3390,12 +3110,8 @@ async function handleNoxpCommand(interaction, guildConfig) {
         return channel ? `${GLYPHS.ARROW_RIGHT} ${channel}` : `${GLYPHS.ARROW_RIGHT} <Deleted Channel>`;
       }).join('\n');
 
-      const embed = new EmbedBuilder()
-        .setColor('#5865F2')
-        .setTitle('🚫 No-XP Channels')
-        .setDescription(`**Blacklisted Channels:**\n\n${channelList}`)
-        .setFooter({ text: `${noXpChannels.length} channel(s) blacklisted` })
-        .setTimestamp();
+      const embed = await infoEmbed(interaction.guild.id, 'No-XP Channels',
+        `**${noXpChannels.length} channel(s) blacklisted from earning XP:**\n\n${channelList}`.slice(0, 4096));
 
       await interaction.editReply({ embeds: [embed] });
       break;
@@ -3447,30 +3163,32 @@ async function handleSetoverlayCommand(interaction, guildConfig) {
       const cardOverlay = guildConfig.economy?.cardOverlay || { color: '#000000', opacity: 0.5 };
       const overlayRgba = hexToRgba(cardOverlay.color, cardOverlay.opacity);
 
+      // Shown in the overlay color as a preview
       const embed = new EmbedBuilder()
-        .setColor(cardOverlay.color || '#667eea')
+        .setColor(cardOverlay.color || COLORS.RAPHAEL)
         .setTitle('『 Server Overlay Settings 』')
         .setDescription(customizationEnabled
-          ? '⚠️ **User customization is enabled** - these settings are not active.\nUse `feature disable profilecustomization` to take control.'
-          : '✅ **These settings apply to all profiles.**')
+          ? `${GLYPHS.ERROR} **Member customization is enabled**: these settings are not active.\n` +
+            'Use `/feature type:profilecustomization status:disable` to take control, Master.'
+          : `${GLYPHS.SUCCESS} **These settings apply to all profile and level cards.**`)
         .addFields(
           {
-            name: '🎨 Color',
+            name: '▸ Color',
             value: `\`${cardOverlay.color}\``,
             inline: true
           },
           {
-            name: '💧 Opacity',
+            name: '▸ Opacity',
             value: `\`${Math.round(cardOverlay.opacity * 100)}%\``,
             inline: true
           },
           {
-            name: '📋 Result',
+            name: '▸ Result',
             value: `\`${overlayRgba}\``,
             inline: true
           }
         )
-        .setFooter({ text: 'Applies to both profile and level/rank cards' });
+        .setFooter({ text: getRandomFooter() });
 
       await interaction.editReply({ embeds: [embed] });
       break;
@@ -3503,7 +3221,7 @@ async function handleSetoverlayCommand(interaction, guildConfig) {
       if (!match) {
         await interaction.editReply({
           embeds: [await errorEmbed(interaction.guild.id, 'Invalid Color',
-            `${GLYPHS.WARNING} Please provide a valid hex color.\n\n` +
+            `${GLYPHS.ERROR} Please provide a valid hex color, Master.\n\n` +
             `**Examples:**\n` +
             `◇ \`#000000\` - Black\n` +
             `◇ \`#1a1a2e\` - Dark Blue\n` +
@@ -3544,241 +3262,38 @@ async function handleSetoverlayCommand(interaction, guildConfig) {
   }
 }
 
-// Handle setprofile command
-async function handleSetprofileCommand(interaction) {
-  const Economy = (await import('../../models/Economy.js')).default;
-  const Guild = (await import('../../models/Guild.js')).default;
-  const { successEmbed, errorEmbed, GLYPHS } = await import('../../utils/embeds.js');
-  const { EmbedBuilder } = await import('discord.js');
-
-  const userId = interaction.user.id;
-  const guildId = interaction.guild.id;
-  const subcommandGroup = interaction.options.getSubcommandGroup(false);
-  const subcommand = interaction.options.getSubcommand();
-
-  // Get guild config to check if customization is enabled (default: true)
-  const guildConfig = await Guild.getGuild(guildId);
-  const customizationEnabled = guildConfig.economy?.profileCustomization?.enabled !== false;
-
-  // Helper function to convert hex to rgba
-  function hexToRgba(hex, opacity) {
-    const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
-    if (!result) return null;
-    const r = parseInt(result[1], 16);
-    const g = parseInt(result[2], 16);
-    const b = parseInt(result[3], 16);
-    return `rgba(${r}, ${g}, ${b}, ${opacity})`;
-  }
-
-  // Handle overlay subcommand group
-  if (subcommandGroup === 'overlay') {
-    if (!customizationEnabled) {
-      await interaction.editReply({
-        embeds: [await errorEmbed(guildId, 'Customization Disabled',
-          `${GLYPHS.WARNING} Profile customization is disabled on this server.\n\n` +
-          `Server admins control the overlay using \`/setoverlay\`.`)]
-      });
-      return;
-    }
-
-    if (subcommand === 'color') {
-      const hex = interaction.options.getString('hex');
-      const hexRegex = /^#?([0-9A-Fa-f]{6})$/;
-      const match = hex.match(hexRegex);
-
-      if (!match) {
-        await interaction.editReply({
-          embeds: [await errorEmbed(guildId, 'Invalid Color',
-            `${GLYPHS.WARNING} Invalid hex color format, Master.\n\n` +
-            `**Examples:**\n◇ \`#000000\` - Black\n◇ \`#1a1a2e\` - Dark Blue`)]
-        });
-        return;
-      }
-
-      const hexColor = hex.startsWith('#') ? hex.toLowerCase() : `#${hex.toLowerCase()}`;
-      const economy = await Economy.getEconomy(userId, guildId);
-      economy.profile.overlayColor = hexColor;
-      await economy.save();
-
-      const embed = new EmbedBuilder()
-        .setColor(hexColor)
-        .setTitle('『 Overlay Color Updated 』')
-        .setDescription(`${GLYPHS.SUCCESS} **Confirmed:** Set to \`${hexColor}\`, Master.`)
-        .setFooter({ text: 'Applied to your profile and level cards.' });
-
-      await interaction.editReply({ embeds: [embed] });
-      return;
-    }
-
-    if (subcommand === 'opacity') {
-      const opacityPercent = interaction.options.getInteger('percent');
-      const opacity = opacityPercent / 100;
-
-      const economy = await Economy.getEconomy(userId, guildId);
-      economy.profile.overlayOpacity = opacity;
-      await economy.save();
-
-      await interaction.editReply({
-        embeds: [await successEmbed(guildId, 'Overlay Opacity Updated',
-          `${GLYPHS.SUCCESS} **Confirmed:** Set to \`${opacityPercent}%\`, Master.\n\n` +
-          `Applied to your profile and level cards.`)]
-      });
-      return;
-    }
-  }
-
-  switch (subcommand) {
-    case 'view': {
-      const economy = await Economy.getEconomy(userId, guildId);
-      const profile = economy.profile || {};
-
-      const overlayColor = profile.overlayColor || '#000000';
-      const overlayOpacity = profile.overlayOpacity ?? 0.5;
-      const overlayRgba = hexToRgba(overlayColor, overlayOpacity);
-
-      const embed = new EmbedBuilder()
-        .setColor('#00CED1')
-        .setTitle('『 Your Profile Settings 』')
-        .setDescription(customizationEnabled
-          ? '**You can customize your overlay.**'
-          : '**Overlay is controlled by server admins.**')
-        .addFields(
-          {
-            name: '📄 Description',
-            value: profile.description ? `\`\`\`${profile.description.substring(0, 150)}${profile.description.length > 150 ? '...' : ''}\`\`\`` : '`Not set`',
-            inline: false
-          },
-          {
-            name: '🎨 Overlay Color',
-            value: `\`${overlayColor}\``,
-            inline: true
-          },
-          {
-            name: '💧 Overlay Opacity',
-            value: `\`${Math.round(overlayOpacity * 100)}%\``,
-            inline: true
-          },
-          {
-            name: '📋 Result',
-            value: `\`${overlayRgba}\``,
-            inline: true
-          },
-          {
-            name: '🖼️ Background',
-            value: `\`${profile.background || 'default'}\``,
-            inline: true
-          }
-        )
-        .setFooter({ text: 'Use /profile to preview your card' });
-
-      await interaction.editReply({ embeds: [embed] });
-      break;
-    }
-
-    case 'reset': {
-      if (!customizationEnabled) {
-        await interaction.editReply({
-          embeds: [await errorEmbed(guildId, 'Customization Disabled',
-            `${GLYPHS.WARNING} Profile customization is disabled.\nOverlay is controlled by server admins.`)]
-        });
-        return;
-      }
-
-      await Economy.updateEconomy(userId, guildId, {
-        $set: {
-          'profile.overlayColor': '#000000',
-          'profile.overlayOpacity': 0.5
-        }
-      });
-
-      await interaction.editReply({
-        embeds: [await successEmbed(guildId, 'Overlay Reset',
-          `${GLYPHS.SUCCESS} Your overlay has been reset to default, Master.\n\n` +
-          `**Default Values:**\n` +
-          `◇ Color: \`#000000\`\n` +
-          `◇ Opacity: \`50%\``)]
-      });
-      break;
-    }
-
-    case 'description': {
-      const text = interaction.options.getString('text') || '';
-      const economy = await Economy.getEconomy(userId, guildId);
-
-      if (!text) {
-        economy.profile.description = '';
-        await economy.save();
-        await interaction.editReply({
-          embeds: [await successEmbed(guildId, 'Description Cleared',
-            `${GLYPHS.SUCCESS} Your description has been cleared, Master.`)]
-        });
-      } else {
-        economy.profile.description = text;
-        await economy.save();
-        await interaction.editReply({
-          embeds: [await successEmbed(guildId, 'Description Updated',
-            `${GLYPHS.SUCCESS} Your description has been updated, Master.\n\n**Length:** ${text.length}/500 characters`)]
-        });
-      }
-      break;
-    }
-  }
-}
-
-// Announce level up for award command
+// Announce a level-up from an award through the shared announcer, so awarded levels follow the
+// server's level-up settings (channel, embed style, mention, placeholders) like earned ones
 async function announceLevelUpFromAward(guild, guildConfig, user, levelData, leveledUp) {
-  try {
-    const { EmbedBuilder } = await import('discord.js');
-    const levelConfig = guildConfig.features?.levelSystem;
-
-    // Check if level up announcements are enabled
-    if (levelConfig?.announceLevelUp === false) return;
-
-    const newLevel = Math.max(...leveledUp);
-
-    // Get the level up channel
-    const channelId = levelConfig?.levelUpChannel || guildConfig.channels?.levelUpChannel;
-    if (!channelId) return;
-
-    const channel = guild.channels.cache.get(channelId);
-    if (!channel) return;
-
-    // Build level up message
-    let levelUpMessage = levelConfig?.levelUpMessage || '🎉 {user} leveled up to level {level}!';
-    levelUpMessage = levelUpMessage
-      .replace(/{user}/g, `<@${user.id}>`)
-      .replace(/{username}/g, user.username)
-      .replace(/{level}/g, newLevel)
-      .replace(/{totalxp}/g, levelData.totalXP.toLocaleString())
-      .replace(/{server}/g, guild.name);
-
-    // Create embed
-    const embed = new EmbedBuilder()
-      .setColor(guildConfig.embedStyle?.color || '#FFD700')
-      .setTitle('🎉 Level Up!')
-      .setDescription(levelUpMessage)
-      .setThumbnail(user.displayAvatarURL({ extension: 'png', size: 128 }))
-      .addFields(
-        { name: 'New Level', value: `**${newLevel}**`, inline: true },
-        { name: 'Total XP', value: levelData.totalXP.toLocaleString(), inline: true }
-      )
-      .setFooter({ text: 'Awarded by admin' })
-      .setTimestamp();
-
-    await channel.send({
-      content: `<@${user.id}>`,
-      embeds: [embed]
-    });
-
-  } catch (error) {
-    console.error('Error announcing level up:', error);
-  }
+  const { sendLevelUpAnnouncement } = await import('../../commands/config/levelup.js');
+  const member = await guild.members.fetch(user.id).catch(() => null);
+  await sendLevelUpAnnouncement({ guild, member: member ?? user, guildConfig, levelData, levelsGained: leveledUp });
 }
+
+// The confession panel, as the prefix confession command sends it; confession_submit is
+// handled by confessionHandler.js
+async function sendConfessionPanel(channel) {
+  const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = await import('discord.js');
+  const panelEmbed = new EmbedBuilder()
+    .setTitle('『 Anonymous Confessions 』')
+    .setDescription('Use the button below to submit an anonymous confession.\n\n*Your identity will remain hidden from other members.*')
+    .setColor(COLORS.RAPHAEL)
+    .setFooter({ text: 'Confessions are moderated • Be respectful' });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('confession_submit')
+      .setLabel('Submit a Confession')
+      .setStyle(ButtonStyle.Primary)
+  );
+  await channel.send({ embeds: [panelEmbed], components: [row] });
+}
+
+const yesNo = (value) => value ? '◉ Yes' : '◇ No';
 
 // Handle Confession slash command
-async function handleConfessionCommand(interaction, client, guildConfig) {
+async function handleConfessionCommand(interaction) {
   const { successEmbed, errorEmbed, infoEmbed, GLYPHS } = await import('../../utils/embeds.js');
-  const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType } = await import('discord.js');
   const Confession = (await import('../../models/Confession.js')).default;
   const subcommand = interaction.options.getSubcommand();
 
@@ -3787,6 +3302,11 @@ async function handleConfessionCommand(interaction, client, guildConfig) {
     confessionData = new Confession({ guildId: interaction.guild.id });
   }
 
+  const panelFailed = async (channel) => interaction.editReply({
+    embeds: [await errorEmbed(interaction.guild.id, 'Panel Not Sent',
+      `${GLYPHS.ERROR} I could not post the confession panel in ${channel}. Please check my permissions there, Master.`)]
+  });
+
   switch (subcommand) {
     case 'setup': {
       const channel = interaction.options.getChannel('channel');
@@ -3794,45 +3314,34 @@ async function handleConfessionCommand(interaction, client, guildConfig) {
       if (channel.type !== ChannelType.GuildText) {
         await interaction.editReply({
           embeds: [await errorEmbed(interaction.guild.id, 'Invalid Channel',
-            `${GLYPHS.ERROR} Please select a text channel.`)]
+            `${GLYPHS.ERROR} Please select a text channel, Master.`)]
         });
         return;
       }
 
       const botPerms = channel.permissionsFor(interaction.guild.members.me);
-      if (!botPerms.has(['SendMessages', 'EmbedLinks'])) {
+      if (!botPerms.has(['ViewChannel', 'SendMessages', 'EmbedLinks'])) {
         await interaction.editReply({
           embeds: [await errorEmbed(interaction.guild.id, 'Missing Permissions',
-            `${GLYPHS.ERROR} I need \`Send Messages\` and \`Embed Links\` permissions in ${channel}.`)]
+            `${GLYPHS.ERROR} I need \`View Channel\`, \`Send Messages\` and \`Embed Links\` permissions in ${channel}, Master.`)]
         });
         return;
+      }
+
+      try {
+        await sendConfessionPanel(channel);
+      } catch (error) {
+        console.error('Error sending confession panel:', error);
+        return panelFailed(channel);
       }
 
       confessionData.channelId = channel.id;
       confessionData.enabled = true;
       await confessionData.save();
 
-      // Send confession panel
-      const panelEmbed = new EmbedBuilder()
-        .setTitle('📝 Anonymous Confessions')
-        .setDescription('Click the button below to submit an anonymous confession!\n\n*Your identity will remain completely anonymous to other members.*')
-        .setColor('#9b59b6')
-        .setFooter({ text: 'Confessions are moderated • Be respectful' });
-
-      const row = new ActionRowBuilder()
-        .addComponents(
-          new ButtonBuilder()
-            .setCustomId('confession_submit')
-            .setLabel('Submit a confession!')
-            .setStyle(ButtonStyle.Primary)
-            .setEmoji('📝')
-        );
-
-      await channel.send({ embeds: [panelEmbed], components: [row] });
-
       await interaction.editReply({
         embeds: [await successEmbed(interaction.guild.id, 'Confession System Enabled',
-          `${GLYPHS.SUCCESS} Confession system has been set up in ${channel}!\n\nA confession panel has been sent to the channel.`)]
+          `${GLYPHS.SUCCESS} Confession system has been set up in ${channel}.\n\nA confession panel has been sent to the channel.`)]
       });
       break;
     }
@@ -3850,22 +3359,19 @@ async function handleConfessionCommand(interaction, client, guildConfig) {
     }
 
     case 'settings': {
-      const embed = new EmbedBuilder()
-        .setTitle('⚙️ Confession Settings')
-        .setColor('#9b59b6')
-        .addFields(
-          { name: 'Status', value: confessionData.enabled ? '✅ Enabled' : '❌ Disabled', inline: true },
-          { name: 'Channel', value: confessionData.channelId ? `<#${confessionData.channelId}>` : 'Not set', inline: true },
-          { name: 'Total Confessions', value: `${confessionData.confessionCount}`, inline: true },
-          { name: 'Cooldown', value: `${confessionData.settings.cooldown} seconds`, inline: true },
-          { name: 'Allow Replies', value: confessionData.settings.allowReplies ? '✅ Yes' : '❌ No', inline: true },
-          { name: 'Anonymous Replies', value: confessionData.settings.anonymousReplies ? '✅ Yes' : '❌ No', inline: true },
-          { name: 'Require Approval', value: confessionData.settings.requireApproval ? '✅ Yes' : '❌ No', inline: true },
-          { name: 'Min Length', value: `${confessionData.settings.minLength} chars`, inline: true },
-          { name: 'Max Length', value: `${confessionData.settings.maxLength} chars`, inline: true },
-          { name: 'Banned Users', value: `${confessionData.settings.bannedUsers.length} users`, inline: true }
-        )
-        .setTimestamp();
+      const embed = await infoEmbed(interaction.guild.id, 'Confession Settings',
+        `**▸ Status:** ${confessionData.enabled ? '◉ Active' : '◇ Inactive'}`);
+      embed.addFields(
+        { name: '▸ Channel', value: confessionData.channelId ? `<#${confessionData.channelId}>` : 'Not set', inline: true },
+        { name: '▸ Total Confessions', value: `${confessionData.confessionCount}`, inline: true },
+        { name: '▸ Cooldown', value: `${confessionData.settings.cooldown} seconds`, inline: true },
+        { name: '▸ Allow Replies', value: yesNo(confessionData.settings.allowReplies), inline: true },
+        { name: '▸ Anonymous Replies', value: yesNo(confessionData.settings.anonymousReplies), inline: true },
+        { name: '▸ Require Approval', value: yesNo(confessionData.settings.requireApproval), inline: true },
+        { name: '▸ Min Length', value: `${confessionData.settings.minLength} chars`, inline: true },
+        { name: '▸ Max Length', value: `${confessionData.settings.maxLength} chars`, inline: true },
+        { name: '▸ Banned Users', value: `${confessionData.settings.bannedUsers.length} users`, inline: true }
+      );
 
       await interaction.editReply({ embeds: [embed] });
       break;
@@ -3971,13 +3477,15 @@ async function handleConfessionCommand(interaction, client, guildConfig) {
         return;
       }
 
-      const embed = new EmbedBuilder()
-        .setTitle('📝 Pending Confessions')
-        .setColor('#9b59b6')
-        .setDescription(confessionData.pendingConfessions.slice(0, 10).map((c, i) =>
+      const pendingCount = confessionData.pendingConfessions.length;
+      const embed = await infoEmbed(interaction.guild.id, 'Pending Confessions',
+        confessionData.pendingConfessions.slice(0, 10).map((c, i) =>
           `**${i + 1}.** ${c.content.substring(0, 100)}${c.content.length > 100 ? '...' : ''}\n*Submitted <t:${Math.floor(c.timestamp.getTime() / 1000)}:R>*`
-        ).join('\n\n'))
-        .setFooter({ text: `Showing ${Math.min(10, confessionData.pendingConfessions.length)} of ${confessionData.pendingConfessions.length} pending` });
+        ).join('\n\n'));
+      embed.addFields({
+        name: '▸ Queue',
+        value: `Showing ${Math.min(10, pendingCount)} of ${pendingCount} pending. Use \`/confession approve\` or \`/confession reject\` with the number.`
+      });
 
       await interaction.editReply({ embeds: [embed] });
       break;
@@ -3995,7 +3503,7 @@ async function handleConfessionCommand(interaction, client, guildConfig) {
       }
 
       const channel = interaction.guild.channels.cache.get(confessionData.channelId);
-      if (!channel) {
+      if (!channel?.isTextBased()) {
         await interaction.editReply({
           embeds: [await errorEmbed(interaction.guild.id, 'Channel Not Found',
             `${GLYPHS.ERROR} The confession channel no longer exists.`)]
@@ -4003,44 +3511,20 @@ async function handleConfessionCommand(interaction, client, guildConfig) {
         return;
       }
 
+      // Same posting path as direct submissions and the prefix command
+      const { postConfession } = await import('./confessionHandler.js');
       const pending = confessionData.pendingConfessions[id];
-      confessionData.confessionCount++;
-      const confessionNumber = confessionData.confessionCount;
-
-      const confessionEmbed = new EmbedBuilder()
-        .setAuthor({ name: `Anonymous Confession (#${confessionNumber})`, iconURL: interaction.guild.iconURL() })
-        .setDescription(`"${pending.content}"`)
-        .setColor('#9b59b6')
-        .setTimestamp();
-
-      const buttons = [
-        new ButtonBuilder()
-          .setCustomId('confession_submit')
-          .setLabel('Submit a confession!')
-          .setStyle(ButtonStyle.Primary)
-          .setEmoji('📝')
-      ];
-
-      if (confessionData.settings.allowReplies) {
-        buttons.push(
-          new ButtonBuilder()
-            .setCustomId(`confession_reply_${confessionNumber}`)
-            .setLabel('Reply')
-            .setStyle(ButtonStyle.Secondary)
-            .setEmoji('💬')
-        );
+      let confessionNumber;
+      try {
+        confessionNumber = await postConfession(channel, confessionData, pending.content, pending.userId);
+      } catch (error) {
+        console.error('Error posting approved confession:', error);
+        return interaction.editReply({
+          embeds: [await errorEmbed(interaction.guild.id, 'Confession Not Posted',
+            `${GLYPHS.ERROR} I could not post in ${channel}. The confession is still pending, Master.`)]
+        });
       }
 
-      const row = new ActionRowBuilder().addComponents(buttons);
-      const sentMessage = await channel.send({ embeds: [confessionEmbed], components: [row] });
-
-      confessionData.confessions.push({
-        number: confessionNumber,
-        content: pending.content,
-        messageId: sentMessage.id,
-        userId: pending.userId,
-        timestamp: new Date()
-      });
       confessionData.pendingConfessions.splice(id, 1);
       await confessionData.save();
 
@@ -4092,22 +3576,12 @@ async function handleConfessionCommand(interaction, client, guildConfig) {
         return;
       }
 
-      const panelEmbed = new EmbedBuilder()
-        .setTitle('📝 Anonymous Confessions')
-        .setDescription('Click the button below to submit an anonymous confession!\n\n*Your identity will remain completely anonymous to other members.*')
-        .setColor('#9b59b6')
-        .setFooter({ text: 'Confessions are moderated • Be respectful' });
-
-      const row = new ActionRowBuilder()
-        .addComponents(
-          new ButtonBuilder()
-            .setCustomId('confession_submit')
-            .setLabel('Submit a confession!')
-            .setStyle(ButtonStyle.Primary)
-            .setEmoji('📝')
-        );
-
-      await channel.send({ embeds: [panelEmbed], components: [row] });
+      try {
+        await sendConfessionPanel(channel);
+      } catch (error) {
+        console.error('Error sending confession panel:', error);
+        return panelFailed(channel);
+      }
 
       await interaction.editReply({
         embeds: [await successEmbed(interaction.guild.id, 'Panel Sent',
@@ -4122,18 +3596,15 @@ async function handleConfessionCommand(interaction, client, guildConfig) {
       const pendingCount = confessionData.pendingConfessions?.length || 0;
       const bannedCount = confessionData.settings.bannedUsers?.length || 0;
 
-      const embed = new EmbedBuilder()
-        .setTitle('📊 Confession Statistics')
-        .setColor('#9b59b6')
-        .addFields(
-          { name: 'Total Confessions', value: `${totalConfessions}`, inline: true },
-          { name: 'Total Replies', value: `${totalReplies}`, inline: true },
-          { name: 'Pending Approval', value: `${pendingCount}`, inline: true },
-          { name: 'Banned Users', value: `${bannedCount}`, inline: true },
-          { name: 'Status', value: confessionData.enabled ? '✅ Active' : '❌ Disabled', inline: true },
-          { name: 'Channel', value: confessionData.channelId ? `<#${confessionData.channelId}>` : 'Not set', inline: true }
-        )
-        .setTimestamp();
+      const embed = await infoEmbed(interaction.guild.id, 'Confession Statistics',
+        `**▸ Status:** ${confessionData.enabled ? '◉ Active' : '◇ Inactive'}`);
+      embed.addFields(
+        { name: '▸ Total Confessions', value: `${totalConfessions}`, inline: true },
+        { name: '▸ Total Replies', value: `${totalReplies}`, inline: true },
+        { name: '▸ Pending Approval', value: `${pendingCount}`, inline: true },
+        { name: '▸ Banned Users', value: `${bannedCount}`, inline: true },
+        { name: '▸ Channel', value: confessionData.channelId ? `<#${confessionData.channelId}>` : 'Not set', inline: true }
+      );
 
       await interaction.editReply({ embeds: [embed] });
       break;
@@ -4184,6 +3655,9 @@ async function handleAutocomplete(interaction) {
   }
 }
 
+// An onboarding change refused before it reaches Discord; the message is shown to the user
+class OnboardingEditError extends Error {}
+
 // Onboarding command handler
 async function handleOnboardingCommand(interaction, guildConfig) {
   const { successEmbed, errorEmbed, infoEmbed, GLYPHS } = await import('../../utils/embeds.js');
@@ -4202,6 +3676,12 @@ async function handleOnboardingCommand(interaction, guildConfig) {
     }
 
     const prompts = onboarding.prompts || new Map();
+
+    // Members pick onboarding roles for themselves, so a role must be safe to hand out
+    // (getAssignableRoleError) before it is attached to an option
+    const rejectRole = async (roleError) => interaction.editReply({
+      embeds: [await errorEmbed(interaction.guild.id, 'Role Not Allowed', roleError)]
+    });
 
     // Helper to build prompts array for update
     const mapPrompts = (modifier) => {
@@ -4248,25 +3728,27 @@ async function handleOnboardingCommand(interaction, guildConfig) {
         payload.defaultChannels = defaultChannelIds;
       }
 
-      // Helper to validate and filter prompts
-      const validatePrompts = (promptsArray) => {
-        return promptsArray
-          .map(p => ({
-            ...p,
-            // Filter options to only those with at least one role or channel
-            options: p.options.filter(o =>
-              (o.roles && o.roles.length > 0) || (o.channels && o.channels.length > 0)
-            )
-          }))
-          // Only keep prompts that have at least one valid option
-          .filter(p => p.options && p.options.length > 0);
-      };
-
       // Include prompts - either the updated ones or existing (mapped properly)
       if (updates.prompts !== undefined) {
-        payload.prompts = validatePrompts(updates.prompts);
+        payload.prompts = updates.prompts;
       } else if (prompts.size > 0) {
-        payload.prompts = validatePrompts(mapPrompts());
+        payload.prompts = mapPrompts();
+      }
+
+      // Discord rejects an option with no role or channel and a question with no options.
+      // Refuse such an edit with the reason, rather than quietly dropping the option or question.
+      for (const prompt of payload.prompts ?? []) {
+        if (!prompt.options?.length) {
+          throw new OnboardingEditError(
+            `The question **"${prompt.title}"** would be left with no options. ` +
+            `Add another option first, or delete the question with \`/onboarding questions delete\`.`);
+        }
+        const emptyOption = prompt.options.find(o => !o.roles?.length && !o.channels?.length);
+        if (emptyOption) {
+          throw new OnboardingEditError(
+            `The option **"${emptyOption.title}"** in **"${prompt.title}"** would be left with no role or channel, ` +
+            `and every option needs at least one. Assign another first, or remove the option with \`/onboarding options remove\`.`);
+        }
       }
 
       await interaction.guild.editOnboarding(payload);
@@ -4277,26 +3759,27 @@ async function handleOnboardingCommand(interaction, guildConfig) {
       if (subcommand === 'view') {
         const embed = new EmbedBuilder()
           .setTitle('『 Onboarding Settings 』')
-          .setColor(guildConfig.embedStyle?.color || '#5865F2')
-          .setDescription(`Server onboarding configuration for **${interaction.guild.name}**`)
+          .setColor(COLORS.RAPHAEL)
+          .setDescription(`Server onboarding configuration for **${interaction.guild.name}**, Master.`)
+          .setFooter({ text: getRandomFooter() })
           .addFields(
             {
-              name: '📊 Status',
+              name: '▸ Status',
               value: [
-                `**Enabled:** ${onboarding.enabled ? '✅ Yes' : '❌ No'}`,
+                `**Enabled:** ${onboarding.enabled ? '◉ Yes' : '◇ No'}`,
                 `**Mode:** ${onboarding.mode === 0 ? 'Default' : 'Advanced'}`,
               ].join('\n'),
               inline: true
             },
             {
-              name: '📺 Default Channels',
+              name: '▸ Default Channels',
               value: defaultChannelIds.length > 0
-                ? defaultChannelIds.map(id => `<#${id}>`).join('\n')
+                ? truncateList(defaultChannelIds.map(id => `<#${id}>`).join(', '), 1024)
                 : '*No default channels*',
               inline: true
             },
             {
-              name: '❓ Questions',
+              name: '▸ Questions',
               value: `${prompts.size} question(s) configured`,
               inline: true
             }
@@ -4309,11 +3792,11 @@ async function handleOnboardingCommand(interaction, guildConfig) {
             if (prompt.singleSelect) flags.push('Single');
             else flags.push('Multi');
 
-            return `**${index + 1}.** ${prompt.title}\n   └ ${prompt.options.size} options | ${flags.join(', ')}`;
+            return `**${index + 1}.** ${prompt.title}\n   › ${prompt.options.size} options | ${flags.join(', ')}`;
           }).join('\n');
 
           embed.addFields({
-            name: '📝 Questions List',
+            name: '▸ Questions List',
             value: questionsList.substring(0, 1024) || '*None*',
             inline: false
           });
@@ -4335,7 +3818,7 @@ async function handleOnboardingCommand(interaction, guildConfig) {
         await updateOnboarding({ enabled: true });
         return interaction.editReply({
           embeds: [await successEmbed(interaction.guild.id, 'Onboarding Enabled',
-            `${GLYPHS.SUCCESS} Server onboarding has been enabled!`)]
+            `${GLYPHS.SUCCESS} Server onboarding has been enabled.`)]
         });
       }
 
@@ -4351,16 +3834,11 @@ async function handleOnboardingCommand(interaction, guildConfig) {
     // CHANNELS GROUP
     if (group === 'channels') {
       if (subcommand === 'list') {
-        const embed = new EmbedBuilder()
-          .setTitle('『 Default Channels 』')
-          .setColor(guildConfig.embedStyle?.color || '#5865F2')
-          .setDescription(
-            defaultChannelIds.length > 0
-              ? defaultChannelIds.map((id, i) => `**${i + 1}.** <#${id}>`).join('\n')
-              : '*No default channels configured*'
-          )
-          .setFooter({ text: `${defaultChannelIds.length} default channel(s)` })
-          .setTimestamp();
+        const embed = await infoEmbed(interaction.guild.id, 'Default Channels',
+          defaultChannelIds.length > 0
+            ? `**${defaultChannelIds.length} default channel(s):**\n\n` +
+              defaultChannelIds.map((id, i) => `**${i + 1}.** <#${id}>`).join('\n').slice(0, 3900)
+            : '*No default channels configured.*');
 
         return interaction.editReply({ embeds: [embed] });
       }
@@ -4418,17 +3896,17 @@ async function handleOnboardingCommand(interaction, guildConfig) {
       if (subcommand === 'list') {
         const embed = new EmbedBuilder()
           .setTitle('『 Onboarding Questions 』')
-          .setColor(guildConfig.embedStyle?.color || '#5865F2');
+          .setColor(COLORS.RAPHAEL);
 
         if (prompts.size === 0) {
           embed.setDescription('*No questions configured*');
         } else {
           const questionsList = Array.from(prompts.values()).map((prompt, index) => {
             const flags = [];
-            if (prompt.required) flags.push('📌 Required');
-            else flags.push('📎 Optional');
-            if (prompt.singleSelect) flags.push('1️⃣ Single');
-            else flags.push('🔢 Multi');
+            if (prompt.required) flags.push('Required');
+            else flags.push('Optional');
+            if (prompt.singleSelect) flags.push('Single choice');
+            else flags.push('Multiple choice');
 
             let optionsList = Array.from(prompt.options.values()).map(o => {
               const roleCount = o.roles?.size || 0;
@@ -4444,7 +3922,7 @@ async function handleOnboardingCommand(interaction, guildConfig) {
           embed.setDescription(questionsList.substring(0, 4000));
         }
 
-        embed.setFooter({ text: `${prompts.size} question(s)` });
+        embed.setFooter({ text: `${getRandomFooter()} | ${prompts.size} question(s)` });
         embed.setTimestamp();
 
         return interaction.editReply({ embeds: [embed] });
@@ -4465,6 +3943,10 @@ async function handleOnboardingCommand(interaction, guildConfig) {
               `${GLYPHS.ERROR} Each option must have at least one **role** or **channel** assigned.\n\n` +
               `Please provide \`option_role\` or \`option_channel\`.`)]
           });
+        }
+        if (optionRole) {
+          const roleError = getAssignableRoleError(optionRole, interaction.member);
+          if (roleError) return rejectRole(roleError);
         }
 
         const newPrompt = {
@@ -4488,7 +3970,7 @@ async function handleOnboardingCommand(interaction, guildConfig) {
 
         return interaction.editReply({
           embeds: [await successEmbed(interaction.guild.id, 'Question Created',
-            `${GLYPHS.SUCCESS} Question created with initial option!\n\n` +
+            `${GLYPHS.SUCCESS} Question created with its initial option.\n\n` +
             `**Question:** ${title}\n` +
             `**Option:** ${optionTitle}\n` +
             `**Single Select:** ${singleSelect ? 'Yes' : 'No'}\n` +
@@ -4523,13 +4005,13 @@ async function handleOnboardingCommand(interaction, guildConfig) {
         await updateOnboarding({ prompts: updatedPrompts });
 
         const changes = [];
-        if (newTitle) changes.push(`Title → ${newTitle}`);
-        if (required !== null) changes.push(`Required → ${required ? 'Yes' : 'No'}`);
-        if (singleSelect !== null) changes.push(`Single Select → ${singleSelect ? 'Yes' : 'No'}`);
+        if (newTitle) changes.push(`Title › ${newTitle}`);
+        if (required !== null) changes.push(`Required › ${required ? 'Yes' : 'No'}`);
+        if (singleSelect !== null) changes.push(`Single Select › ${singleSelect ? 'Yes' : 'No'}`);
 
         return interaction.editReply({
           embeds: [await successEmbed(interaction.guild.id, 'Question Updated',
-            `${GLYPHS.SUCCESS} Question **"${prompt.title}"** updated!\n\n${changes.join('\n') || 'No changes made'}`)]
+            `${GLYPHS.SUCCESS} Question **"${prompt.title}"** updated.\n\n${changes.join('\n') || 'No changes made'}`)]
         });
       }
 
@@ -4568,22 +4050,21 @@ async function handleOnboardingCommand(interaction, guildConfig) {
 
       if (subcommand === 'list') {
         const embed = new EmbedBuilder()
-          .setTitle(`『 Options: ${prompt.title} 』`)
-          .setColor(guildConfig.embedStyle?.color || '#5865F2');
+          .setTitle(`『 Options: ${prompt.title} 』`.slice(0, 256))
+          .setColor(COLORS.RAPHAEL);
 
         if (prompt.options.size === 0) {
           embed.setDescription('*No options configured*');
         } else {
           const optionsList = Array.from(prompt.options.values()).map((opt, index) => {
             const roles = opt.roles?.size > 0
-              ? `\n     Roles: ${Array.from(opt.roles.keys()).map(id => `<@&${id}>`).join(', ')}`
+              ? `\n   › Roles: ${Array.from(opt.roles.keys()).map(id => `<@&${id}>`).join(', ')}`
               : '';
             const channels = opt.channels?.size > 0
-              ? `\n     Channels: ${Array.from(opt.channels.keys()).map(id => `<#${id}>`).join(', ')}`
+              ? `\n   › Channels: ${Array.from(opt.channels.keys()).map(id => `<#${id}>`).join(', ')}`
               : '';
-            const emoji = opt.emoji ? `${opt.emoji.name || opt.emoji} ` : '';
 
-            return `**${index + 1}. ${emoji}${opt.title}**` +
+            return `**${index + 1}. ${opt.title}**` +
               (opt.description ? `\n   ${opt.description}` : '') +
               roles + channels;
           }).join('\n\n');
@@ -4591,7 +4072,7 @@ async function handleOnboardingCommand(interaction, guildConfig) {
           embed.setDescription(optionsList.substring(0, 4000));
         }
 
-        embed.setFooter({ text: `${prompt.options.size} option(s)` });
+        embed.setFooter({ text: `${getRandomFooter()} | ${prompt.options.size} option(s)` });
         embed.setTimestamp();
 
         return interaction.editReply({ embeds: [embed] });
@@ -4623,6 +4104,10 @@ async function handleOnboardingCommand(interaction, guildConfig) {
               `Please provide a \`role\` or \`channel\` option when adding.`)]
           });
         }
+        if (role) {
+          const roleError = getAssignableRoleError(role, interaction.member);
+          if (roleError) return rejectRole(roleError);
+        }
 
         const updatedPrompts = mapPrompts((promptData, original) => {
           if (original.id === questionId) {
@@ -4641,7 +4126,7 @@ async function handleOnboardingCommand(interaction, guildConfig) {
 
         return interaction.editReply({
           embeds: [await successEmbed(interaction.guild.id, 'Option Added',
-            `${GLYPHS.SUCCESS} Option **"${title}"** added to question **"${prompt.title}"**!`)]
+            `${GLYPHS.SUCCESS} Option **"${title}"** added to question **"${prompt.title}"**.`)]
         });
       }
 
@@ -4682,6 +4167,10 @@ async function handleOnboardingCommand(interaction, guildConfig) {
             embeds: [await errorEmbed(interaction.guild.id, 'Not Found',
               `${GLYPHS.ERROR} Option not found.`)]
           });
+        }
+        if (!remove) {
+          const roleError = getAssignableRoleError(role, interaction.member);
+          if (roleError) return rejectRole(roleError);
         }
 
         const updatedPrompts = mapPrompts((promptData, original) => {
@@ -4749,6 +4238,12 @@ async function handleOnboardingCommand(interaction, guildConfig) {
     }
 
   } catch (error) {
+    if (error instanceof OnboardingEditError) {
+      return interaction.editReply({
+        embeds: [await errorEmbed(interaction.guild.id, 'Change Not Applied', `${GLYPHS.ERROR} ${error.message}`)]
+      });
+    }
+
     console.error('Onboarding command error:', error);
 
     if (error.code === 50001) {
