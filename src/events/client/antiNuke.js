@@ -1,9 +1,22 @@
-import { Events, AuditLogEvent, Collection, PermissionFlagsBits } from 'discord.js';
+import { Events, AuditLogEvent, Collection } from 'discord.js';
 import Guild from '../../models/Guild.js';
-import { errorEmbed, infoEmbed, GLYPHS } from '../../utils/embeds.js';
+import { errorEmbed, GLYPHS } from '../../utils/embeds.js';
 
 // Cache for tracking potentially dangerous actions
 const actionCache = new Collection(); // guildId -> { userId -> { bans: [], kicks: [], roleDeletes: [], channelDeletes: [] } }
+
+const ACTION_LABELS = {
+  removeroles: 'Remove Roles',
+  kick: 'Kick',
+  ban: 'Ban'
+};
+
+const VIOLATION_LABELS = {
+  bans: 'Bans',
+  kicks: 'Kicks',
+  roleDeletes: 'Role deletions',
+  channelDeletes: 'Channel deletions'
+};
 
 export default {
   name: 'antiNuke',
@@ -30,7 +43,7 @@ export default {
       }
     });
 
-    console.log('🛡️ Anti-nuke protection initialized');
+    console.log('[RAPHAEL] Anti-nuke protection initialized');
   },
 
   async checkForKick(client, member) {
@@ -49,7 +62,7 @@ export default {
       const { target, executor, createdTimestamp } = kickLog;
 
       // Check if this is the kick we're looking for (within last 5 seconds)
-      if (target.id === member.user.id && Date.now() - createdTimestamp < 5000) {
+      if (target?.id === member.user.id && Date.now() - createdTimestamp < 5000) {
         await this.trackAction(client, member.guild, 'kick', null, executor);
       }
     } catch (error) {
@@ -66,7 +79,7 @@ export default {
       if (!guild || !client.guilds.cache.has(guild.id)) return;
       
       const guildConfig = await Guild.getGuild(guild.id, guild.name);
-      const antiNuke = guildConfig.features.autoMod.antiNuke;
+      const antiNuke = guildConfig?.features?.autoMod?.antiNuke;
 
       if (!antiNuke?.enabled) return;
 
@@ -157,7 +170,7 @@ export default {
       const violations = [];
       for (const [key, threshold] of Object.entries(thresholds)) {
         if (userCache[key].length >= threshold) {
-          violations.push(`${key}: ${userCache[key].length}/${threshold}`);
+          violations.push(`${VIOLATION_LABELS[key]}: ${userCache[key].length}/${threshold}`);
         }
       }
 
@@ -173,52 +186,86 @@ export default {
     }
   },
 
-  async handleNukeAttempt(client, guild, guildConfig, executor, violations, action) {
-    console.log(`🚨 Nuke attempt detected in ${guild.name} by ${executor.tag}: ${violations.join(', ')}`);
+  // Applies the configured action to the executor; throws when Discord refuses it
+  async applyNukeAction(guild, executor, executorMember, action) {
+    // Lowercased: older configs saved the action as 'removeroles'
+    switch (String(action || 'removeRoles').toLowerCase()) {
+      case 'removeroles':
+        // Remove all roles from the user
+        if (executorMember.manageable) {
+          const rolesToRemove = executorMember.roles.cache.filter(r => r.id !== guild.id && !r.managed); // managed (integration/booster) roles can't be removed and would fail the whole call
+          await executorMember.roles.remove(rolesToRemove, '[Anti-Nuke] Suspicious activity detected');
+        }
+        break;
+
+      case 'kick':
+        if (executorMember.kickable) {
+          await executorMember.kick('[Anti-Nuke] Suspicious activity detected');
+        }
+        break;
+
+      case 'ban':
+        if (executorMember.bannable) {
+          await guild.members.ban(executor.id, {
+            reason: '[Anti-Nuke] Suspicious activity detected',
+            deleteMessageSeconds: 86400
+          });
+        }
+        break;
+    }
+  },
+
+  // What the configured action did, for the alert
+  async describeOutcome(guild, executor, action) {
+    const normalized = String(action || 'removeRoles').toLowerCase();
+    const label = ACTION_LABELS[normalized] || `Unknown action "${String(action)}"`;
 
     const executorMember = await guild.members.fetch(executor.id).catch(() => null);
-    if (!executorMember) return;
+    if (!executorMember) {
+      return `${label} (not applied: the executor is no longer a member)`;
+    }
+
+    // The same checks the action itself makes before acting
+    const permitted = {
+      removeroles: executorMember.manageable,
+      kick: executorMember.kickable,
+      ban: executorMember.bannable
+    }[normalized];
+
+    if (!permitted) {
+      return ACTION_LABELS[normalized]
+        ? `${label} (not applied: I lack the permission or role position to act on the executor)`
+        : `${label} (no action applied)`;
+    }
 
     try {
-      // Lowercased: older configs saved the action as 'removeroles'
-      switch (String(action || 'removeRoles').toLowerCase()) {
-        case 'removeroles':
-          // Remove all roles from the user
-          if (executorMember.manageable) {
-            const rolesToRemove = executorMember.roles.cache.filter(r => r.id !== guild.id);
-            await executorMember.roles.remove(rolesToRemove, '[Anti-Nuke] Suspicious activity detected');
-          }
-          break;
+      await this.applyNukeAction(guild, executor, executorMember, action);
+      return label;
+    } catch (error) {
+      console.error('[Anti-Nuke] Failed to apply the configured action:', error);
+      return `${label} (failed: ${error.message})`;
+    }
+  },
 
-        case 'kick':
-          if (executorMember.kickable) {
-            await executorMember.kick('[Anti-Nuke] Suspicious activity detected');
-          }
-          break;
+  async handleNukeAttempt(client, guild, guildConfig, executor, violations, action) {
+    console.log(`[Anti-Nuke] Nuke attempt detected in ${guild.name} by ${executor.tag}: ${violations.join(', ')}`);
 
-        case 'ban':
-          if (executorMember.bannable) {
-            await guild.members.ban(executor.id, {
-              reason: '[Anti-Nuke] Suspicious activity detected',
-              deleteMessageSeconds: 86400
-            });
-          }
-          break;
-      }
+    // The alert goes out even when the action could not be applied
+    const outcome = await this.describeOutcome(guild, executor, action);
 
+    try {
       // Send alert to staff
-      if (guildConfig.channels.alertLog) {
+      if (guildConfig.channels?.alertLog) {
         const alertChannel = guild.channels.cache.get(guildConfig.channels.alertLog);
         if (alertChannel) {
-          const embed = await errorEmbed(guild.id, '🚨 NUKE ATTEMPT DETECTED',
+          const embed = await errorEmbed(guild.id, 'Nuke Attempt Detected',
             `**Executor:** ${executor.tag} (${executor.id})\n\n` +
             `**Violations:**\n${violations.map(v => `${GLYPHS.ERROR} ${v}`).join('\n')}\n\n` +
-            `**Action Taken:** ${action.toUpperCase()}\n\n` +
-            `${GLYPHS.WARNING} Review the audit log immediately!`
+            `**Action Taken:** ${outcome}\n\n` +
+            `${GLYPHS.WARNING} Review the audit log immediately, Master.`
           );
-          embed.setColor('#FF0000');
 
-          const staffMention = guildConfig.roles.staffRoles?.length > 0
+          const staffMention = guildConfig.roles?.staffRoles?.length > 0
             ? guildConfig.roles.staffRoles.map(r => `<@&${r}>`).join(' ')
             : '';
 
@@ -232,12 +279,12 @@ export default {
       // DM the server owner
       try {
         const owner = await guild.fetchOwner();
-        const dmEmbed = await errorEmbed(guild.id, '🚨 Nuke Attempt on Your Server',
+        const dmEmbed = await errorEmbed(guild.id, 'Nuke Attempt on Your Server',
           `**Server:** ${guild.name}\n` +
           `**Executor:** ${executor.tag} (${executor.id})\n\n` +
-          `**Violations:**\n${violations.map(v => `• ${v}`).join('\n')}\n\n` +
-          `**Action Taken:** ${action.toUpperCase()}\n\n` +
-          `Please review your server's audit log.`
+          `**Violations:**\n${violations.map(v => `${GLYPHS.DOT} ${v}`).join('\n')}\n\n` +
+          `**Action Taken:** ${outcome}\n\n` +
+          `Please review your server's audit log, Master.`
         );
         await owner.send({ embeds: [dmEmbed] }).catch(() => { });
       } catch (error) {

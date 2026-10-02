@@ -1,9 +1,9 @@
 import {
   ActionRowBuilder,
-  ActivityType,
   ButtonBuilder,
   ButtonStyle,
   CommandInteraction,
+  MessageFlags,
 } from "discord.js";
 
 class Utils {
@@ -87,27 +87,27 @@ class Utils {
       const pageEmbed = embed[page];
       const first = new ButtonBuilder()
         .setCustomId("fast")
-        .setEmoji("⏪")
+        .setLabel("First")
         .setStyle(ButtonStyle.Primary);
       if (firstEmbed) first.setDisabled(true);
       const back = new ButtonBuilder()
         .setCustomId("back")
-        .setEmoji("◀️")
+        .setLabel("Back")
         .setStyle(ButtonStyle.Primary);
       if (firstEmbed) back.setDisabled(true);
       const next = new ButtonBuilder()
         .setCustomId("next")
-        .setEmoji("▶️")
+        .setLabel("Next")
         .setStyle(ButtonStyle.Primary);
       if (lastEmbed) next.setDisabled(true);
       const last = new ButtonBuilder()
         .setCustomId("last")
-        .setEmoji("⏩")
+        .setLabel("Last")
         .setStyle(ButtonStyle.Primary);
       if (lastEmbed) last.setDisabled(true);
       const stop = new ButtonBuilder()
         .setCustomId("stop")
-        .setEmoji("⏹️")
+        .setLabel("Stop")
         .setStyle(ButtonStyle.Danger);
       const row = new ActionRowBuilder().addComponents(
         first,
@@ -142,58 +142,62 @@ class Utils {
     } else {
       author = ctx.author;
     }
-    const filter = (int) => int.user.id === author.id;
+    // Every press is collected so other users get an answer instead of a failed interaction
     const collector = msg.createMessageComponentCollector({
-      filter,
       time: 60000,
     });
     collector.on("collect", async (interaction) => {
-      if (interaction.user.id === author.id) {
-        await interaction.deferUpdate();
-        if (interaction.customId === "fast") {
-          if (page !== 0) {
-            page = 0;
-            const newEmbed = getButton(page);
-            await interaction.editReply(newEmbed);
+      try {
+        if (interaction.user.id === author.id) {
+          await interaction.deferUpdate();
+          if (interaction.customId === "fast") {
+            if (page !== 0) {
+              page = 0;
+              const newEmbed = getButton(page);
+              await interaction.editReply(newEmbed);
+            }
           }
-        }
-        if (interaction.customId === "back") {
-          if (page !== 0) {
-            page--;
-            const newEmbed = getButton(page);
-            await interaction.editReply(newEmbed);
+          if (interaction.customId === "back") {
+            if (page !== 0) {
+              page--;
+              const newEmbed = getButton(page);
+              await interaction.editReply(newEmbed);
+            }
           }
-        }
-        if (interaction.customId === "stop") {
-          collector.stop();
-          await interaction.editReply({
-            embeds: [embed[page]],
-            components: [],
+          if (interaction.customId === "stop") {
+            collector.stop();
+            await interaction.editReply({
+              embeds: [embed[page]],
+              components: [],
+            });
+          }
+          if (interaction.customId === "next") {
+            if (page !== embed.length - 1) {
+              page++;
+              const newEmbed = getButton(page);
+              await interaction.editReply(newEmbed);
+            }
+          }
+          if (interaction.customId === "last") {
+            if (page !== embed.length - 1) {
+              page = embed.length - 1;
+              const newEmbed = getButton(page);
+              await interaction.editReply(newEmbed);
+            }
+          }
+        } else {
+          await interaction.reply({
+            content: "**Notice:** These controls belong to the member who requested them, Master.",
+            flags: MessageFlags.Ephemeral,
           });
         }
-        if (interaction.customId === "next") {
-          if (page !== embed.length - 1) {
-            page++;
-            const newEmbed = getButton(page);
-            await interaction.editReply(newEmbed);
-          }
-        }
-        if (interaction.customId === "last") {
-          if (page !== embed.length - 1) {
-            page = embed.length - 1;
-            const newEmbed = getButton(page);
-            await interaction.editReply(newEmbed);
-          }
-        }
-      } else {
-        await interaction.reply({
-          content: "You can't use this button",
-          ephemeral: true,
-        });
+      } catch (error) {
+        console.error("[Utils] Pagination interaction failed:", error);
       }
     });
     collector.on("end", async () => {
-      await msg.edit({ embeds: [embed[page]], components: [] });
+      // The message may have been deleted meanwhile
+      await msg.edit({ embeds: [embed[page]], components: [] }).catch(() => {});
     });
   }
 }

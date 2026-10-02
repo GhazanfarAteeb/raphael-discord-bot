@@ -1,61 +1,34 @@
-// const { ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
 
-const getButtons = () => {
-    let pausebut = new ButtonBuilder()
-        .setCustomId(`PAUSE_BUT`)
-        .setEmoji({ name: '⏸️' })
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(false);
-    let previousbut = new ButtonBuilder()
-        .setCustomId(`PREV_BUT`)
-        .setEmoji({ name: '⏮️' })
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(false);
-    let skipbut = new ButtonBuilder()
-        .setCustomId(`SKIP_BUT`)
-        .setEmoji({ name: '⏭️' })
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(false);
-    let highvolumebut = new ButtonBuilder()
-        .setCustomId(`HIGH_VOL_BUT`)
-        .setEmoji({ name: '🔊' })
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(false);
-    let lowvolumebut = new ButtonBuilder()
-        .setCustomId(`LOW_VOL_BUT`)
-        .setEmoji({ name: '🔉' })
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(false);
-    let forwardbut = new ButtonBuilder()
-        .setCustomId(`FORWARD_BUT`)
-        .setEmoji({ name: '⏩' })
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(false);
-    let stopbut = new ButtonBuilder()
-        .setCustomId(`STOP_BUT`)
-        .setEmoji({ name: '⏹️' })
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(false);
-    let loopbut = new ButtonBuilder()
-        .setCustomId(`LOOP_BUT`)
-        .setEmoji({ name: '🔁' })
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(false);
-    let shufflebut = new ButtonBuilder()
-        .setCustomId(`SHUFFLE_BUT`)
-        .setEmoji({ name: '🔀' })
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(false);
-    let rewindbut = new ButtonBuilder()
-        .setCustomId(`REWIND_BUT`)
-        .setEmoji({ name: '⏪' })
-        .setStyle(ButtonStyle.Secondary)
-        .setDisabled(false);
-    let row = new ActionRowBuilder().addComponents(lowvolumebut, previousbut, pausebut, skipbut, highvolumebut);
-    let row2 = new ActionRowBuilder().addComponents(rewindbut, loopbut, stopbut, shufflebut, forwardbut);
-    return [row, row2];
+// Text labels: bot buttons carry no emoji
+const ROW_ONE = [
+    { id: 'LOW_VOL_BUT', label: 'Vol -' },
+    { id: 'PREV_BUT', label: 'Previous' },
+    { id: 'PAUSE_BUT', label: 'Pause' },
+    { id: 'SKIP_BUT', label: 'Skip' },
+    { id: 'HIGH_VOL_BUT', label: 'Vol +' }
+];
+
+const ROW_TWO = [
+    { id: 'REWIND_BUT', label: 'Rewind' },
+    { id: 'LOOP_BUT', label: 'Loop' },
+    { id: 'STOP_BUT', label: 'Stop' },
+    { id: 'SHUFFLE_BUT', label: 'Shuffle' },
+    { id: 'FORWARD_BUT', label: 'Forward' }
+];
+
+function buildRow(buttons) {
+    return new ActionRowBuilder().addComponents(
+        buttons.map(({ id, label }) => new ButtonBuilder()
+            .setCustomId(id)
+            .setLabel(label)
+            .setStyle(ButtonStyle.Secondary)
+            .setDisabled(false))
+    );
 }
+
+// Fresh builders on every call: callers toggle setDisabled() on the returned rows
+const getButtons = () => [buildRow(ROW_ONE), buildRow(ROW_TWO)];
 
 export { getButtons };
 export default getButtons;

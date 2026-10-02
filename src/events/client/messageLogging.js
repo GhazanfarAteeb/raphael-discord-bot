@@ -1,6 +1,13 @@
 import { Events, EmbedBuilder } from 'discord.js';
 import Guild from '../../models/Guild.js';
-import { GLYPHS } from '../../utils/embeds.js';
+import { COLORS, GLYPHS } from '../../utils/embeds.js';
+import { truncate } from '../../utils/helpers.js';
+
+const FIELD_VALUE_MAX = 1024;
+const DESCRIPTION_MAX = 4000;
+// Code block fences around the inline bulk-delete transcript
+const CODE_BLOCK_OVERHEAD = 8;
+const NOT_CACHED = '*Unavailable (the message was not cached)*';
 
 export default {
   name: 'messageLogging',
@@ -17,6 +24,8 @@ export default {
     client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
       if (!newMessage.guild || newMessage.author?.bot) return;
       if (oldMessage.content === newMessage.content) return; // Embed updates, etc.
+      // An uncached message has no old content to compare; only a real edit sets editedTimestamp
+      if (oldMessage.partial && !newMessage.editedTimestamp) return;
 
       await logMessageEdit(oldMessage, newMessage);
     });
@@ -26,71 +35,87 @@ export default {
       await logBulkDelete(messages, channel);
     });
 
-    console.log('📝 Message logging initialized');
+    console.log('[RAPHAEL] Message logging initialized');
   }
 };
 
+// The configured message log channel, or null
+async function getMessageLogChannel(guild) {
+  const guildConfig = await Guild.getGuild(guild.id, guild.name);
+  const logChannelId = guildConfig?.channels?.messageLog;
+  return logChannelId ? guild.channels.cache.get(logChannelId) ?? null : null;
+}
+
+function field(name, value, inline = true) {
+  return { name: `${GLYPHS.ARROW_RIGHT} ${name}`, value, inline };
+}
+
+function describeAuthor(author) {
+  return author ? `${author.tag} (${author.id})` : 'Unknown';
+}
+
+// Message text for a field or description; uncached messages have no content to show
+function describeContent(message, limit) {
+  if (message.partial && !message.content) return NOT_CACHED;
+  return message.content ? truncate(message.content, limit) : '*No text content*';
+}
+
+// Keep message text from closing the transcript's code block
+function escapeCodeBlock(text) {
+  return text.replace(/```/g, '`​`​`');
+}
+
 async function logMessageDelete(message) {
   try {
-    const guildConfig = await Guild.getGuild(message.guild.id, message.guild.name);
-
-    if (!guildConfig?.channels?.messageLog) return;
-
-    const logChannel = message.guild.channels.cache.get(guildConfig.channels.messageLog);
+    const logChannel = await getMessageLogChannel(message.guild);
     if (!logChannel) return;
 
     const embed = new EmbedBuilder()
-      .setTitle(`${GLYPHS.DELETE || '🗑️'} Message Deleted`)
-      .setColor('#FF6B6B')
-      .setDescription(message.content?.substring(0, 1024) || '*No text content*')
+      .setTitle('『 Message Deleted 』')
+      .setColor(COLORS.RAPHAEL_ERROR)
+      .setDescription(describeContent(message, DESCRIPTION_MAX))
       .addFields(
-        { name: 'Author', value: message.author ? `${message.author.tag} (${message.author.id})` : 'Unknown', inline: true },
-        { name: 'Channel', value: `${message.channel} (${message.channel.id})`, inline: true }
+        field('Author', describeAuthor(message.author)),
+        field('Channel', `<#${message.channelId}> (${message.channelId})`)
       )
+      .setFooter({ text: `Message ID: ${message.id}` })
       .setTimestamp();
 
     // Add attachment info if any
-    if (message.attachments.size > 0) {
+    if (message.attachments?.size > 0) {
       const attachmentList = message.attachments.map(a => a.name).join(', ');
-      embed.addFields({ name: 'Attachments', value: attachmentList.substring(0, 1024), inline: false });
+      embed.addFields(field('Attachments', truncate(attachmentList, FIELD_VALUE_MAX), false));
     }
-
-    // Add message ID
-    embed.setFooter({ text: `Message ID: ${message.id}` });
 
     await logChannel.send({ embeds: [embed] });
 
   } catch (error) {
-    console.error('Error logging message delete:', error);
+    console.error('[MessageLogging] Error logging message delete:', error);
   }
 }
 
 async function logMessageEdit(oldMessage, newMessage) {
   try {
-    const guildConfig = await Guild.getGuild(newMessage.guild.id, newMessage.guild.name);
-
-    if (!guildConfig.channels.messageLog) return;
-
-    const logChannel = newMessage.guild.channels.cache.get(guildConfig.channels.messageLog);
+    const logChannel = await getMessageLogChannel(newMessage.guild);
     if (!logChannel) return;
 
     const embed = new EmbedBuilder()
-      .setTitle(`${GLYPHS.EDIT || '✏️'} Message Edited`)
-      .setColor('#FFD93D')
+      .setTitle('『 Message Edited 』')
+      .setColor(COLORS.RAPHAEL_WARNING)
       .addFields(
-        { name: 'Before', value: oldMessage.content?.substring(0, 1024) || '*No content*', inline: false },
-        { name: 'After', value: newMessage.content?.substring(0, 1024) || '*No content*', inline: false },
-        { name: 'Author', value: `${newMessage.author.tag} (${newMessage.author.id})`, inline: true },
-        { name: 'Channel', value: `${newMessage.channel} (${newMessage.channel.id})`, inline: true },
-        { name: 'Jump to Message', value: `[Click here](${newMessage.url})`, inline: true }
+        field('Before', describeContent(oldMessage, FIELD_VALUE_MAX), false),
+        field('After', describeContent(newMessage, FIELD_VALUE_MAX), false),
+        field('Author', describeAuthor(newMessage.author)),
+        field('Channel', `<#${newMessage.channelId}> (${newMessage.channelId})`),
+        field('Jump to Message', `[Open message](${newMessage.url})`)
       )
-      .setTimestamp()
-      .setFooter({ text: `Message ID: ${newMessage.id}` });
+      .setFooter({ text: `Message ID: ${newMessage.id}` })
+      .setTimestamp();
 
     await logChannel.send({ embeds: [embed] });
 
   } catch (error) {
-    console.error('Error logging message edit:', error);
+    console.error('[MessageLogging] Error logging message edit:', error);
   }
 }
 
@@ -98,47 +123,45 @@ async function logBulkDelete(messages, channel) {
   try {
     if (!channel.guild) return;
 
-    const guildConfig = await Guild.getGuild(channel.guild.id, channel.guild.name);
-
-    if (!guildConfig?.channels?.messageLog) return;
-
-    const logChannel = channel.guild.channels.cache.get(guildConfig.channels.messageLog);
+    const logChannel = await getMessageLogChannel(channel.guild);
     if (!logChannel) return;
 
-    // Create a text file with deleted messages
-    const messageLog = messages.map(msg => {
-      const author = msg.author ? `${msg.author.tag} (${msg.author.id})` : 'Unknown';
-      const content = msg.content || '*No content*';
-      const time = msg.createdAt.toISOString();
-      return `[${time}] ${author}: ${content}`;
-    }).reverse().join('\n');
+    // Oldest first
+    const messageLog = [...messages.values()]
+      .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
+      .map(msg => {
+        const content = msg.content || (msg.partial ? '[not cached]' : '[no text content]');
+        return `[${msg.createdAt.toISOString()}] ${describeAuthor(msg.author)}: ${content}`;
+      })
+      .join('\n');
 
     const embed = new EmbedBuilder()
-      .setTitle(`${GLYPHS.DELETE || '🗑️'} Bulk Message Delete`)
-      .setColor('#FF4757')
-      .setDescription(`**${messages.size}** messages were deleted in ${channel}`)
+      .setTitle('『 Bulk Message Delete 』')
+      .setColor(COLORS.RAPHAEL_ERROR)
+      .setDescription(`${GLYPHS.ARROW_RIGHT} **${messages.size}** messages were deleted in ${channel}.`)
       .addFields(
-        { name: 'Channel', value: `${channel} (${channel.id})`, inline: true }
+        field('Channel', `${channel} (${channel.id})`)
       )
       .setTimestamp();
 
-    // If message log is small enough, include in embed
-    if (messageLog.length < 1800) {
-      embed.addFields({ name: 'Messages', value: `\`\`\`\n${messageLog.substring(0, 1000)}\n\`\`\``, inline: false });
+    const inline = escapeCodeBlock(messageLog);
+
+    // Small enough to show in full inside the embed; otherwise attach the whole transcript
+    if (inline.length + CODE_BLOCK_OVERHEAD <= FIELD_VALUE_MAX) {
+      embed.addFields(field('Messages', `\`\`\`\n${inline}\n\`\`\``, false));
       await logChannel.send({ embeds: [embed] });
     } else {
-      // Send as file
-      const buffer = Buffer.from(messageLog, 'utf-8');
+      embed.addFields(field('Messages', 'The full transcript is attached.', false));
       await logChannel.send({
         embeds: [embed],
         files: [{
-          attachment: buffer,
+          attachment: Buffer.from(messageLog, 'utf-8'),
           name: `deleted_messages_${Date.now()}.txt`
         }]
       });
     }
 
   } catch (error) {
-    console.error('Error logging bulk delete:', error);
+    console.error('[MessageLogging] Error logging bulk delete:', error);
   }
 }

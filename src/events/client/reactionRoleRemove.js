@@ -3,6 +3,33 @@ import Guild from '../../models/Guild.js';
 import { botRemovedReactions } from './reactionRoleAdd.js';
 import logger from '../../utils/logger.js';
 
+// Color panel reactions; these emoji are data (the panel's reactions), never bot text
+const EMOJI_TO_COLOR_NAME = {
+  '❤️': 'Red', '🧡': 'Orange', '💛': 'Yellow', '💚': 'Green',
+  '💙': 'Blue', '💜': 'Purple', '🩷': 'Pink', '🤍': 'White',
+  '🖤': 'Black', '🩵': 'Cyan', '🤎': 'Brown', '💗': 'Hot Pink'
+};
+const COLOR_EMOJIS = Object.keys(EMOJI_TO_COLOR_NAME);
+// Name prefix of the roles the color panel hands out (role names are data)
+const COLOR_ROLE_PREFIX = '🎨';
+
+// Remove `role` from the member if I can; hierarchy and permission problems are logged, not thrown
+async function removeRoleQuietly(member, role, reason, logPrefix) {
+  if (!member.roles.cache.has(role.id)) return;
+
+  if (!role.editable) {
+    logger.warn(`${logPrefix} Cannot remove ${role.name} (${role.id}) in ${role.guild.id}: it is managed or not below my highest role, or I lack Manage Roles`);
+    return;
+  }
+
+  try {
+    await member.roles.remove(role, reason);
+    logger.debug(`${logPrefix} Removed ${role.name} from ${member.user.tag}`);
+  } catch (err) {
+    logger.warn(`${logPrefix} Could not remove ${role.name} from ${member.user.tag}: ${err.message}`);
+  }
+}
+
 export default {
   name: Events.MessageReactionRemove,
 
@@ -10,79 +37,42 @@ export default {
     // Ignore bots
     if (user.bot) return;
 
-    logger.info(`[ReactionRoleRemove] Reaction removed by ${user.tag} (${user.id}) with emoji: ${reaction.emoji.name}`);
-
     try {
-      // Fetch partial reactions
-      if (reaction.partial) {
-        try {
-          logger.info('[ReactionRoleRemove] Fetching partial reaction...');
-          await reaction.fetch();
-        } catch (error) {
-          logger.error('[ReactionRoleRemove] Failed to fetch reaction:', error);
-          return;
-        }
-      }
+      const { emoji } = reaction;
+      const guild = reaction.message.guild;
 
-      // Also fetch partial message if needed
-      if (reaction.message.partial) {
-        try {
-          logger.info('[ReactionRoleRemove] Fetching partial message...');
-          await reaction.message.fetch();
-        } catch (error) {
-          logger.error('[ReactionRoleRemove] Failed to fetch message:', error);
-          return;
-        }
-      }
+      if (!guild) return;
 
-      const { message, emoji } = reaction;
-      const guild = message.guild;
-
-      if (!guild) {
-        logger.info('[ReactionRoleRemove] No guild found, ignoring');
-        return;
-      }
+      const messageId = reaction.message.id;
+      const channelId = reaction.message.channelId;
 
       // Check if this was a bot-initiated removal (from switching colors)
-      const removeKey = `${message.id}:${user.id}:${emoji.name}`;
+      const removeKey = `${messageId}:${user.id}:${emoji.name}`;
       if (botRemovedReactions.has(removeKey)) {
-        logger.info(`[ReactionRoleRemove] Bot-initiated removal detected for ${removeKey}, skipping role removal`);
         // This reaction was removed by the bot during color switching, don't remove the role
         botRemovedReactions.delete(removeKey);
         return;
       }
 
-      // Get guild config
+      // Decide from the config whether this reaction matters before fetching anything
       const guildConfig = await Guild.getGuild(guild.id);
-      logger.info(`[ReactionRoleRemove] Guild config loaded. ColorRoles messageId: ${guildConfig.settings?.colorRoles?.messageId}, Current message: ${message.id}`);
 
-      // Check for color roles - either by stored messageId OR by checking if this looks like a color roles panel
-      const isColorRolesPanel = guildConfig.settings?.colorRoles?.messageId === message.id;
-      
-      // Fallback: Check if this message is in the color roles channel and has color emojis
-      const isInColorChannel = guildConfig.settings?.colorRoles?.channelId === message.channel.id;
-      const colorEmojis = ['❤️', '🧡', '💛', '💚', '💙', '💜', '🩷', '🤍', '🖤', '🩵', '🤎', '💗'];
-      const isColorEmoji = colorEmojis.includes(emoji.name);
-      const looksLikeColorPanel = isInColorChannel && isColorEmoji;
+      const isColorRolesPanel = guildConfig.settings?.colorRoles?.messageId === messageId;
 
-      if (isColorRolesPanel || looksLikeColorPanel) {
-        logger.info('[ReactionRoleRemove] This is a color roles panel message');
-        return this.handleColorRoleRemove(reaction, user, guild, guildConfig, emoji);
-      }
+      // Fallback: a message in the color roles channel with a color emoji
+      const isInColorChannel = guildConfig.settings?.colorRoles?.channelId === channelId;
+      const looksLikeColorPanel = isInColorChannel && COLOR_EMOJIS.includes(emoji.name);
 
-      if (!guildConfig.settings?.reactionRoles?.messages?.length) {
-        logger.info('[ReactionRoleRemove] No reaction role messages configured');
-        return;
-      }
-
-      // Find the message in our reaction roles config
-      const reactionMessage = guildConfig.settings.reactionRoles.messages.find(
-        m => m.messageId === message.id && m.channelId === message.channel.id
+      const reactionMessage = guildConfig.settings?.reactionRoles?.messages?.find(
+        m => m.messageId === messageId && m.channelId === channelId
       );
 
-      if (!reactionMessage) {
-        logger.info(`[ReactionRoleRemove] Message ${message.id} not found in reaction roles config`);
-        return;
+      if (!isColorRolesPanel && !looksLikeColorPanel && !reactionMessage) return;
+
+      logger.debug(`[ReactionRoleRemove] ${user.id} removed ${emoji.name} on panel ${messageId} in ${guild.id}`);
+
+      if (isColorRolesPanel || looksLikeColorPanel) {
+        return await this.handleColorRoleRemove(reaction, user, guild, guildConfig, emoji);
       }
 
       // Find the role for this emoji
@@ -90,36 +80,22 @@ export default {
       const roleConfig = reactionMessage.roles.find(r => r.emoji === emojiKey || r.emoji === emoji.name);
 
       if (!roleConfig) {
-        logger.info(`[ReactionRoleRemove] No role config found for emoji ${emojiKey}`);
+        logger.debug(`[ReactionRoleRemove] No role configured for ${emojiKey} on ${messageId}`);
         return;
       }
 
       // Get the role
       const role = guild.roles.cache.get(roleConfig.roleId);
       if (!role) {
-        logger.error(`[ReactionRoleRemove] Role ${roleConfig.roleId} not found in guild cache`);
+        logger.warn(`[ReactionRoleRemove] Role ${roleConfig.roleId} of panel ${messageId} no longer exists`);
         return;
       }
 
       // Get the member
-      const member = await guild.members.fetch(user.id).catch((err) => {
-        logger.error(`[ReactionRoleRemove] Failed to fetch member ${user.id}:`, err);
-        return null;
-      });
+      const member = await guild.members.fetch(user.id).catch(() => null);
       if (!member) return;
 
-      // Remove the role
-      if (member.roles.cache.has(role.id)) {
-        logger.info(`[ReactionRoleRemove] Removing role ${role.name} from ${member.user.tag}`);
-        try {
-          await member.roles.remove(role, 'Reaction role removed');
-          logger.info(`[ReactionRoleRemove] Successfully removed role ${role.name} from ${member.user.tag}`);
-        } catch (err) {
-          logger.error(`[ReactionRoleRemove] Failed to remove role ${role.name}:`, err);
-        }
-      } else {
-        logger.info(`[ReactionRoleRemove] Member ${member.user.tag} doesn't have role ${role.name}`);
-      }
+      await removeRoleQuietly(member, role, 'Reaction role removed', '[ReactionRoleRemove]');
 
     } catch (error) {
       logger.error('[ReactionRoleRemove] Reaction role remove error:', error);
@@ -127,9 +103,8 @@ export default {
   },
 
   async handleColorRoleRemove(reaction, user, guild, guildConfig, emoji) {
-    logger.info(`[handleColorRoleRemove] Processing color role removal for ${user.tag} with emoji: ${emoji.name}`);
     try {
-      const colorRolesConfig = guildConfig.settings.colorRoles;
+      const colorRolesConfig = guildConfig.settings?.colorRoles || {};
       const emojiName = emoji.name;
 
       // Find the role for this emoji
@@ -137,22 +112,15 @@ export default {
 
       // If no roles map, try to find by role name prefix
       if (!roleConfig) {
-        // Map emoji to color name
-        const emojiToColor = {
-          '❤️': 'Red', '🧡': 'Orange', '💛': 'Yellow', '💚': 'Green',
-          '💙': 'Blue', '💜': 'Purple', '🩷': 'Pink', '🤍': 'White',
-          '🖤': 'Black', '🩵': 'Cyan', '🤎': 'Brown', '💗': 'Hot Pink'
-        };
-
-        const colorName = emojiToColor[emojiName];
+        const colorName = EMOJI_TO_COLOR_NAME[emojiName];
         if (!colorName) {
-          logger.info(`[handleColorRoleRemove] Emoji ${emojiName} not found in emoji map`);
+          logger.debug(`[handleColorRoleRemove] ${emojiName} is not a color emoji`);
           return;
         }
 
-        const role = guild.roles.cache.find(r => r.name === `🎨 ${colorName}`);
+        const role = guild.roles.cache.find(r => r.name === `${COLOR_ROLE_PREFIX} ${colorName}`);
         if (!role) {
-          logger.error(`[handleColorRoleRemove] Role "🎨 ${colorName}" not found in guild`);
+          logger.warn(`[handleColorRoleRemove] Color role "${colorName}" not found in ${guild.id}`);
           return;
         }
 
@@ -162,29 +130,16 @@ export default {
       // Get the role
       const role = guild.roles.cache.get(roleConfig.roleId);
       if (!role) {
-        logger.error(`[handleColorRoleRemove] Role ${roleConfig.roleId} not found in cache`);
+        logger.warn(`[handleColorRoleRemove] Color role ${roleConfig.roleId} no longer exists in ${guild.id}`);
         return;
       }
 
       // Get the member
-      const member = await guild.members.fetch(user.id).catch((err) => {
-        logger.error(`[handleColorRoleRemove] Failed to fetch member ${user.id}:`, err);
-        return null;
-      });
+      const member = await guild.members.fetch(user.id).catch(() => null);
       if (!member) return;
 
       // Remove the role only if user manually removed their reaction
-      if (member.roles.cache.has(role.id)) {
-        logger.info(`[handleColorRoleRemove] Removing role ${role.name} from ${member.user.tag}`);
-        try {
-          await member.roles.remove(role, 'Color role removed by user');
-          logger.info(`[handleColorRoleRemove] Successfully removed role ${role.name} from ${member.user.tag}`);
-        } catch (err) {
-          logger.error(`[handleColorRoleRemove] Failed to remove role ${role.name}:`, err);
-        }
-      } else {
-        logger.info(`[handleColorRoleRemove] Member ${member.user.tag} doesn't have role ${role.name}`);
-      }
+      await removeRoleQuietly(member, role, 'Color role removed by user', '[handleColorRoleRemove]');
 
     } catch (error) {
       logger.error('[handleColorRoleRemove] Color role remove error:', error);
