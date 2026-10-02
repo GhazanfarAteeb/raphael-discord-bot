@@ -16,6 +16,7 @@ services:
         condition: service_healthy
     networks:
       - raphael-net
+      - audio-net
     volumes:
       - ./logs:/app/logs
 
@@ -39,3 +40,7 @@ volumes:
 networks:
   raphael-net:
     driver: bridge
+  # Shared with NodeLink (nodelink_app) and yt-cipher, which run from their own
+  # compose projects. Create once: docker network create audio-net
+  audio-net:
+    external: true

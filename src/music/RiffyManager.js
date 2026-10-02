@@ -29,6 +29,10 @@ class MoonlinkManager {
         password: n.password,
         secure: n.secure ?? false,
         identifier: `${n.host}:${n.port}`,
+        // moonlink's default (5) permanently destroys the node after ~1 minute
+        // of downtime, leaving music dead until the bot restarts. Keep retrying
+        // (backoff is capped at 5 minutes) so a NodeLink restart self-heals.
+        retryAmount: Infinity,
       })),
       options: {
         search: {
@@ -83,6 +87,33 @@ class MoonlinkManager {
     this.moonlink.on("nodeReady", (node) => {
       logger.info(`[MOONLINK] Node "${node.identifier}" ready.`);
       console.log(`[RAPHAEL] Audio node ${node.identifier} ready.`);
+    });
+
+    this.moonlink.on("nodeError", (node, error) => {
+      logger.error(`[MOONLINK] Node "${node.identifier}" error:`, error);
+    });
+
+    this.moonlink.on("nodeReconnecting", (node, attempt) => {
+      logger.warn(
+        `[MOONLINK] Reconnecting to node "${node.identifier}" (attempt ${attempt}).`,
+      );
+    });
+
+    this.moonlink.on("nodeDestroy", (identifier) => {
+      logger.error(`[MOONLINK] Node "${identifier}" destroyed.`);
+    });
+
+    // Discord voice WebSocket closed for a player (kicked, region move, etc.)
+    this.moonlink.on("socketClosed", (player, code, reason, byRemote) => {
+      logger.warn(
+        `[MOONLINK] Voice socket closed for guild ${player.guildId}: ${code} ${reason} (byRemote=${byRemote})`,
+      );
+    });
+
+    this.moonlink.on("trackStuck", (player, track, threshold) => {
+      logger.warn(
+        `[MOONLINK] Track stuck in guild ${player.guildId}: ${track?.title} (${threshold}ms)`,
+      );
     });
 
     this.moonlink.on("trackStart", (player, track) => {
