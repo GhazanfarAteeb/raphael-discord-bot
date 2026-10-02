@@ -3,10 +3,20 @@ import Member from '../../models/Member.js';
 import ModLog from '../../models/ModLog.js';
 import Guild from '../../models/Guild.js';
 import { successEmbed, errorEmbed, modLogEmbed, GLYPHS } from '../../utils/embeds.js';
+import { getPrefix, truncate } from '../../utils/helpers.js';
 import logger from '../../utils/logger.js';
+
+const USER_ID = /^\d{17,20}$/;
+const EMBED_REASON_LIMIT = 1000;
+const AUDIT_REASON_LIMIT = 512;
+// Discord API codes for "not in this server" and "no such user"
+const UNKNOWN_MEMBER = 10007;
+const UNKNOWN_USER = 10013;
+const MISSING_PERMISSIONS = 50013;
 
 export default {
   name: 'kick',
+  category: 'moderation',
   description: 'Execute temporary exclusion protocol on a member, Master',
   usage: '<@user|user_id> [reason]',
   aliases: ['boot'],
@@ -17,151 +27,180 @@ export default {
   cooldown: 3,
 
   async execute(message, args) {
-    if (!args[0]) {
-      const embed = await errorEmbed(message.guild.id, 'Invalid Usage',
-        `${GLYPHS.ARROW_RIGHT} Usage: \`kick <@user|user_id> [reason]\``
-      );
-      return message.reply({ embeds: [embed] });
-    }
+    const guildId = message.guild.id;
 
-    const userId = args[0].replace(/[<@!>]/g, '');
-    // Force fetch to bypass cache and get fresh member data
-    const targetMember = await message.guild.members.fetch({ user: userId, force: true }).catch(() => null);
-
-    if (!targetMember) {
-      const embed = await errorEmbed(message.guild.id, 'User Not Found',
-        `${GLYPHS.ERROR} Could not find that user.`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    // Check if trying to kick the server owner
-    if (targetMember.id === message.guild.ownerId) {
-      const embed = await errorEmbed(message.guild.id, 'Cannot Kick Owner',
-        `${GLYPHS.ERROR} Cannot kick the server owner. The owner is immune to all moderation actions.`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    if (!targetMember.kickable) {
-      const botMember = message.guild.members.me;
-      const isRoleIssue = targetMember.roles.highest.position >= botMember.roles.highest.position;
-      
-      // Log detailed permission info for debugging
-      logger.info(`[Kick Debug] Cannot kick user in ${message.guild.name}`);
-      logger.info(`  Target: ${targetMember.user.tag} (${targetMember.id})`);
-      logger.info(`  Target highest role: ${targetMember.roles.highest.name} (pos: ${targetMember.roles.highest.position})`);
-      logger.info(`  Target role permissions: ${targetMember.roles.highest.permissions.bitfield}`);
-      logger.info(`  Bot highest role: ${botMember.roles.highest.name} (pos: ${botMember.roles.highest.position})`);
-      logger.info(`  Bot role permissions: ${botMember.roles.highest.permissions.bitfield}`);
-      logger.info(`  Bot has Admin: ${botMember.permissions.has('Administrator')}`);
-      logger.info(`  Bot has KickMembers: ${botMember.permissions.has('KickMembers')}`);
-      logger.info(`  Target is kickable: ${targetMember.kickable}`);
-      logger.info(`  All target roles: ${targetMember.roles.cache.map(r => `${r.name}(${r.position})`).join(', ')}`);
-      logger.info(`  All bot roles: ${botMember.roles.cache.map(r => `${r.name}(${r.position})`).join(', ')}`);
-      
-      const embed = await errorEmbed(message.guild.id, 'Cannot Kick',
-        `${GLYPHS.ERROR} I cannot kick this user.\n\n` +
-        `**Debug Info:**\n` +
-        `${GLYPHS.DOT} My highest role: \`${botMember.roles.highest.name}\` (pos: ${botMember.roles.highest.position})\n` +
-        `${GLYPHS.DOT} Their highest role: \`${targetMember.roles.highest.name}\` (pos: ${targetMember.roles.highest.position})\n` +
-        `${GLYPHS.DOT} Bot has Admin: ${botMember.permissions.has('Administrator') ? 'Yes' : 'No'}\n\n` +
-        `**Issue:** ${isRoleIssue ? 'Their role is higher or equal to mine.' : 'Unknown - check Discord permissions.'}`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    if (targetMember.roles.highest.position >= message.member.roles.highest.position) {
-      // Allow server owner and administrators to bypass role hierarchy check
-      const isOwner = message.author.id === message.guild.ownerId;
-      if (!isOwner && !message.member.permissions.has(PermissionFlagsBits.Administrator)) {
-        logger.info(`[Kick Debug] Moderator role hierarchy check failed`);
-        logger.info(`  Moderator: ${message.author.tag} - highest role: ${message.member.roles.highest.name} (pos: ${message.member.roles.highest.position})`);
-        logger.info(`  Target: ${targetMember.user.tag} - highest role: ${targetMember.roles.highest.name} (pos: ${targetMember.roles.highest.position})`);
-        logger.info(`  Moderator is Owner: ${isOwner}`);
-        
-        const embed = await errorEmbed(message.guild.id, 'Permission Denied',
-          `${GLYPHS.LOCK} You cannot kick someone with equal or higher role than you.\n\n` +
-          `**Debug Info:**\n` +
-          `${GLYPHS.DOT} Your highest role: \`${message.member.roles.highest.name}\` (pos: ${message.member.roles.highest.position})\n` +
-          `${GLYPHS.DOT} Their highest role: \`${targetMember.roles.highest.name}\` (pos: ${targetMember.roles.highest.position})\n\n` +
-          `*Server owner and Administrators can bypass this check.*`
-        );
-        return message.reply({ embeds: [embed] });
+    try {
+      const userId = args[0]?.replace(/[<@!>]/g, '');
+      if (!userId || !USER_ID.test(userId)) {
+        const prefix = await getPrefix(guildId);
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Invalid Usage',
+            `${GLYPHS.ARROW_RIGHT} Usage: \`${prefix}kick <@user|user_id> [reason]\``)]
+        });
       }
-    }
 
-    const reason = args.slice(1).join(' ') || 'No reason provided';
+      if (userId === message.author.id) {
+        return message.reply({ embeds: [await errorEmbed(guildId, 'Permission Denied', 'You cannot kick yourself, Master.')] });
+      }
+      if (userId === message.client.user.id) {
+        return message.reply({ embeds: [await errorEmbed(guildId, 'Invalid Usage', 'I cannot kick myself, Master.')] });
+      }
+      if (userId === message.guild.ownerId) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Permission Denied', 'The server owner is immune to moderation actions, Master.')]
+        });
+      }
 
-    // Update member data
-    let memberData = await Member.findOne({
-      userId: targetMember.user.id,
-      guildId: message.guild.id
-    });
+      const targetMember = await fetchMember(message.guild, userId);
+      if (!targetMember) {
+        return message.reply({ embeds: [await errorEmbed(guildId, 'User Not Found', 'That user is not a member of this server, Master.')] });
+      }
 
-    if (memberData) {
-      memberData.kicks.push({
-        moderatorId: message.author.id,
-        reason,
-        timestamp: new Date()
+      if (!targetMember.kickable) {
+        return message.reply({ embeds: [await errorEmbed(guildId, 'Cannot Kick', botHierarchyReason(targetMember))] });
+      }
+      if (!outranks(message.member, targetMember)) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Permission Denied',
+            'Their highest role is equal to or above yours, so you cannot kick them, Master.')]
+        });
+      }
+
+      const reason = truncate(args.slice(1).join(' ').trim() || 'No reason provided', EMBED_REASON_LIMIT);
+      const targetUser = targetMember.user;
+
+      // Notify right before acting: once removed they may share no server with me
+      let notice = null;
+      try {
+        const dmEmbed = await errorEmbed(guildId, 'Removal Notice',
+          `**Notice:** You have been removed from **${message.guild.name}**.\n\n` +
+          `${GLYPHS.ARROW_RIGHT} **Reason:** ${reason}\n` +
+          `${GLYPHS.ARROW_RIGHT} **Moderator:** ${message.author.tag}\n\n` +
+          `*You may rejoin if you have an invite link.*`
+        );
+        notice = await targetMember.send({ embeds: [dmEmbed] });
+      } catch {
+        // DMs closed
+      }
+
+      try {
+        await targetMember.kick(truncate(reason, AUDIT_REASON_LIMIT));
+      } catch (error) {
+        // The kick did not happen, so withdraw the notice that said it had
+        await notice?.delete().catch(() => {});
+        logger.error(`[Kick] Discord rejected the kick of ${userId} in ${guildId}`, error);
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Kick Failed', error.code === MISSING_PERMISSIONS
+            ? 'Discord denied me permission to kick this member, Master.'
+            : 'Discord rejected the kick request, Master. The incident has been logged.')]
+        });
+      }
+
+      const caseNumber = await recordCase(message, targetUser, reason);
+
+      await postModLog(message, {
+        caseNumber: caseNumber ?? '—',
+        targetTag: targetUser.tag,
+        targetId: targetUser.id,
+        moderatorTag: message.author.tag,
+        reason
       });
-      await memberData.save();
+
+      const embed = await successEmbed(guildId, 'Removal Executed',
+        `**Notice:** Disciplinary action has been executed, Master.\n\n` +
+        `${GLYPHS.ARROW_RIGHT} **Subject:** ${targetUser.tag}\n` +
+        `${GLYPHS.ARROW_RIGHT} **Action:** Server Removal\n` +
+        `${GLYPHS.ARROW_RIGHT} **Reason:** ${reason}\n` +
+        (caseNumber
+          ? `${GLYPHS.ARROW_RIGHT} **Case Reference:** #${caseNumber}`
+          : `${GLYPHS.ERROR} The case record could not be saved. The incident has been logged.`)
+      );
+      return message.reply({ embeds: [embed] });
+    } catch (error) {
+      logger.error('[Kick] Command failed', error);
+      const embed = await errorEmbed(guildId, 'Kick Failed',
+        'An anomaly interrupted the kick protocol, Master. The incident has been logged.').catch(() => null);
+      return message.reply(embed ? { embeds: [embed] } : { content: '**Alert:** The kick protocol failed, Master.' }).catch(() => null);
     }
+  }
+};
 
-    // Create mod log
-    const caseNumber = await ModLog.getNextCaseNumber(message.guild.id);
-    const guildConfig = await Guild.getGuild(message.guild.id);
+// The member, or null when they are not in the server; other lookup failures are rethrown
+async function fetchMember(guild, userId) {
+  try {
+    return await guild.members.fetch({ user: userId, force: true });
+  } catch (error) {
+    if (error.code === UNKNOWN_MEMBER || error.code === UNKNOWN_USER) return null;
+    throw error;
+  }
+}
 
-    const logData = {
-      caseNumber,
-      targetTag: targetMember.user.tag,
-      targetId: targetMember.user.id,
-      moderatorTag: message.author.tag,
-      reason
-    };
+// Server owner and Administrators may act on anyone; others only below their own top role
+function outranks(moderator, target) {
+  if (moderator.id === moderator.guild.ownerId) return true;
+  if (moderator.permissions.has(PermissionFlagsBits.Administrator)) return true;
+  return target.roles.highest.position < moderator.roles.highest.position;
+}
 
+function botHierarchyReason(target) {
+  const me = target.guild.members.me;
+  return target.roles.highest.position >= me.roles.highest.position
+    ? 'Their highest role is equal to or above mine, so I cannot kick them, Master. Move my role above theirs in Server Settings › Roles.'
+    : 'Discord does not permit me to kick this member, Master.';
+}
+
+// Case and member records, written only after the kick succeeded. Returns the case number,
+// or null if it could not be saved (the kick itself stands either way).
+async function recordCase(message, user, reason) {
+  const guildId = message.guild.id;
+  let caseNumber = null;
+
+  try {
+    const nextCase = await ModLog.getNextCaseNumber(guildId);
     await ModLog.create({
-      guildId: message.guild.id,
-      caseNumber,
+      guildId,
+      caseNumber: nextCase,
       action: 'kick',
       moderatorId: message.author.id,
       moderatorTag: message.author.tag,
-      targetId: targetMember.user.id,
-      targetTag: targetMember.user.tag,
+      targetId: user.id,
+      targetTag: user.tag,
       reason
     });
-
-    // DM the user
-    try {
-      const dmEmbed = await errorEmbed(message.guild.id, `Removal Notice`,
-        `**Notice:** You have been removed from **${message.guild.name}**.\n\n` +
-        `▸ **Justification:** ${reason}\n` +
-        `▸ **Authorized by:** ${message.author.tag}\n\n` +
-        `*You may rejoin if you have an invite link.*`
-      );
-      await targetMember.send({ embeds: [dmEmbed] });
-    } catch (error) {
-      // User has DMs disabled
-    }
-
-    // Kick the member
-    await targetMember.kick(reason);
-
-    // Send to mod log
-    if (guildConfig.channels.modLog) {
-      const modLogChannel = message.guild.channels.cache.get(guildConfig.channels.modLog);
-      if (modLogChannel) {
-        const logEmbed = await modLogEmbed(message.guild.id, 'kick', logData);
-        await modLogChannel.send({ embeds: [logEmbed] });
-      }
-    }
-
-    const embed = await successEmbed(message.guild.id, 'Removal Executed',
-      `**Notice:** Disciplinary action has been executed, Master.\n\n` +
-      `▸ **Subject:** ${targetMember.user.tag}\n` +
-      `▸ **Action:** Server Removal\n` +
-      `▸ **Case Reference:** #${caseNumber}`
-    );
-    return message.reply({ embeds: [embed] });
+    caseNumber = nextCase;
+  } catch (error) {
+    logger.error(`[Kick] Failed to save the case for ${user.id} in ${guildId}`, error);
   }
-};
+
+  try {
+    await Member.updateOne(
+      { userId: user.id, guildId },
+      {
+        $push: { kicks: { moderatorId: message.author.id, reason, timestamp: new Date() } },
+        $setOnInsert: {
+          username: user.username,
+          discriminator: user.discriminator || '0',
+          accountCreatedAt: user.createdAt
+        }
+      },
+      { upsert: true }
+    );
+  } catch (error) {
+    logger.error(`[Kick] Failed to update the member record for ${user.id} in ${guildId}`, error);
+  }
+
+  return caseNumber;
+}
+
+async function postModLog(message, logData) {
+  try {
+    const guildConfig = await Guild.getGuild(message.guild.id);
+    const channelId = guildConfig?.channels?.modLog;
+    const channel = channelId ? message.guild.channels.cache.get(channelId) : null;
+    if (!channel) return;
+    const embed = await modLogEmbed(message.guild.id, 'kick', logData);
+    await channel.send({ embeds: [embed] });
+  } catch (error) {
+    logger.warn(`[Kick] Failed to post to the mod log in ${message.guild.id}: ${error.message}`);
+  }
+}

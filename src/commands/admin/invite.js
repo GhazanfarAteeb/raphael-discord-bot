@@ -1,121 +1,132 @@
-import { EmbedBuilder } from "discord.js";
-import { getRandomFooter } from "../../utils/raphael.js";
+import { ChannelType, EmbedBuilder, PermissionFlagsBits } from 'discord.js';
+import { errorEmbed, successEmbed, warningEmbed, COLORS, GLYPHS } from '../../utils/embeds.js';
+import { getPrefix, formatNumber, escapeMarkdown, truncate } from '../../utils/helpers.js';
+import { getRandomFooter } from '../../utils/raphael.js';
+import logger from '../../utils/logger.js';
+
+const GUILD_ID = /^\d{17,20}$/;
+const INVITE_MAX_AGE_SECONDS = 24 * 60 * 60;
+const MAX_LISTED_MATCHES = 10;
+const INVITE_PERMISSIONS = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.CreateInstantInvite];
 
 export default {
-  name: "invite",
-  description: "Get an invite link to a specific server (Owner only)",
+  name: 'invite',
+  category: 'admin',
+  description: 'Get an invite link to a specific server (Owner only)',
   ownerOnly: true,
-  usage: "<server_name_or_id>",
+  usage: '<server_name_or_id>',
 
   async execute(message, args) {
+    const guildId = message.guild.id;
+
     try {
-      if (!args.length) {
+      const prefix = await getPrefix(guildId);
+      const query = args.join(' ').trim();
+
+      if (!query) {
         return message.reply({
-          embeds: [
-            new EmbedBuilder()
-              .setColor(message.client.color.red)
-              .setTitle("▸ Invalid Usage")
-              .setDescription(
-                "Please provide a server name or ID.\n\n`!invite <server_name_or_id>`",
-              )
-              .setFooter({ text: getRandomFooter() }),
-          ],
+          embeds: [await errorEmbed(guildId, 'Invalid Usage',
+            `Provide a server name or ID, Master.\n\n${GLYPHS.ARROW_RIGHT} Usage: \`${prefix}invite <server_name_or_id>\``)]
         });
       }
 
-      const searchTerm = args.join(" ").toLowerCase();
-      const client = message.client;
-      const guilds = client.guilds.cache;
+      const matches = findGuilds(message.client.guilds.cache, query);
 
-      // Search by name or ID
-      let targetGuild = guilds.find((g) =>
-        g.name.toLowerCase().includes(searchTerm),
-      );
-      if (!targetGuild && /^\d+$/.test(searchTerm)) {
-        targetGuild = guilds.get(searchTerm);
-      }
-
-      if (!targetGuild) {
+      if (matches.length === 0) {
         return message.reply({
-          embeds: [
-            new EmbedBuilder()
-              .setColor(message.client.color.red)
-              .setTitle("▸ Server Not Found")
-              .setDescription(
-                `Could not find a server matching **${searchTerm}**, Master.`,
-              )
-              .setFooter({ text: getRandomFooter() }),
-          ],
+          embeds: [await errorEmbed(guildId, 'Server Not Found',
+            `No server I belong to matches **${escapeMarkdown(truncate(query, 100))}**, Master.`)]
         });
       }
 
-      // Try to create an invite
-      const channel = targetGuild.channels.cache.find(
-        (ch) =>
-          ch.isTextBased() &&
-          ch
-            .permissionsFor(targetGuild.members.me)
-            .has(["CreateInstantInvite", "ViewChannel"]),
-      );
+      if (matches.length > 1) {
+        const lines = matches.slice(0, MAX_LISTED_MATCHES).map(g =>
+          `${GLYPHS.DOT} **${escapeMarkdown(g.name)}** — \`${g.id}\` (${formatNumber(g.memberCount)} members)`);
+        if (matches.length > MAX_LISTED_MATCHES) lines.push(`${GLYPHS.DOT} ...and ${matches.length - MAX_LISTED_MATCHES} more`);
 
+        const list = new EmbedBuilder()
+          .setColor(COLORS.RAPHAEL_WARNING)
+          .setTitle('『 Multiple Servers Match 』')
+          .setDescription(
+            `**Notice:** ${matches.length} servers match **${escapeMarkdown(truncate(query, 100))}**, Master. ` +
+            `Repeat the command with the server ID.\n\n${lines.join('\n')}`)
+          .setFooter({ text: getRandomFooter() });
+        return deliverPrivately(message, { embeds: [list] }, 'The matching servers have been');
+      }
+
+      const targetGuild = matches[0];
+      const channel = pickInviteChannel(targetGuild);
       if (!channel) {
         return message.reply({
-          embeds: [
-            new EmbedBuilder()
-              .setColor(message.client.color.red)
-              .setTitle("▸ Cannot Create Invite")
-              .setDescription(
-                `I don't have permission to create invites in **${targetGuild.name}**, Master.\n\nEnsure I have the **Create Invite** permission.`,
-              )
-              .setFooter({ text: getRandomFooter() }),
-          ],
+          embeds: [await errorEmbed(guildId, 'Cannot Create Invite',
+            `I lack the **Create Invite** permission in every text channel of **${escapeMarkdown(targetGuild.name)}**, Master.`)]
         });
       }
 
       const invite = await channel.createInvite({
-        maxAge: 86400, // 24 hours
+        maxAge: INVITE_MAX_AGE_SECONDS,
         maxUses: 0,
-        reason: "Generated by owner via invite command",
+        reason: 'Generated by the bot owner via the invite command'
       });
 
-      return message.reply({
-        embeds: [
-          new EmbedBuilder()
-            .setColor(message.client.color.main)
-            .setTitle(`▸ Invite to ${targetGuild.name}`)
-            .addFields(
-              { name: "◈ Server", value: targetGuild.name, inline: true },
-              {
-                name: "◆ Members",
-                value: targetGuild.memberCount.toString(),
-                inline: true,
-              },
-              {
-                name: "▸ Invite Link",
-                value: `[Join Server](${invite.url})`,
-                inline: false,
-              },
-              { name: "◉ Expires", value: "In 24 hours", inline: true },
-              { name: "◎ Uses", value: "Unlimited", inline: true },
-            )
-            .setThumbnail(targetGuild.iconURL({ size: 256 }))
-            .setFooter({ text: getRandomFooter() })
-            .setTimestamp(),
-        ],
-      });
+      const embed = new EmbedBuilder()
+        .setColor(COLORS.RAPHAEL)
+        .setTitle('『 Server Invite 』')
+        .setDescription(`**Answer:** Invite generated for **${escapeMarkdown(targetGuild.name)}**, Master.\n\n${invite.url}`)
+        .addFields(
+          { name: `${GLYPHS.ARROW_RIGHT} Server ID`, value: `\`${targetGuild.id}\``, inline: true },
+          { name: `${GLYPHS.ARROW_RIGHT} Members`, value: formatNumber(targetGuild.memberCount), inline: true },
+          { name: `${GLYPHS.ARROW_RIGHT} Channel`, value: `#${channel.name}`, inline: true },
+          { name: `${GLYPHS.ARROW_RIGHT} Expires`, value: `<t:${Math.floor(Date.now() / 1000) + INVITE_MAX_AGE_SECONDS}:R>`, inline: true },
+          { name: `${GLYPHS.ARROW_RIGHT} Uses`, value: 'Unlimited', inline: true }
+        )
+        .setThumbnail(targetGuild.iconURL({ size: 256 }))
+        .setFooter({ text: getRandomFooter() })
+        .setTimestamp();
+
+      return deliverPrivately(message, { embeds: [embed] }, 'The invite has been');
     } catch (error) {
-      console.error("[INVITE] Error:", error);
-      return message.reply({
-        embeds: [
-          new EmbedBuilder()
-            .setColor(message.client.color.red)
-            .setTitle("▸ Error")
-            .setDescription(
-              `An error occurred while generating the invite:\n\`\`\`${error.message}\`\`\``,
-            )
-            .setFooter({ text: getRandomFooter() }),
-        ],
-      });
+      logger.error('[Invite] Command failed', error);
+      const embed = await errorEmbed(guildId, 'Invite Failed',
+        'An anomaly occurred while generating the invite, Master. The incident has been logged.').catch(() => null);
+      return message.reply(embed ? { embeds: [embed] } : { content: '**Alert:** The invite could not be generated, Master.' }).catch(() => null);
     }
-  },
+  }
 };
+
+// Exact ID, then exact name, then every partial name match (the caller lists ambiguous results)
+function findGuilds(guilds, query) {
+  if (GUILD_ID.test(query) && guilds.has(query)) return [guilds.get(query)];
+
+  const lower = query.toLowerCase();
+  const exact = [...guilds.filter(g => g.name.toLowerCase() === lower).values()];
+  if (exact.length > 0) return exact;
+
+  return [...guilds.filter(g => g.name.toLowerCase().includes(lower)).values()]
+    .sort((a, b) => b.memberCount - a.memberCount);
+}
+
+// The system channel when usable, otherwise the topmost text channel I can invite from
+function pickInviteChannel(guild) {
+  const me = guild.members.me;
+  if (!me) return null;
+  const usable = c => c?.type === ChannelType.GuildText && c.permissionsFor(me)?.has(INVITE_PERMISSIONS);
+  if (usable(guild.systemChannel)) return guild.systemChannel;
+  return guild.channels.cache.filter(usable).sort((a, b) => a.rawPosition - b.rawPosition).first() ?? null;
+}
+
+// Invites and server lists stay out of shared channels: DM the owner and confirm briefly,
+// falling back to the channel (and saying so) only when DMs are closed
+async function deliverPrivately(message, payload, subject) {
+  const guildId = message.guild.id;
+  try {
+    await message.author.send(payload);
+  } catch {
+    const notice = await warningEmbed(guildId, 'Direct Messages Closed',
+      'I could not reach your direct messages, so the result is posted here instead, Master.');
+    return message.reply({ ...payload, embeds: [notice, ...payload.embeds] });
+  }
+  return message.reply({
+    embeds: [await successEmbed(guildId, 'Delivered', `${subject} sent to your direct messages, Master.`)]
+  });
+}

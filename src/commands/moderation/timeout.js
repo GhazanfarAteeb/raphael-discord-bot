@@ -1,15 +1,38 @@
-import { PermissionFlagsBits, SlashCommandBuilder } from 'discord.js';
+import { PermissionFlagsBits } from 'discord.js';
 import Member from '../../models/Member.js';
 import ModLog from '../../models/ModLog.js';
 import Guild from '../../models/Guild.js';
-import { successEmbed, errorEmbed, modLogEmbed, GLYPHS } from '../../utils/embeds.js';
+import { successEmbed, errorEmbed, modLogEmbed, GLYPHS, COLORS } from '../../utils/embeds.js';
+import { getPrefix, truncate } from '../../utils/helpers.js';
 import logger from '../../utils/logger.js';
-import { getRandomFooter } from '../../utils/raphael.js';
+
+const USER_ID = /^\d{17,20}$/;
+const EMBED_REASON_LIMIT = 1000;
+const AUDIT_REASON_LIMIT = 512;
+// Discord API codes for "not in this server" and "no such user"
+const UNKNOWN_MEMBER = 10007;
+const UNKNOWN_USER = 10013;
+const MISSING_PERMISSIONS = 50013;
+
+const UNIT_MS = {
+  w: 7 * 24 * 60 * 60 * 1000,
+  d: 24 * 60 * 60 * 1000,
+  h: 60 * 60 * 1000,
+  m: 60 * 1000,
+  s: 1000
+};
+const UNIT_NAMES = [['week', UNIT_MS.w], ['day', UNIT_MS.d], ['hour', UNIT_MS.h], ['minute', UNIT_MS.m], ['second', UNIT_MS.s]];
+// Discord's limit is 28 days from the moment the request lands; a minute of headroom keeps
+// a full "28d" from being rejected once request latency is added
+const DISCORD_MAX_TIMEOUT_MS = 28 * UNIT_MS.d;
+const MAX_TIMEOUT_MS = DISCORD_MAX_TIMEOUT_MS - UNIT_MS.m;
+const REMOVE_KEYWORDS = ['off', 'remove', 'clear'];
 
 export default {
   name: 'timeout',
+  category: 'moderation',
   description: 'Timeout a member (prevent them from sending messages)',
-  usage: '<@user|user_id> <duration> [reason]',
+  usage: '<@user|user_id> <duration|off> [reason]',
   aliases: ['mute', 'to'],
   permissions: {
     user: PermissionFlagsBits.ModerateMembers,
@@ -17,310 +40,328 @@ export default {
   },
   cooldown: 3,
 
-  // Slash command data
-  slashCommand: true,
-  data: new SlashCommandBuilder()
-    .setName('timeout')
-    .setDescription('Timeout a member (prevent them from sending messages)')
-    .addUserOption(option =>
-      option.setName('user')
-        .setDescription('The user to timeout')
-        .setRequired(true))
-    .addStringOption(option =>
-      option.setName('duration')
-        .setDescription('Duration (e.g., 5m, 1h, 1d, 1w)')
-        .setRequired(true))
-    .addStringOption(option =>
-      option.setName('reason')
-        .setDescription('Reason for the timeout')
-        .setRequired(false))
-    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
-
   async execute(message, args) {
-    if (!args[0]) {
-      const embed = await errorEmbed(message.guild.id, 'Protocol Parameters',
-        `**Notice:** Correct syntax required, Master.\n\n` +
-        `\`timeout <@user|user_id> <duration> [reason]\`\n\n` +
-        `**Duration Parameters:**\n` +
-        `◇ \`5m\` — 5 minutes\n` +
-        `◇ \`1h\` — 1 hour\n` +
-        `◇ \`1d\` — 1 day\n` +
-        `◇ \`1w\` — 1 week\n` +
-        `◇ \`off\` — Remove restriction`
-      );
-      return message.reply({ embeds: [embed] });
-    }
+    const guildId = message.guild.id;
 
-    const userId = args[0].replace(/[<@!>]/g, '');
-    // Force fetch to bypass cache and get fresh member data
-    const targetMember = await message.guild.members.fetch({ user: userId, force: true }).catch(() => null);
-
-    if (!targetMember) {
-      const embed = await errorEmbed(message.guild.id, 'Subject Not Found',
-        `**Warning:** Unable to locate the specified user, Master.`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    // Check if target is the server owner
-    if (targetMember.id === message.guild.ownerId) {
-      const embed = await errorEmbed(message.guild.id, 'Action Denied',
-        `**Warning:** Server owner possesses absolute immunity, Master. This action cannot be executed.`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    if (!targetMember.moderatable) {
-      // Get the bot's highest role for better error message
-      const botMember = message.guild.members.me;
-      const botHighestRole = botMember.roles.highest;
-      const targetHighestRole = targetMember.roles.highest;
-      
-      // Check role hierarchy
-      const isRoleIssue = targetHighestRole.position >= botHighestRole.position;
-      
-      // Log detailed permission info for debugging
-      logger.info(`[Timeout Debug] Cannot moderate user in ${message.guild.name}`);
-      logger.info(`  Target: ${targetMember.user.tag} (${targetMember.id})`);
-      logger.info(`  Target highest role: ${targetHighestRole.name} (pos: ${targetHighestRole.position})`);
-      logger.info(`  Target role permissions: ${targetHighestRole.permissions.bitfield}`);
-      logger.info(`  Bot highest role: ${botHighestRole.name} (pos: ${botHighestRole.position})`);
-      logger.info(`  Bot role permissions: ${botHighestRole.permissions.bitfield}`);
-      logger.info(`  Bot has Admin: ${botMember.permissions.has('Administrator')}`);
-      logger.info(`  Bot has ModerateMembers: ${botMember.permissions.has('ModerateMembers')}`);
-      logger.info(`  Target is moderatable: ${targetMember.moderatable}`);
-      logger.info(`  All target roles: ${targetMember.roles.cache.map(r => `${r.name}(${r.position})`).join(', ')}`);
-      logger.info(`  All bot roles: ${botMember.roles.cache.map(r => `${r.name}(${r.position})`).join(', ')}`);
-      
-      const embed = await errorEmbed(message.guild.id, 'Authority Insufficient',
-        `**Warning:** Unable to execute restriction on this subject, Master.\n\n` +
-        `**Diagnostic Data:**\n` +
-        `◇ My authority level: \`${botHighestRole.name}\` (position: ${botHighestRole.position})\n` +
-        `◇ Subject authority: \`${targetHighestRole.name}\` (position: ${targetHighestRole.position})\n` +
-        `◇ Administrative access: ${botMember.permissions.has('Administrator') ? 'Affirmative' : 'Negative'}\n\n` +
-        `**Analysis:** ${isRoleIssue ? 'Subject role exceeds or equals my authority. Elevation required via Server Settings → Roles.' : 'Unknown — verify Discord permissions.'}`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    if (targetMember.roles.highest.position >= message.member.roles.highest.position) {
-      // Allow server owner and administrators to bypass role hierarchy check
-      const isOwner = message.author.id === message.guild.ownerId;
-      if (!isOwner && !message.member.permissions.has(PermissionFlagsBits.Administrator)) {
-        // Log for debugging
-        logger.info(`[Timeout Debug] Moderator role hierarchy check failed`);
-        logger.info(`  Moderator: ${message.author.tag} (${message.author.id})`);
-        logger.info(`  Moderator highest role: ${message.member.roles.highest.name} (pos: ${message.member.roles.highest.position})`);
-        logger.info(`  Target: ${targetMember.user.tag} (${targetMember.id})`);
-        logger.info(`  Target highest role: ${targetMember.roles.highest.name} (pos: ${targetMember.roles.highest.position})`);
-        logger.info(`  Moderator has Admin: ${message.member.permissions.has(PermissionFlagsBits.Administrator)}`);
-        logger.info(`  Moderator is Owner: ${isOwner}`);
-        
-        const embed = await errorEmbed(message.guild.id, 'Authority Conflict',
-          `**Warning:** Your authority level is insufficient to restrict this subject, Master.\n\n` +
-          `**Hierarchy Analysis:**\n` +
-          `◇ Your authority: \`${message.member.roles.highest.name}\` (pos: ${message.member.roles.highest.position})\n` +
-          `◇ Subject authority: \`${targetMember.roles.highest.name}\` (pos: ${targetMember.roles.highest.position})\n\n` +
-          `*Server owner and Administrators possess override privileges.*`
-        );
-        return message.reply({ embeds: [embed] });
-      }
-    }
-
-    const durationArg = args[1]?.toLowerCase();
-
-    // Handle timeout removal
-    if (durationArg === 'off' || durationArg === 'remove' || durationArg === 'clear') {
-      if (!targetMember.isCommunicationDisabled()) {
-        const embed = await errorEmbed(message.guild.id, 'No Active Restriction',
-          `**Notice:** This subject has no active communication restriction, Master.`
-        );
-        return message.reply({ embeds: [embed] });
-      }
-
-      await targetMember.timeout(null, `Timeout removed by ${message.author.tag}`);
-
-      // Remove muted role if configured
-      const guildConfig = await Guild.getGuild(message.guild.id);
-      if (guildConfig.roles?.mutedRole) {
-        const mutedRole = message.guild.roles.cache.get(guildConfig.roles.mutedRole);
-        if (mutedRole && targetMember.roles.cache.has(mutedRole.id)) {
-          try {
-            await targetMember.roles.remove(mutedRole, `Timeout removed by ${message.author.tag}`);
-          } catch (err) {
-            logger.warn(`[Timeout] Failed to remove muted role: ${err.message}`);
-          }
-        }
-      }
-
-      const embed = await successEmbed(message.guild.id, 'Restriction Lifted',
-        `**Confirmed:** Communication restriction removed from **${targetMember.user.tag}**, Master.`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    if (!durationArg) {
-      const embed = await errorEmbed(message.guild.id, 'Duration Required',
-        `**Notice:** Temporal parameter is mandatory, Master.\n\n` +
-        `Examples: \`5m\`, \`1h\`, \`1d\`, \`1w\`, \`off\``
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    // Parse duration
-    const durationMs = parseDuration(durationArg);
-
-    if (!durationMs) {
-      const embed = await errorEmbed(message.guild.id, 'Invalid Duration Format',
-        `**Warning:** Duration syntax is incorrect, Master.\n\n` +
-        `**Valid Formats:**\n` +
-        `◇ \`5m\` — 5 minutes\n` +
-        `◇ \`1h\` — 1 hour\n` +
-        `◇ \`1d\` — 1 day\n` +
-        `◇ \`1w\` — 1 week`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    // Max timeout is 28 days (Discord limit)
-    const maxTimeout = 28 * 24 * 60 * 60 * 1000;
-    if (durationMs > maxTimeout) {
-      const embed = await errorEmbed(message.guild.id, 'Duration Exceeded',
-        `**Warning:** Maximum restriction duration is 28 days, Master.`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    const reason = args.slice(2).join(' ') || 'No reason provided';
-
-    // Update member data
-    let memberData = await Member.findOne({
-      userId: targetMember.user.id,
-      guildId: message.guild.id
-    });
-
-    if (!memberData) {
-      memberData = await Member.create({
-        userId: targetMember.user.id,
-        guildId: message.guild.id,
-        username: targetMember.user.username,
-        discriminator: targetMember.user.discriminator || '0',
-        accountCreatedAt: targetMember.user.createdAt
-      });
-    }
-
-    memberData.mutes.push({
-      moderatorId: message.author.id,
-      reason,
-      duration: durationMs / 1000,
-      timestamp: new Date(),
-      expiresAt: new Date(Date.now() + durationMs)
-    });
-    await memberData.save();
-
-    // Get guild config for muted role and mod log
-    const guildConfig = await Guild.getGuild(message.guild.id);
-
-    // Apply timeout
-    await targetMember.timeout(durationMs, reason);
-
-    // Apply muted role if configured
-    if (guildConfig.roles?.mutedRole) {
-      const mutedRole = message.guild.roles.cache.get(guildConfig.roles.mutedRole);
-      if (mutedRole && targetMember.manageable) {
-        try {
-          await targetMember.roles.add(mutedRole, `[Timeout] ${reason}`);
-        } catch (err) {
-          logger.warn(`[Timeout] Failed to add muted role: ${err.message}`);
-        }
-      }
-    }
-
-    // Create mod log
-    const caseNumber = await ModLog.getNextCaseNumber(message.guild.id);
-
-    const logData = {
-      caseNumber,
-      targetTag: targetMember.user.tag,
-      targetId: targetMember.user.id,
-      moderatorTag: message.author.tag,
-      reason,
-      duration: formatDuration(durationMs)
-    };
-
-    // Save to database
-    await ModLog.create({
-      guildId: message.guild.id,
-      caseNumber,
-      action: 'timeout',
-      moderatorId: message.author.id,
-      moderatorTag: message.author.tag,
-      targetId: targetMember.user.id,
-      targetTag: targetMember.user.tag,
-      reason,
-      duration: durationMs / 1000
-    });
-
-    // Send to mod log channel
-    if (guildConfig.channels.modLog) {
-      const modLogChannel = message.guild.channels.cache.get(guildConfig.channels.modLog);
-      if (modLogChannel) {
-        const logEmbed = await modLogEmbed(message.guild.id, 'timeout', logData);
-        await modLogChannel.send({ embeds: [logEmbed] });
-      }
-    }
-
-    // DM the user
     try {
-      const dmEmbed = await errorEmbed(message.guild.id, `Communication Restricted — ${message.guild.name}`,
-        `**Caution:** Your communication privileges have been suspended.\n\n` +
-        `**Duration:** ${formatDuration(durationMs)}\n` +
-        `**Reason:** ${reason}\n` +
-        `**Authority:** ${message.author.tag}\n\n` +
-        `Communication will resume <t:${Math.floor((Date.now() + durationMs) / 1000)}:R>`
-      );
-      await targetMember.send({ embeds: [dmEmbed] });
-    } catch (error) {
-      // User has DMs disabled
-    }
+      const prefix = await getPrefix(guildId);
+      const durationHelp =
+        `**Duration Parameters:**\n` +
+        `${GLYPHS.INFO} \`5m\` — 5 minutes\n` +
+        `${GLYPHS.INFO} \`1h\` — 1 hour\n` +
+        `${GLYPHS.INFO} \`1d12h\` — 1 day 12 hours\n` +
+        `${GLYPHS.INFO} \`1w\` — 1 week (maximum 28 days)\n` +
+        `${GLYPHS.INFO} \`off\` — Remove an active timeout`;
 
-    const embed = await successEmbed(message.guild.id, 'Restriction Applied',
-      `**Confirmed:** Communication restriction applied to **${targetMember.user.tag}**, Master.\n\n` +
-      `**Duration:** ${formatDuration(durationMs)}\n` +
-      `**Reason:** ${reason}\n` +
-      `**Case:** #${caseNumber}\n` +
-      `**Expires:** <t:${Math.floor((Date.now() + durationMs) / 1000)}:R>`
-    );
-    message.reply({ embeds: [embed] });
+      const userId = args[0]?.replace(/[<@!>]/g, '');
+      if (!userId || !USER_ID.test(userId)) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Invalid Usage',
+            `${GLYPHS.ARROW_RIGHT} Usage: \`${prefix}timeout <@user|user_id> <duration|off> [reason]\`\n\n${durationHelp}`)]
+        });
+      }
+
+      if (userId === message.author.id) {
+        return message.reply({ embeds: [await errorEmbed(guildId, 'Permission Denied', 'You cannot time yourself out, Master.')] });
+      }
+      if (userId === message.client.user.id) {
+        return message.reply({ embeds: [await errorEmbed(guildId, 'Invalid Usage', 'I cannot time myself out, Master.')] });
+      }
+      if (userId === message.guild.ownerId) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Permission Denied', 'The server owner is immune to moderation actions, Master.')]
+        });
+      }
+
+      const targetMember = await fetchMember(message.guild, userId);
+      if (!targetMember) {
+        return message.reply({ embeds: [await errorEmbed(guildId, 'User Not Found', 'That user is not a member of this server, Master.')] });
+      }
+
+      if (!targetMember.moderatable) {
+        return message.reply({ embeds: [await errorEmbed(guildId, 'Cannot Timeout', botLimitReason(targetMember))] });
+      }
+      if (!outranks(message.member, targetMember)) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Permission Denied',
+            'Their highest role is equal to or above yours, so you cannot moderate them, Master.')]
+        });
+      }
+
+      const durationArg = args[1]?.toLowerCase();
+
+      if (REMOVE_KEYWORDS.includes(durationArg)) {
+        return await removeTimeout(message, targetMember, args.slice(2));
+      }
+
+      if (!durationArg) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Invalid Usage', `**Notice:** A duration is required, Master.\n\n${durationHelp}`)]
+        });
+      }
+
+      let durationMs = parseDuration(durationArg);
+      if (!durationMs) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Invalid Usage', `**Warning:** \`${truncate(durationArg.replace(/`/g, ''), 50)}\` is not a valid duration, Master.\n\n${durationHelp}`)]
+        });
+      }
+      if (durationMs > DISCORD_MAX_TIMEOUT_MS) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Invalid Usage', 'The maximum timeout duration is 28 days, Master.')]
+        });
+      }
+      durationMs = Math.min(durationMs, MAX_TIMEOUT_MS);
+
+      const reason = truncate(args.slice(2).join(' ').trim() || 'No reason provided', EMBED_REASON_LIMIT);
+      const targetUser = targetMember.user;
+      const duration = formatDuration(durationMs);
+      const expiresAt = Date.now() + durationMs;
+      const guildConfig = await Guild.getGuild(guildId);
+
+      // Notify right before acting; withdrawn below if the timeout is rejected
+      let notice = null;
+      try {
+        const dmEmbed = await errorEmbed(guildId, 'Timeout Notice',
+          `**Caution:** You have been timed out in **${message.guild.name}**.\n\n` +
+          `${GLYPHS.ARROW_RIGHT} **Duration:** ${duration}\n` +
+          `${GLYPHS.ARROW_RIGHT} **Reason:** ${reason}\n` +
+          `${GLYPHS.ARROW_RIGHT} **Moderator:** ${message.author.tag}\n\n` +
+          `Communication resumes <t:${Math.floor(expiresAt / 1000)}:R>.`
+        );
+        notice = await targetMember.send({ embeds: [dmEmbed] });
+      } catch {
+        // DMs closed
+      }
+
+      try {
+        await targetMember.timeout(durationMs, truncate(reason, AUDIT_REASON_LIMIT));
+      } catch (error) {
+        await notice?.delete().catch(() => {});
+        logger.error(`[Timeout] Discord rejected the timeout of ${userId} in ${guildId}`, error);
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Timeout Failed', error.code === MISSING_PERMISSIONS
+            ? 'Discord denied me permission to time out this member, Master.'
+            : 'Discord rejected the timeout request, Master. The incident has been logged.')]
+        });
+      }
+
+      // Apply muted role if configured
+      const mutedRole = guildConfig?.roles?.mutedRole ? message.guild.roles.cache.get(guildConfig.roles.mutedRole) : null;
+      if (mutedRole && targetMember.manageable) {
+        await targetMember.roles.add(mutedRole, truncate(`[Timeout] ${reason}`, AUDIT_REASON_LIMIT))
+          .catch(err => logger.warn(`[Timeout] Failed to add muted role: ${err.message}`));
+      }
+
+      const caseNumber = await recordCase(message, targetUser, {
+        action: 'timeout',
+        reason,
+        duration,
+        mute: {
+          moderatorId: message.author.id,
+          reason,
+          duration: durationMs / 1000,
+          timestamp: new Date(),
+          expiresAt: new Date(expiresAt)
+        }
+      });
+
+      await postModLog(message, guildConfig, 'timeout', {
+        caseNumber: caseNumber ?? '—',
+        targetTag: targetUser.tag,
+        targetId: targetUser.id,
+        moderatorTag: message.author.tag,
+        reason,
+        duration
+      });
+
+      const embed = await successEmbed(guildId, 'Restriction Applied',
+        `**Confirmed:** Communication restriction applied to **${targetUser.tag}**, Master.\n\n` +
+        `${GLYPHS.ARROW_RIGHT} **Duration:** ${duration}\n` +
+        `${GLYPHS.ARROW_RIGHT} **Reason:** ${reason}\n` +
+        `${GLYPHS.ARROW_RIGHT} **Expires:** <t:${Math.floor(expiresAt / 1000)}:R>\n` +
+        (caseNumber
+          ? `${GLYPHS.ARROW_RIGHT} **Case Reference:** #${caseNumber}`
+          : `${GLYPHS.ERROR} The case record could not be saved. The incident has been logged.`)
+      );
+      return message.reply({ embeds: [embed] });
+    } catch (error) {
+      logger.error('[Timeout] Command failed', error);
+      const embed = await errorEmbed(guildId, 'Timeout Failed',
+        'An anomaly interrupted the timeout protocol, Master. The incident has been logged.').catch(() => null);
+      return message.reply(embed ? { embeds: [embed] } : { content: '**Alert:** The timeout protocol failed, Master.' }).catch(() => null);
+    }
   }
 };
 
-function parseDuration(str) {
-  const match = str.match(/^(\d+)(s|m|h|d|w)$/i);
-  if (!match) return null;
+// `timeout @user off [reason]`: same result and records as the untimeout command
+async function removeTimeout(message, targetMember, reasonArgs) {
+  const guildId = message.guild.id;
+  const targetUser = targetMember.user;
 
-  const [, num, unit] = match;
-  const multipliers = {
-    s: 1000,
-    m: 60 * 1000,
-    h: 60 * 60 * 1000,
-    d: 24 * 60 * 60 * 1000,
-    w: 7 * 24 * 60 * 60 * 1000
-  };
+  if (!targetMember.isCommunicationDisabled()) {
+    return message.reply({
+      embeds: [await errorEmbed(guildId, 'No Active Timeout', `**Notice:** **${targetUser.tag}** is not currently timed out, Master.`)]
+    });
+  }
 
-  return parseInt(num) * multipliers[unit.toLowerCase()];
+  const reason = truncate(reasonArgs.join(' ').trim() || 'No reason provided', EMBED_REASON_LIMIT);
+  const auditReason = truncate(`${reason} | Removed by ${message.author.tag}`, AUDIT_REASON_LIMIT);
+  const guildConfig = await Guild.getGuild(guildId);
+
+  try {
+    await targetMember.timeout(null, auditReason);
+  } catch (error) {
+    logger.error(`[Timeout] Discord rejected the timeout removal for ${targetUser.id} in ${guildId}`, error);
+    return message.reply({
+      embeds: [await errorEmbed(guildId, 'Timeout Removal Failed', 'Discord rejected the request, Master. The incident has been logged.')]
+    });
+  }
+
+  const mutedRole = guildConfig?.roles?.mutedRole ? message.guild.roles.cache.get(guildConfig.roles.mutedRole) : null;
+  if (mutedRole && targetMember.roles.cache.has(mutedRole.id)) {
+    await targetMember.roles.remove(mutedRole, auditReason)
+      .catch(err => logger.warn(`[Timeout] Failed to remove muted role: ${err.message}`));
+  }
+
+  const caseNumber = await recordCase(message, targetUser, { action: 'untimeout', reason });
+
+  await postModLog(message, guildConfig, 'untimeout', {
+    caseNumber: caseNumber ?? '—',
+    targetTag: targetUser.tag,
+    targetId: targetUser.id,
+    moderatorTag: message.author.tag,
+    reason
+  });
+
+  try {
+    const dmEmbed = await successEmbed(guildId, 'Timeout Lifted',
+      `**Notice:** Your timeout in **${message.guild.name}** has been removed.\n\n` +
+      `${GLYPHS.ARROW_RIGHT} **Reason:** ${reason}\n` +
+      `${GLYPHS.ARROW_RIGHT} **Moderator:** ${message.author.tag}`
+    );
+    await targetMember.send({ embeds: [dmEmbed] });
+  } catch {
+    // DMs closed
+  }
+
+  const embed = await successEmbed(guildId, 'Restriction Lifted',
+    `**Confirmed:** Communication restriction removed from **${targetUser.tag}**, Master.\n\n` +
+    `${GLYPHS.ARROW_RIGHT} **Reason:** ${reason}\n` +
+    (caseNumber
+      ? `${GLYPHS.ARROW_RIGHT} **Case Reference:** #${caseNumber}`
+      : `${GLYPHS.ERROR} The case record could not be saved. The incident has been logged.`)
+  );
+  return message.reply({ embeds: [embed] });
 }
 
-function formatDuration(ms) {
-  const seconds = Math.floor(ms / 1000);
-  const minutes = Math.floor(seconds / 60);
-  const hours = Math.floor(minutes / 60);
-  const days = Math.floor(hours / 24);
-  const weeks = Math.floor(days / 7);
+// The member, or null when they are not in the server; other lookup failures are rethrown
+async function fetchMember(guild, userId) {
+  try {
+    return await guild.members.fetch({ user: userId, force: true });
+  } catch (error) {
+    if (error.code === UNKNOWN_MEMBER || error.code === UNKNOWN_USER) return null;
+    throw error;
+  }
+}
 
-  if (weeks > 0) return `${weeks} week${weeks !== 1 ? 's' : ''}`;
-  if (days > 0) return `${days} day${days !== 1 ? 's' : ''}`;
-  if (hours > 0) return `${hours} hour${hours !== 1 ? 's' : ''}`;
-  if (minutes > 0) return `${minutes} minute${minutes !== 1 ? 's' : ''}`;
-  return `${seconds} second${seconds !== 1 ? 's' : ''}`;
+// Server owner and Administrators may act on anyone; others only below their own top role
+function outranks(moderator, target) {
+  if (moderator.id === moderator.guild.ownerId) return true;
+  if (moderator.permissions.has(PermissionFlagsBits.Administrator)) return true;
+  return target.roles.highest.position < moderator.roles.highest.position;
+}
+
+// Why `moderatable` is false: Discord exempts Administrators from timeouts entirely
+function botLimitReason(target) {
+  if (target.permissions.has(PermissionFlagsBits.Administrator)) {
+    return 'Members with the Administrator permission cannot be timed out, Master. Discord exempts them from timeouts.';
+  }
+  const me = target.guild.members.me;
+  return target.roles.highest.position >= me.roles.highest.position
+    ? 'Their highest role is equal to or above mine, so I cannot moderate them, Master. Move my role above theirs in Server Settings › Roles.'
+    : 'Discord does not permit me to moderate this member, Master.';
+}
+
+// Case and member records, written only after the action succeeded. Returns the case number,
+// or null if it could not be saved (the action itself stands either way).
+async function recordCase(message, user, { action, reason, duration, mute }) {
+  const guildId = message.guild.id;
+  let caseNumber = null;
+
+  try {
+    const nextCase = await ModLog.getNextCaseNumber(guildId);
+    await ModLog.create({
+      guildId,
+      caseNumber: nextCase,
+      action,
+      moderatorId: message.author.id,
+      moderatorTag: message.author.tag,
+      targetId: user.id,
+      targetTag: user.tag,
+      reason,
+      duration
+    });
+    caseNumber = nextCase;
+  } catch (error) {
+    logger.error(`[Timeout] Failed to save the ${action} case for ${user.id} in ${guildId}`, error);
+  }
+
+  if (mute) {
+    try {
+      await Member.updateOne(
+        { userId: user.id, guildId },
+        {
+          $push: { mutes: mute },
+          $setOnInsert: {
+            username: user.username,
+            discriminator: user.discriminator || '0',
+            accountCreatedAt: user.createdAt
+          }
+        },
+        { upsert: true }
+      );
+    } catch (error) {
+      logger.error(`[Timeout] Failed to update the member record for ${user.id} in ${guildId}`, error);
+    }
+  }
+
+  return caseNumber;
+}
+
+async function postModLog(message, guildConfig, action, logData) {
+  try {
+    const channelId = guildConfig?.channels?.modLog;
+    const channel = channelId ? message.guild.channels.cache.get(channelId) : null;
+    if (!channel) return;
+    const embed = await modLogEmbed(message.guild.id, action, logData);
+    if (action === 'untimeout') embed.setColor(COLORS.RAPHAEL_SUCCESS);
+    await channel.send({ embeds: [embed] });
+  } catch (error) {
+    logger.warn(`[Timeout] Failed to post to the mod log in ${message.guild.id}: ${error.message}`);
+  }
+}
+
+// "30m", "1d", "1d12h": one or more number+unit pairs (s, m, h, d, w)
+function parseDuration(input) {
+  if (!/^(\d+[smhdw])+$/.test(input)) return null;
+  let total = 0;
+  for (const [, value, unit] of input.matchAll(/(\d+)([smhdw])/g)) {
+    total += Number(value) * UNIT_MS[unit];
+  }
+  return total > 0 ? total : null;
+}
+
+// Compound form: "1 week 3 days", "1 day 12 hours"
+function formatDuration(ms) {
+  let remaining = Math.round(ms / 1000) * 1000;
+  const parts = [];
+  for (const [name, size] of UNIT_NAMES) {
+    const count = Math.floor(remaining / size);
+    if (count > 0) {
+      parts.push(`${count} ${name}${count === 1 ? '' : 's'}`);
+      remaining -= count * size;
+    }
+  }
+  return parts.join(' ') || '0 seconds';
 }

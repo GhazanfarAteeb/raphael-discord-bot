@@ -1,7 +1,19 @@
 import { EmbedBuilder, PermissionFlagsBits } from 'discord.js';
 import Member from '../../models/Member.js';
-import { errorEmbed } from '../../utils/embeds.js';
-import { getPrefix } from '../../utils/helpers.js';
+import { errorEmbed, COLORS, GLYPHS } from '../../utils/embeds.js';
+import { escapeMarkdown, truncate } from '../../utils/helpers.js';
+import { getRandomFooter } from '../../utils/raphael.js';
+import logger from '../../utils/logger.js';
+
+const USER_ID = /^\d{17,20}$/;
+const FIELD_LIMIT = 1024;
+const RECENT_NAMES = 5;
+const RECENT_JOINS = 3;
+const RECENT_NOTES = 3;
+const NOTE_PREVIEW = 200;
+
+const unix = (date) => Math.floor(new Date(date).getTime() / 1000);
+const safeName = (name) => escapeMarkdown(String(name));
 
 export default {
   name: 'userhistory',
@@ -16,125 +28,143 @@ export default {
   execute: async (message, args) => {
     const guildId = message.guild.id;
 
-    // Get target user
-    const targetUser = message.mentions.users.first() ||
-      await message.client.users.fetch(args[0]).catch(() => null) ||
-      message.author;
-
-    const memberData = await Member.findOne({ userId: targetUser.id, guildId });
-
-    if (!memberData) {
-      return message.reply({
-        embeds: [await errorEmbed(guildId, 'No tracking data found for this user.')]
-      });
-    }
-
-    const embed = new EmbedBuilder()
-      .setColor('#5865F2')
-      .setTitle(`📊 User History: ${targetUser.tag}`)
-      .setThumbnail(targetUser.displayAvatarURL({ dynamic: true, size: 256 }))
-      .setTimestamp();
-
-    // Current Identity
-    let identityText = `**Current Username:** ${memberData.username}`;
-    if (memberData.discriminator && memberData.discriminator !== '0') {
-      identityText += `#${memberData.discriminator}`;
-    }
-    if (memberData.displayName && memberData.displayName !== memberData.username) {
-      identityText += `\n**Display Name:** ${memberData.displayName}`;
-    }
-    if (memberData.globalName) {
-      identityText += `\n**Global Name:** ${memberData.globalName}`;
-    }
-    identityText += `\n**User ID:** ${targetUser.id}`;
-    identityText += `\n**Account Created:** <t:${Math.floor(targetUser.createdTimestamp / 1000)}:R>`;
-
-    embed.addFields({ name: '👤 Identity', value: identityText, inline: false });
-
-    // Username History
-    if (memberData.usernameHistory && memberData.usernameHistory.length > 0) {
-      const historyText = memberData.usernameHistory
-        .slice(-5) // Last 5 changes
-        .reverse()
-        .map(h => {
-          const name = h.discriminator && h.discriminator !== '0'
-            ? `${h.username}#${h.discriminator}`
-            : h.username;
-          const display = h.displayName && h.displayName !== h.username
-            ? ` (${h.displayName})`
-            : '';
-          return `\`${name}${display}\` - <t:${Math.floor(h.changedAt.getTime() / 1000)}:R>`;
-        })
-        .join('\n') || 'No username changes recorded';
-
-      embed.addFields({
-        name: `📝 Username History (Last 5 of ${memberData.usernameHistory.length})`,
-        value: historyText,
-        inline: false
-      });
-    }
-
-    // Join/Leave Stats
-    const joinLeaveText = `**Joins:** ${memberData.joinCount}\n` +
-      `**Leaves:** ${memberData.leaveCount}\n` +
-      `**Sus Level:** ${memberData.susLevel}\n` +
-      `**Status:** ${memberData.isSuspicious ? '⚠️ Suspicious' : '✅ Normal'}`;
-
-    embed.addFields({ name: '📊 Join/Leave Stats', value: joinLeaveText, inline: true });
-
-    // Moderation History
-    const modText = `**Warnings:** ${memberData.warnings?.length || 0}\n` +
-      `**Kicks:** ${memberData.kicks?.length || 0}\n` +
-      `**Bans:** ${memberData.bans?.length || 0}\n` +
-      `**Mutes:** ${memberData.mutes?.length || 0}`;
-
-    embed.addFields({ name: '🔨 Moderation', value: modText, inline: true });
-
-    // Recent Joins (Last 3)
-    if (memberData.joinHistory && memberData.joinHistory.length > 0) {
-      const recentJoins = memberData.joinHistory
-        .slice(-3)
-        .reverse()
-        .map(j => {
-          let text = `<t:${Math.floor(j.timestamp.getTime() / 1000)}:F>`;
-          if (j.inviteCode) text += `\nInvite: \`${j.inviteCode}\``;
-          if (j.inviter) text += ` by <@${j.inviter}>`;
-          return text;
-        })
-        .join('\n\n');
-
-      embed.addFields({
-        name: `📥 Recent Joins (Last 3 of ${memberData.joinHistory.length})`,
-        value: recentJoins,
-        inline: false
-      });
-    }
-
-    // Flags
-    if (memberData.flags) {
-      const flagText = [];
-      if (memberData.flags.radarOn) flagText.push('📡 On Radar');
-      if (memberData.flags.verified) flagText.push('✅ Verified');
-      if (memberData.flags.autoModBypass) flagText.push('🔓 AutoMod Bypass');
-      if (memberData.isNewAccount) flagText.push('🥚 New Account');
-
-      if (flagText.length > 0) {
-        embed.addFields({ name: '🏷️ Flags', value: flagText.join('\n'), inline: false });
+    try {
+      const targetUser = await resolveUser(message, args[0]);
+      if (!targetUser) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'User Not Found', 'No Discord user matches that mention or ID, Master.')]
+        });
       }
+
+      const memberData = await Member.findOne({ userId: targetUser.id, guildId }).lean();
+      if (!memberData) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'No Records', `I hold no tracking data for **${safeName(targetUser.tag)}**, Master.`)]
+        });
+      }
+
+      const embed = new EmbedBuilder()
+        .setColor(COLORS.RAPHAEL)
+        .setTitle('『 User History 』')
+        .setDescription(
+          `**Analysis:** Tracking record for ${targetUser} (**${safeName(targetUser.tag)}**), Master.` +
+          (memberData.createdAt ? `\nRecords kept since <t:${unix(memberData.createdAt)}:D>.` : '')
+        )
+        .setThumbnail(targetUser.displayAvatarURL({ size: 256 }))
+        .setFooter({ text: getRandomFooter() })
+        .setTimestamp();
+
+      // Identity
+      const username = memberData.username || targetUser.username;
+      const identity = [
+        `${GLYPHS.DOT} **Username:** ${safeName(username)}` +
+          (memberData.discriminator && memberData.discriminator !== '0' ? `#${memberData.discriminator}` : '')
+      ];
+      if (memberData.displayName && memberData.displayName !== username) {
+        identity.push(`${GLYPHS.DOT} **Display Name:** ${safeName(memberData.displayName)}`);
+      }
+      if (memberData.globalName && memberData.globalName !== memberData.displayName) {
+        identity.push(`${GLYPHS.DOT} **Global Name:** ${safeName(memberData.globalName)}`);
+      }
+      identity.push(`${GLYPHS.DOT} **User ID:** \`${targetUser.id}\``);
+      identity.push(`${GLYPHS.DOT} **Account Created:** <t:${unix(targetUser.createdTimestamp)}:D>`);
+      embed.addFields({ name: `${GLYPHS.ARROW_RIGHT} Identity`, value: truncate(identity.join('\n'), FIELD_LIMIT) });
+
+      // Username history
+      const nameHistory = memberData.usernameHistory || [];
+      if (nameHistory.length > 0) {
+        const lines = nameHistory.slice(-RECENT_NAMES).reverse().map(entry => {
+          const name = entry.discriminator && entry.discriminator !== '0'
+            ? `${entry.username}#${entry.discriminator}`
+            : entry.username;
+          const display = entry.displayName && entry.displayName !== entry.username ? ` (${entry.displayName})` : '';
+          const changed = entry.changedAt ? ` — <t:${unix(entry.changedAt)}:D>` : '';
+          return `${GLYPHS.DOT} ${safeName(`${name}${display}`)}${changed}`;
+        });
+        embed.addFields({
+          name: `${GLYPHS.ARROW_RIGHT} Username History (last ${Math.min(RECENT_NAMES, nameHistory.length)} of ${nameHistory.length})`,
+          value: truncate(lines.join('\n'), FIELD_LIMIT)
+        });
+      }
+
+      // Join/leave and moderation counts
+      embed.addFields(
+        {
+          name: `${GLYPHS.ARROW_RIGHT} Join Activity`,
+          value:
+            `${GLYPHS.DOT} **Joins:** ${memberData.joinCount ?? 0}\n` +
+            `${GLYPHS.DOT} **Leaves:** ${memberData.leaveCount ?? 0}\n` +
+            `${GLYPHS.DOT} **Sus Level:** ${memberData.susLevel ?? 0}/10\n` +
+            `${GLYPHS.DOT} **Status:** ${memberData.isSuspicious ? `${GLYPHS.ERROR} Suspicious` : 'Normal'}`,
+          inline: true
+        },
+        {
+          name: `${GLYPHS.ARROW_RIGHT} Moderation`,
+          value:
+            `${GLYPHS.DOT} **Warnings:** ${memberData.warnings?.length || 0}\n` +
+            `${GLYPHS.DOT} **Timeouts:** ${memberData.mutes?.length || 0}\n` +
+            `${GLYPHS.DOT} **Kicks:** ${memberData.kicks?.length || 0}\n` +
+            `${GLYPHS.DOT} **Bans:** ${memberData.bans?.length || 0}`,
+          inline: true
+        }
+      );
+
+      // Recent joins
+      const joinHistory = memberData.joinHistory || [];
+      if (joinHistory.length > 0) {
+        const lines = joinHistory.slice(-RECENT_JOINS).reverse().map(join => {
+          let line = `${GLYPHS.DOT} <t:${unix(join.timestamp)}:D>`;
+          if (join.inviteCode) line += ` via \`${join.inviteCode}\``;
+          if (join.inviter) line += ` (invited by <@${join.inviter}>)`;
+          return line;
+        });
+        embed.addFields({
+          name: `${GLYPHS.ARROW_RIGHT} Recent Joins (last ${Math.min(RECENT_JOINS, joinHistory.length)} of ${joinHistory.length})`,
+          value: truncate(lines.join('\n'), FIELD_LIMIT)
+        });
+      }
+
+      // Flags
+      const flags = [];
+      if (memberData.flags?.radarOn) flags.push(`${GLYPHS.RADAR} On radar`);
+      if (memberData.flags?.verified) flags.push(`${GLYPHS.SUCCESS} Verified`);
+      if (memberData.flags?.autoModBypass) flags.push(`${GLYPHS.UNLOCK} AutoMod bypass`);
+      if (memberData.isNewAccount) flags.push(`${GLYPHS.EGG} New account`);
+      if (flags.length > 0) {
+        embed.addFields({ name: `${GLYPHS.ARROW_RIGHT} Flags`, value: flags.join('\n') });
+      }
+
+      // Staff notes (no separate notes command exists, so the latest are shown here)
+      const notes = memberData.notes || [];
+      if (notes.length > 0) {
+        const lines = notes.slice(-RECENT_NOTES).reverse().map(entry => {
+          const when = entry.timestamp ? ` — <t:${unix(entry.timestamp)}:D>` : '';
+          const author = entry.staffTag ? ` by ${safeName(entry.staffTag)}` : '';
+          return `${GLYPHS.DOT} ${truncate(safeName(entry.note || 'No content'), NOTE_PREVIEW)}${author}${when}`;
+        });
+        embed.addFields({
+          name: `${GLYPHS.ARROW_RIGHT} Staff Notes (last ${Math.min(RECENT_NOTES, notes.length)} of ${notes.length})`,
+          value: truncate(lines.join('\n'), FIELD_LIMIT)
+        });
+      }
+
+      return message.reply({ embeds: [embed] });
+    } catch (error) {
+      logger.error('[UserHistory] Command failed', error);
+      const embed = await errorEmbed(guildId, 'Lookup Failed',
+        'An anomaly interrupted the history lookup, Master. The incident has been logged.').catch(() => null);
+      return message.reply(embed ? { embeds: [embed] } : { content: '**Alert:** The history lookup failed, Master.' }).catch(() => null);
     }
-
-    // Staff Notes Count
-    if (memberData.notes && memberData.notes.length > 0) {
-      const prefix = await getPrefix(guildId);
-      embed.addFields({
-        name: '📋 Staff Notes',
-        value: `${memberData.notes.length} note(s) on file. Use \`${prefix}notes @user\` to view.`,
-        inline: false
-      });
-    }
-
-    embed.setFooter({ text: `Data tracked since ${memberData.createdAt.toLocaleDateString()}` });
-
-    return message.reply({ embeds: [embed] });
   }
 };
+
+// Mentioned user, a user ID, or the author when no target was given
+async function resolveUser(message, arg) {
+  const mentioned = message.mentions?.users?.first();
+  if (mentioned) return mentioned;
+  if (!arg) return message.author;
+
+  const userId = arg.replace(/[<@!>]/g, '');
+  if (!USER_ID.test(userId)) return null;
+  return message.client.users.fetch(userId).catch(() => null);
+}

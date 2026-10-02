@@ -1,11 +1,11 @@
-import { PermissionFlagsBits, EmbedBuilder } from 'discord.js';
+import { PermissionFlagsBits } from 'discord.js';
 import Economy from '../../models/Economy.js';
 import Level from '../../models/Level.js';
 import Guild from '../../models/Guild.js';
 import ModLog from '../../models/ModLog.js';
-import { successEmbed, errorEmbed, infoEmbed, GLYPHS, createEmbed } from '../../utils/embeds.js';
+import { successEmbed, errorEmbed, infoEmbed, warningEmbed, GLYPHS, createEmbed } from '../../utils/embeds.js';
 import { getPrefix, hasAdminPerms } from '../../utils/helpers.js';
-import { getRandomFooter } from '../../utils/raphael.js';
+import { sendLevelUpAnnouncement } from '../config/levelup.js';
 
 export default {
   name: 'award',
@@ -24,71 +24,73 @@ export default {
 
   async execute(message, args) {
     const guildId = message.guild.id;
-    const prefix = await getPrefix(guildId);
-    const guildConfig = await Guild.getGuild(guildId);
-
-    // Admin only: awarding mints currency and XP
-    if (!hasAdminPerms(message.member, guildConfig)) {
-      return message.reply({
-        embeds: [await errorEmbed(guildId, 'Permission Denied',
-          'Awards can only be issued by administrators, Master.')]
-      });
-    }
-
-    // No args - show help
-    if (!args[0]) {
-      return showHelp(message, prefix);
-    }
-
-    const type = args[0].toLowerCase();
-    const targetUser = message.mentions.users.first();
-    const amount = parseInt(args[2]);
-
-    // Validate type
-    if (!['xp', 'coins', 'coin', 'rep', 'reputation', 'money'].includes(type)) {
-      return showHelp(message, prefix);
-    }
-
-    // Validate user
-    if (!targetUser) {
-      return message.reply({
-        embeds: [await errorEmbed(guildId, 'Target Required',
-          `**Notice:** Please specify a subject, Master.\n\nSyntax: \`${prefix}award <type> @user <amount>\``)]
-      });
-    }
-    // Only the server owner may award themselves
-    if (targetUser.id === message.author.id && message.author.id !== message.guild.ownerId) {
-      return message.reply({
-        embeds: [await errorEmbed(guildId, 'Invalid Target', 'You cannot award yourself, Master.')]
-      });
-    }
-    // Check if target is a bot
-    if (targetUser.bot) {
-      return message.reply({
-        embeds: [await errorEmbed(guildId, 'Invalid Target',
-          '**Warning:** Automated systems cannot receive awards, Master.')]
-      });
-    }
-    // Validate amount
-    if (isNaN(amount) || amount === 0) {
-      return message.reply({
-        embeds: [await errorEmbed(guildId, 'Invalid Quantity',
-          `**Warning:** Please provide a valid quantity (positive to grant, negative to revoke), Master.\n\nSyntax: \`${prefix}award <type> @user <amount>\``)]
-      });
-    }
-
-    // Limit amount range
-    if (Math.abs(amount) > 10000000) {
-      return message.reply({
-        embeds: [await errorEmbed(guildId, 'Quantity Exceeded',
-          '**Warning:** Maximum quantity is 10,000,000 per transaction, Master.')]
-      });
-    }
-
-    const isAdding = amount > 0;
-    const absAmount = Math.abs(amount);
 
     try {
+      const prefix = await getPrefix(guildId);
+      const guildConfig = await Guild.getGuild(guildId);
+
+      // Admin only: awarding mints currency and XP
+      if (!hasAdminPerms(message.member, guildConfig)) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Permission Denied',
+            'Awards can only be issued by administrators, Master.')]
+        });
+      }
+
+      // No args - show help
+      if (!args[0]) {
+        return showHelp(message, prefix);
+      }
+
+      const type = args[0].toLowerCase();
+      const targetUser = message.mentions.users.first();
+      // Whole numbers only: parseInt would read "5abc" as 5
+      const amount = /^-?\d+$/.test(args[2] ?? '') ? Number(args[2]) : NaN;
+
+      // Validate type
+      if (!['xp', 'coins', 'coin', 'rep', 'reputation', 'money'].includes(type)) {
+        return showHelp(message, prefix);
+      }
+
+      // Validate user
+      if (!targetUser) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Target Required',
+            `**Notice:** Please specify a subject, Master.\n\nSyntax: \`${prefix}award <type> @user <amount>\``)]
+        });
+      }
+      // Only the server owner may award themselves
+      if (targetUser.id === message.author.id && message.author.id !== message.guild.ownerId) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Invalid Target', 'You cannot award yourself, Master.')]
+        });
+      }
+      // Check if target is a bot
+      if (targetUser.bot) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Invalid Target',
+            '**Warning:** Automated systems cannot receive awards, Master.')]
+        });
+      }
+      // Validate amount
+      if (isNaN(amount) || amount === 0) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Invalid Quantity',
+            `**Warning:** Please provide a valid quantity (positive to grant, negative to revoke), Master.\n\nSyntax: \`${prefix}award <type> @user <amount>\``)]
+        });
+      }
+
+      // Limit amount range
+      if (Math.abs(amount) > 10000000) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Quantity Exceeded',
+            '**Warning:** Maximum quantity is 10,000,000 per transaction, Master.')]
+        });
+      }
+
+      const isAdding = amount > 0;
+      const absAmount = Math.abs(amount);
+
       let result;
       switch (type) {
         case 'xp':
@@ -108,8 +110,8 @@ export default {
       const actionWord = isAdding ? 'Granted' : 'Revoked';
       const embed = await successEmbed(guildId,
         `${result.typeName} ${actionWord}`,
-        `**Confirmed:** Successfully ${isAdding ? 'granted' : 'revoked'} **${absAmount.toLocaleString()}** ${result.emoji} ${result.typeName.toLowerCase()} ${isAdding ? 'to' : 'from'} ${targetUser}, Master.\n\n` +
-        `**${targetUser.username}'s New ${result.typeName}:** ${result.newValue.toLocaleString()} ${result.emoji}` +
+        `**Confirmed:** Successfully ${isAdding ? 'granted' : 'revoked'} **${absAmount.toLocaleString()}** ${result.unit} ${isAdding ? 'to' : 'from'} ${targetUser}, Master.\n\n` +
+        `**${targetUser.username}'s New ${result.typeName}:** ${result.newValue.toLocaleString()}` +
         (result.levelInfo ? `\n${result.levelInfo}` : '')
       );
 
@@ -127,30 +129,27 @@ export default {
         moderator: message.author,
         amount,
         newValue: result.newValue,
-        emoji: result.emoji,
+        unit: result.unit,
         typeName: result.typeName
       });
 
       // Try to DM the user
       try {
-        const dmEmbed = new EmbedBuilder()
-          .setColor(isAdding ? '#00FF00' : '#FF6B6B')
-          .setTitle(`${result.emoji} ${result.typeName} ${actionWord}`)
-          .setDescription(
-            `An administrator in **${message.guild.name}** has ${isAdding ? 'given you' : 'removed'} **${absAmount.toLocaleString()}** ${result.emoji} ${result.typeName.toLowerCase()}.\n\n` +
-            `**Your new ${result.typeName.toLowerCase()}:** ${result.newValue.toLocaleString()} ${result.emoji}`
-          )
-          .setTimestamp();
+        const dmDescription =
+          `**Notice:** An administrator in **${message.guild.name}** has ${isAdding ? 'granted you' : 'removed'} **${absAmount.toLocaleString()}** ${result.unit}.\n\n` +
+          `${GLYPHS.ARROW_RIGHT} **New ${result.typeName} Total:** ${result.newValue.toLocaleString()}`;
+        const dmEmbed = isAdding
+          ? await successEmbed(guildId, `${result.typeName} ${actionWord}`, dmDescription)
+          : await warningEmbed(guildId, `${result.typeName} ${actionWord}`, dmDescription);
         await targetUser.send({ embeds: [dmEmbed] });
       } catch {
         // User has DMs disabled
       }
-
     } catch (error) {
       console.error('Error in award command:', error);
-      return message.reply({
-        embeds: [await errorEmbed(guildId, 'Error', 'An error occurred while processing the award.')]
-      });
+      const embed = await errorEmbed(guildId, 'Award Failed',
+        'An anomaly occurred while processing the award, Master. The incident has been logged.').catch(() => null);
+      return message.reply(embed ? { embeds: [embed] } : { content: '**Alert:** The award could not be processed, Master.' }).catch(() => null);
     }
   }
 };
@@ -169,7 +168,7 @@ async function showHelp(message, prefix) {
     `${GLYPHS.DOT} \`${prefix}award xp @user 500\` - Add 500 XP\n` +
     `${GLYPHS.DOT} \`${prefix}award coins @user -100\` - Remove 100 coins\n` +
     `${GLYPHS.DOT} \`${prefix}award rep @user 5\` - Add 5 reputation\n\n` +
-    `**Note:** Use negative numbers to deduct!`
+    `**Note:** Use a negative quantity to deduct, Master.`
   );
   return message.reply({ embeds: [embed] });
 }
@@ -222,7 +221,7 @@ async function handleXP(user, guildId, amount, admin) {
   await levelData.save();
 
   return {
-    emoji: '✨',
+    unit: 'XP',
     typeName: 'XP',
     newValue: levelData.totalXP,
     levelInfo: `**Level:** ${levelData.level} • **Current XP:** ${levelData.xp}/${levelData.xpForNextLevel()}`,
@@ -231,23 +230,23 @@ async function handleXP(user, guildId, amount, admin) {
   };
 }
 
+// Applies `amount` to a numeric Economy field in one atomic update, so an award can't
+// overwrite a change made at the same moment (a game payout, a purchase). Deductions
+// floor at 0 via an update pipeline; grants are a plain $inc (plus any extra counters).
+async function applyAtomicChange(userId, guildId, field, amount, extraInc = {}) {
+  await Economy.getEconomy(userId, guildId); // ensure the record exists
+  const update = amount > 0
+    ? { $inc: { [field]: amount, ...extraInc } }
+    : [{ $set: { [field]: { $max: [0, { $add: [{ $ifNull: [`$${field}`, 0] }, amount] }] } } }];
+  return Economy.findOneAndUpdate({ userId, guildId }, update, { new: true });
+}
+
 async function handleCoins(user, guildId, amount, admin, guildConfig) {
-  const economy = await Economy.getEconomy(user.id, guildId);
-
-  if (amount < 0) {
-    const absAmount = Math.abs(amount);
-    economy.coins = Math.max(0, economy.coins - absAmount);
-  } else {
-    economy.coins += amount;
-    economy.stats.totalEarned = (economy.stats.totalEarned || 0) + amount;
-  }
-
-  await economy.save();
-
-  const coinEmoji = guildConfig.economy?.coinEmoji || '💰';
+  const economy = await applyAtomicChange(user.id, guildId, 'coins', amount,
+    amount > 0 ? { 'stats.totalEarned': amount } : {});
 
   return {
-    emoji: coinEmoji,
+    unit: guildConfig.economy?.coinName || 'coins',
     typeName: 'Coins',
     newValue: economy.coins,
     levelInfo: `**Wallet:** ${economy.coins.toLocaleString()}`
@@ -255,18 +254,10 @@ async function handleCoins(user, guildId, amount, admin, guildConfig) {
 }
 
 async function handleRep(user, guildId, amount, admin) {
-  const economy = await Economy.getEconomy(user.id, guildId);
-
-  if (amount < 0) {
-    economy.reputation = Math.max(0, economy.reputation - Math.abs(amount));
-  } else {
-    economy.reputation = (economy.reputation || 0) + amount;
-  }
-
-  await economy.save();
+  const economy = await applyAtomicChange(user.id, guildId, 'reputation', amount);
 
   return {
-    emoji: '⭐',
+    unit: 'reputation',
     typeName: 'Reputation',
     newValue: economy.reputation
   };
@@ -290,13 +281,13 @@ async function logAward(guild, guildConfig, data) {
 
     // Create the log embed
     const embed = await createEmbed(guild.id, isAdding ? 'success' : 'warning');
-    embed.setTitle(`${data.emoji} ${isAdding ? 'AWARD' : 'DEDUCT'} | Case #${caseNumber}`)
+    embed.setTitle(`${isAdding ? GLYPHS.STAR : GLYPHS.DIAMOND} ${isAdding ? 'AWARD' : 'DEDUCT'} | Case #${caseNumber}`)
       .setDescription(`**${data.typeName}** has been ${isAdding ? 'awarded to' : 'deducted from'} a member.`)
       .addFields(
         { name: `${GLYPHS.ARROW_RIGHT} User`, value: `${data.targetUser.tag}\n\`${data.targetUser.id}\``, inline: true },
         { name: `${GLYPHS.ARROW_RIGHT} Moderator`, value: `${data.moderator.tag}`, inline: true },
-        { name: `${GLYPHS.ARROW_RIGHT} Amount`, value: `${isAdding ? '+' : '-'}${absAmount.toLocaleString()} ${data.emoji}`, inline: true },
-        { name: `${GLYPHS.ARROW_RIGHT} New Total`, value: `${data.newValue.toLocaleString()} ${data.emoji}`, inline: true }
+        { name: `${GLYPHS.ARROW_RIGHT} Amount`, value: `${isAdding ? '+' : '-'}${absAmount.toLocaleString()} ${data.unit}`, inline: true },
+        { name: `${GLYPHS.ARROW_RIGHT} New Total`, value: `${data.newValue.toLocaleString()} ${data.unit}`, inline: true }
       )
       .setThumbnail(data.targetUser.displayAvatarURL({ dynamic: true }))
       .setTimestamp();
@@ -327,53 +318,11 @@ async function logAward(guild, guildConfig, data) {
   }
 }
 
-// Announce level up to the level up channel
+// Announce a level-up through the shared announcer, so awarded levels use the server's
+// level-up settings (channel, embed style, mention, placeholders) like earned ones
 async function announceLevelUp(guild, guildConfig, user, levelData, leveledUp) {
-  try {
-    const levelConfig = guildConfig.features?.levelSystem;
-
-    // Check if level up announcements are enabled
-    if (levelConfig?.announceLevelUp === false) return;
-
-    const newLevel = Math.max(...leveledUp);
-
-    // Get the level up channel
-    const channelId = levelConfig?.levelUpChannel || guildConfig.channels?.levelUpChannel;
-    if (!channelId) return;
-
-    const channel = guild.channels.cache.get(channelId);
-    if (!channel) return;
-
-    // Build level up message
-    let levelUpMessage = levelConfig?.levelUpMessage || '**Confirmed:** {user} has advanced to level {level}, Master.';
-    levelUpMessage = levelUpMessage
-      .replace(/{user}/g, `<@${user.id}>`)
-      .replace(/{username}/g, user.username)
-      .replace(/{level}/g, newLevel)
-      .replace(/{totalxp}/g, levelData.totalXP.toLocaleString())
-      .replace(/{server}/g, guild.name);
-
-    // Create embed
-    const embed = new EmbedBuilder()
-      .setColor(guildConfig.embedStyle?.color || '#00CED1')
-      .setTitle('『 Level Advancement 』')
-      .setDescription(levelUpMessage)
-      .setThumbnail(user.displayAvatarURL({ extension: 'png', size: 128 }))
-      .addFields(
-        { name: '▸ New Level', value: `**${newLevel}**`, inline: true },
-        { name: '▸ Total XP', value: levelData.totalXP.toLocaleString(), inline: true }
-      )
-      .setFooter({ text: 'Awarded by admin' })
-      .setTimestamp();
-
-    await channel.send({
-      content: `<@${user.id}>`,
-      embeds: [embed]
-    });
-
-  } catch (error) {
-    console.error('Error announcing level up:', error);
-  }
+  const member = await guild.members.fetch(user.id).catch(() => null);
+  await sendLevelUpAnnouncement({ guild, member: member ?? user, guildConfig, levelData, levelsGained: leveledUp });
 }
 
 // Export logAward for use in slash command handler

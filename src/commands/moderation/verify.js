@@ -1,314 +1,397 @@
-import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionFlagsBits } from 'discord.js';
+import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, MessageFlags, PermissionFlagsBits } from 'discord.js';
 import Guild from '../../models/Guild.js';
 import Verification from '../../models/Verification.js';
+import { successEmbed, errorEmbed, infoEmbed, COLORS, GLYPHS } from '../../utils/embeds.js';
 import { getPrefix, getAssignableRoleError } from '../../utils/helpers.js';
+import { getRandomFooter } from '../../utils/raphael.js';
 import { logManualVerification } from '../../events/client/verificationHandler.js';
+import logger from '../../utils/logger.js';
+
+// Wizard buttons must not start with "verify_": verificationHandler claims every such
+// customId as a member pressing the verification panel
+const SETUP_PREFIX = 'vsetup_';
+const STEP_TIMEOUT_MS = 60000;
+const VERIFICATION_TYPES = [
+  { type: 'button', label: 'Button', style: ButtonStyle.Primary, summary: 'Members press a button to verify' },
+  { type: 'captcha', label: 'Captcha', style: ButtonStyle.Success, summary: 'Members solve a captcha code' },
+  { type: 'reaction', label: 'Reaction', style: ButtonStyle.Secondary, summary: 'Members react to verify' }
+];
+const TYPE_NAMES = VERIFICATION_TYPES.map(t => t.type);
+const PANEL_PERMISSIONS = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks];
 
 export default {
   name: 'verify',
   description: 'Setup or manage the verification system',
-  usage: '<setup|panel|config|manual> [options]',
+  usage: '<setup|panel|config|manual|status> [options]',
   aliases: ['verification'],
   category: 'moderation',
   permissions: [PermissionFlagsBits.ManageGuild],
   cooldown: 5,
 
-  async execute(message, args, client) {
+  async execute(message, args) {
     const guildId = message.guild.id;
-    const prefix = await getPrefix(guildId);
 
-    const subCommand = args[0]?.toLowerCase();
+    try {
+      const prefix = await getPrefix(guildId);
+      const subCommand = args[0]?.toLowerCase();
 
-    if (!subCommand) {
-      const embed = new EmbedBuilder()
-        .setColor('#5865F2')
-        .setTitle('🔐 Verification System')
-        .setDescription('Protect your server with user verification!')
-        .addFields(
-          { name: `${prefix}verify setup`, value: 'Interactive setup wizard', inline: true },
-          { name: `${prefix}verify panel`, value: 'Send verification panel', inline: true },
-          { name: `${prefix}verify config <option>`, value: 'Configure settings', inline: true },
-          { name: `${prefix}verify manual @user`, value: 'Manually verify a user', inline: true },
-          { name: `${prefix}verify status`, value: 'View current settings', inline: true }
+      if (!subCommand) {
+        const embed = await infoEmbed(guildId, 'Verification System',
+          'Verification restricts server access until new members confirm they are human, Master.');
+        embed.addFields(
+          { name: `${GLYPHS.ARROW_RIGHT} ${prefix}verify setup`, value: 'Guided setup wizard', inline: true },
+          { name: `${GLYPHS.ARROW_RIGHT} ${prefix}verify panel [#channel]`, value: 'Deploy the verification panel', inline: true },
+          { name: `${GLYPHS.ARROW_RIGHT} ${prefix}verify config <option>`, value: 'Adjust individual settings', inline: true },
+          { name: `${GLYPHS.ARROW_RIGHT} ${prefix}verify manual @user`, value: 'Verify a member manually', inline: true },
+          { name: `${GLYPHS.ARROW_RIGHT} ${prefix}verify status`, value: 'View the current configuration', inline: true }
         );
-
-      return message.reply({ embeds: [embed] });
-    }
-
-    const guildConfig = await Guild.getGuild(guildId);
-
-    switch (subCommand) {
-      case 'setup': {
-        // Interactive setup
-        const embed = new EmbedBuilder()
-          .setColor('#5865F2')
-          .setTitle('🔐 Verification Setup')
-          .setDescription('Let\'s set up verification for your server!\n\nFirst, what type of verification would you like?')
-          .addFields(
-            { name: '🔘 Button', value: 'Users click a button to verify', inline: true },
-            { name: '🎭 Captcha', value: 'Users solve a captcha code', inline: true },
-            { name: '⚛️ Reaction', value: 'Users react to verify', inline: true }
-          );
-
-        const row = new ActionRowBuilder()
-          .addComponents(
-            new ButtonBuilder()
-              .setCustomId('verify_setup_button')
-              .setLabel('Button')
-              .setStyle(ButtonStyle.Primary),
-            new ButtonBuilder()
-              .setCustomId('verify_setup_captcha')
-              .setLabel('Captcha')
-              .setStyle(ButtonStyle.Success),
-            new ButtonBuilder()
-              .setCustomId('verify_setup_reaction')
-              .setLabel('Reaction')
-              .setStyle(ButtonStyle.Secondary)
-          );
-
-        const setupMsg = await message.reply({ embeds: [embed], components: [row] });
-
-        const filter = i => i.user.id === message.author.id && i.customId.startsWith('verify_setup_');
-        const collector = setupMsg.createMessageComponentCollector({ filter, time: 60000, max: 1 });
-
-        collector.on('collect', async interaction => {
-          const type = interaction.customId.split('_')[2];
-
-          // Save type using updateGuild
-          await Guild.updateGuild(guildId, {
-            $set: {
-              'features.verificationSystem.type': type,
-              'features.verificationSystem.enabled': true
-            }
-          });
-
-          // Ask for verified role
-          const roleEmbed = new EmbedBuilder()
-            .setColor('#5865F2')
-            .setTitle('🔐 Verification Setup - Step 2')
-            .setDescription(`Great! Verification type set to **${type}**.\n\nNow, mention the role that verified users should receive:\n\n*Example: @Verified or @Member*`);
-
-          await interaction.update({ embeds: [roleEmbed], components: [] });
-
-          // Wait for role mention
-          const roleFilter = m => m.author.id === message.author.id && m.mentions.roles.size > 0;
-          const roleCollector = message.channel.createMessageCollector({ filter: roleFilter, time: 60000, max: 1 });
-
-          roleCollector.on('collect', async roleMsg => {
-            const role = roleMsg.mentions.roles.first();
-            const roleError = getAssignableRoleError(role, message.member);
-            if (roleError) {
-              return roleMsg.reply(`**Error:** ${roleError} Run the setup again with a different role.`);
-            }
-            await Guild.updateGuild(guildId, {
-              $set: {
-                'features.verificationSystem.role': role.id,
-                'roles.verifiedRole': role.id
-              }
-            });
-
-            // Ask for channel
-            const channelEmbed = new EmbedBuilder()
-              .setColor('#5865F2')
-              .setTitle('🔐 Verification Setup - Step 3')
-              .setDescription(`Verified role set to ${role}!\n\nNow, mention the channel where the verification panel should be:\n\n*Example: #verify or #welcome*`);
-
-            await message.channel.send({ embeds: [channelEmbed] });
-
-            const channelFilter = m => m.author.id === message.author.id && m.mentions.channels.size > 0;
-            const channelCollector = message.channel.createMessageCollector({ filter: channelFilter, time: 60000, max: 1 });
-
-            channelCollector.on('collect', async channelMsg => {
-              const channel = channelMsg.mentions.channels.first();
-              await Guild.updateGuild(guildId, {
-                $set: { 'features.verificationSystem.channel': channel.id }
-              });
-              
-              // Refetch guildConfig for sendVerificationPanel
-              const updatedGuildConfig = await Guild.getGuild(guildId);
-              
-              // Send panel
-              await sendVerificationPanel(channel, updatedGuildConfig, client);
-
-              const completeEmbed = new EmbedBuilder()
-                .setColor('#00FF7F')
-                .setTitle('『 Verification System Configured 』')
-                .setDescription(`**Confirmed:** Verification system is now active, Master.\n\n**▸ Type:** ${type}\n**▸ Role:** ${role}\n**▸ Channel:** ${channel}\n\nNew members will require verification for server access.`)
-                .setFooter({ text: `Use ${prefix}verify panel to resend the panel` });
-
-              await message.channel.send({ embeds: [completeEmbed] });
-            });
-          });
-        });
-        break;
+        return message.reply({ embeds: [embed] });
       }
 
-      case 'panel': {
-        if (!guildConfig.features?.verificationSystem?.enabled) {
-          return message.reply(`**Error:** Verification system not configured. Use \`${prefix}verify setup\` first, Master.`);
-        }
+      const guildConfig = await Guild.getGuild(guildId);
 
-        const channel = message.mentions.channels.first() || message.channel;
-        await sendVerificationPanel(channel, guildConfig, client);
+      switch (subCommand) {
+        case 'setup':
+          return await runSetup(message, prefix);
 
-        if (channel.id !== message.channel.id) {
-          await message.reply(`**Confirmed:** Verification panel deployed to ${channel}, Master.`);
-        }
-        break;
-      }
-
-      case 'manual': {
-        const targetUser = message.mentions.members.first();
-        if (!targetUser) {
-          return message.reply(`**Error:** Please mention a user to verify. Usage: \`${prefix}verify manual @user\`, Master.`);
-        }
-
-        const verifiedRole = guildConfig.features?.verificationSystem?.role || guildConfig.roles?.verifiedRole;
-        if (!verifiedRole) {
-          return message.reply(`**Error:** No verified role configured. Use \`${prefix}verify setup\` first, Master.`);
-        }
-
-        try {
-          await targetUser.roles.add(verifiedRole);
-
-          // Remove unverified role if configured
-          const unverifiedRole = guildConfig.features?.verificationSystem?.unverifiedRole;
-          if (unverifiedRole && targetUser.roles.cache.has(unverifiedRole)) {
-            await targetUser.roles.remove(unverifiedRole).catch(() => {});
+        case 'panel': {
+          const vs = guildConfig.features?.verificationSystem;
+          if (!vs?.enabled) {
+            return message.reply({
+              embeds: [await errorEmbed(guildId, 'Not Configured',
+                `The verification system is not active. Run \`${prefix}verify setup\` first, Master.`)]
+            });
           }
 
-          // Update verification record
-          const verification = await Verification.getVerification(guildId, targetUser.id);
-          await verification.verify(`staff:${message.author.id}`);
-          
-          // Log the manual verification
-          await logManualVerification(targetUser, message.author, guildConfig);
+          const channel = message.mentions.channels.first() || message.channel;
+          const channelError = getPanelChannelError(channel, vs.type);
+          if (channelError) {
+            return message.reply({ embeds: [await errorEmbed(guildId, 'Invalid Channel', channelError)] });
+          }
+
+          await sendVerificationPanel(channel, vs.type);
+
+          if (channel.id !== message.channel.id) {
+            return message.reply({
+              embeds: [await successEmbed(guildId, 'Panel Deployed', `Verification panel deployed to ${channel}, Master.`)]
+            });
+          }
+          return null;
+        }
+
+        case 'manual':
+          return await manualVerify(message, guildConfig, prefix);
+
+        case 'config':
+          return await configure(message, args, prefix);
+
+        case 'status': {
+          const vs = guildConfig.features?.verificationSystem;
+          const role = vs?.role ? message.guild.roles.cache.get(vs.role) : null;
+          const unverifiedRole = vs?.unverifiedRole ? message.guild.roles.cache.get(vs.unverifiedRole) : null;
+          const channel = vs?.channel ? message.guild.channels.cache.get(vs.channel) : null;
 
           const embed = new EmbedBuilder()
-            .setColor('#00FF7F')
-            .setDescription(`**Confirmed:** **${targetUser.user.username}** has been manually verified, Master.`);
-
-          await message.reply({ embeds: [embed] });
-        } catch (error) {
-          return message.reply(`**Error:** Failed to verify user: ${error.message}`);
-        }
-        break;
-      }
-
-      case 'config': {
-        const setting = args[1]?.toLowerCase();
-        const value = args.slice(2).join(' ');
-
-        if (!setting) {
-          const configEmbed = new EmbedBuilder()
-            .setColor('#5865F2')
-            .setTitle('🔐 Verification Config')
+            .setColor(vs?.enabled ? COLORS.RAPHAEL_SUCCESS : COLORS.RAPHAEL_ERROR)
+            .setTitle('『 Verification Status 』')
             .addFields(
-              { name: 'type <button|captcha|reaction>', value: 'Set verification type' },
-              { name: 'role <@role>', value: 'Set verified role' },
-              { name: 'unverifiedrole <@role|remove>', value: 'Set role to remove on verify' },
-              { name: 'channel <#channel>', value: 'Set verification channel' },
-              { name: 'enable/disable', value: 'Toggle verification' }
-            );
-          return message.reply({ embeds: [configEmbed] });
+              { name: `${GLYPHS.ARROW_RIGHT} Status`, value: vs?.enabled ? `${GLYPHS.SUCCESS} Active` : `${GLYPHS.INFO} Inactive`, inline: true },
+              { name: `${GLYPHS.ARROW_RIGHT} Type`, value: vs?.type || 'Not configured', inline: true },
+              { name: `${GLYPHS.ARROW_RIGHT} Verified Role`, value: role ? role.toString() : 'Not configured', inline: true },
+              { name: `${GLYPHS.ARROW_RIGHT} Unverified Role`, value: unverifiedRole ? unverifiedRole.toString() : 'Not configured', inline: true },
+              { name: `${GLYPHS.ARROW_RIGHT} Channel`, value: channel ? channel.toString() : 'Not configured', inline: true }
+            )
+            .setFooter({ text: getRandomFooter() })
+            .setTimestamp();
+
+          return message.reply({ embeds: [embed] });
         }
 
-        switch (setting) {
-          case 'type':
-            if (!['button', 'captcha', 'reaction'].includes(value)) {
-              return message.reply('**Error:** Type must be: button, captcha, or reaction, Master.');
-            }
-            await Guild.updateGuild(guildId, {
-              $set: { 'features.verificationSystem.type': value }
-            });
-            return message.reply(`**Confirmed:** Verification type set to **${value}**, Master.`);
-
-          case 'role':
-            const role = message.mentions.roles.first();
-            if (!role) return message.reply('**Error:** Please mention a role, Master.');
-            const roleError = getAssignableRoleError(role, message.member);
-            if (roleError) return message.reply(`**Error:** ${roleError}`);
-            await Guild.updateGuild(guildId, {
-              $set: {
-                'features.verificationSystem.role': role.id,
-                'roles.verifiedRole': role.id
-              }
-            });
-            return message.reply(`**Confirmed:** Verified role set to ${role}, Master.`);
-
-          case 'unverifiedrole':
-            if (value?.toLowerCase() === 'remove' || value?.toLowerCase() === 'none') {
-              await Guild.updateGuild(guildId, {
-                $unset: { 'features.verificationSystem.unverifiedRole': '' }
-              });
-              return message.reply('**Confirmed:** Unverified role cleared, Master.');
-            }
-            const unverifiedRole = message.mentions.roles.first();
-            if (!unverifiedRole) return message.reply('**Error:** Please mention a role or use `remove` to clear, Master.');
-            await Guild.updateGuild(guildId, {
-              $set: { 'features.verificationSystem.unverifiedRole': unverifiedRole.id }
-            });
-            return message.reply(`**Confirmed:** Unverified role set to ${unverifiedRole}. This role will be **removed** when a user verifies, Master.`);
-
-          case 'channel':
-            const channel = message.mentions.channels.first();
-            if (!channel) return message.reply('**Error:** Please mention a channel, Master.');
-            await Guild.updateGuild(guildId, {
-              $set: { 'features.verificationSystem.channel': channel.id }
-            });
-            return message.reply(`**Confirmed:** Verification channel set to ${channel}, Master.`);
-
-          case 'enable':
-            await Guild.updateGuild(guildId, {
-              $set: { 'features.verificationSystem.enabled': true }
-            });
-            return message.reply('**Confirmed:** Verification system activated, Master.');
-
-          case 'disable':
-            await Guild.updateGuild(guildId, {
-              $set: { 'features.verificationSystem.enabled': false }
-            });
-            return message.reply('**Notice:** Verification system deactivated, Master.');
-        }
-        break;
+        default:
+          return message.reply({
+            embeds: [await errorEmbed(guildId, 'Invalid Usage',
+              `Unknown subcommand \`${subCommand.slice(0, 50).replace(/`/g, '')}\`. Use \`${prefix}verify\` for guidance, Master.`)]
+          });
       }
-
-      case 'status': {
-        const vs = guildConfig.features?.verificationSystem;
-        const role = vs?.role ? message.guild.roles.cache.get(vs.role) : null;
-        const unverifiedRole = vs?.unverifiedRole ? message.guild.roles.cache.get(vs.unverifiedRole) : null;
-        const channel = vs?.channel ? message.guild.channels.cache.get(vs.channel) : null;
-
-        const embed = new EmbedBuilder()
-          .setColor(vs?.enabled ? '#00FF7F' : '#FF4757')
-          .setTitle('『 Verification Status 』')
-          .addFields(
-            { name: '▸ Status', value: vs?.enabled ? '◉ Active' : '◎ Inactive', inline: true },
-            { name: '▸ Type', value: vs?.type || 'Not configured', inline: true },
-            { name: '▸ Verified Role', value: role ? role.toString() : 'Not configured', inline: true },
-            { name: '▸ Unverified Role', value: unverifiedRole ? unverifiedRole.toString() : 'Not configured', inline: true },
-            { name: '▸ Channel', value: channel ? channel.toString() : 'Not configured', inline: true }
-          );
-
-        await message.reply({ embeds: [embed] });
-        break;
-      }
-
-      default:
-        return message.reply(`**Error:** Unknown subcommand. Use \`${prefix}verify\` for guidance, Master.`);
+    } catch (error) {
+      logger.error('[Verify] Command failed', error);
+      const embed = await errorEmbed(guildId, 'Verification Error',
+        'An anomaly interrupted the verification command, Master. The incident has been logged.').catch(() => null);
+      return message.reply(embed ? { embeds: [embed] } : { content: '**Alert:** The verification command failed, Master.' }).catch(() => null);
     }
   }
 };
 
-async function sendVerificationPanel(channel, guildConfig, client) {
-  const type = guildConfig.features?.verificationSystem?.type || 'button';
+// Three-step wizard: type (buttons), verified role, panel channel. Nothing is saved until
+// the final step succeeds, so an abandoned wizard leaves the existing configuration intact.
+async function runSetup(message, prefix) {
+  const guildId = message.guild.id;
 
+  const buildRow = (disabled = false) => new ActionRowBuilder().addComponents(
+    VERIFICATION_TYPES.map(({ type, label, style }) => new ButtonBuilder()
+      .setCustomId(`${SETUP_PREFIX}${type}`)
+      .setLabel(label)
+      .setStyle(style)
+      .setDisabled(disabled))
+  );
+
+  const intro = await infoEmbed(guildId, 'Verification Setup — Step 1 of 3',
+    'Select the verification method new members must complete, Master.');
+  intro.addFields(VERIFICATION_TYPES.map(({ label, summary }) => ({ name: `${GLYPHS.ARROW_RIGHT} ${label}`, value: summary, inline: true })));
+
+  const setupMsg = await message.reply({ embeds: [intro], components: [buildRow()] });
+
+  const collector = setupMsg.createMessageComponentCollector({
+    componentType: ComponentType.Button,
+    filter: i => i.customId.startsWith(SETUP_PREFIX),
+    time: STEP_TIMEOUT_MS
+  });
+
+  collector.on('collect', async interaction => {
+    try {
+      if (interaction.user.id !== message.author.id) {
+        return await interaction.reply({
+          content: '**Notice:** This setup session belongs to another administrator, Master.',
+          flags: MessageFlags.Ephemeral
+        });
+      }
+      collector.stop('selected');
+
+      const type = interaction.customId.slice(SETUP_PREFIX.length);
+      if (!TYPE_NAMES.includes(type)) return null;
+
+      const roleStep = await infoEmbed(guildId, 'Verification Setup — Step 2 of 3',
+        `Verification type recorded as **${type}**, Master.\n\n` +
+        'Mention the role verified members should receive.\n*Example: @Verified or @Member*');
+      await interaction.update({ embeds: [roleStep], components: [] });
+
+      const roleReply = await awaitMention(message, m => m.mentions.roles.first());
+      if (!roleReply) return await sendTimedOut(message, prefix);
+
+      const role = roleReply.value;
+      const roleError = getAssignableRoleError(role, message.member);
+      if (roleError) {
+        return await roleReply.message.reply({
+          embeds: [await errorEmbed(guildId, 'Invalid Role', `${roleError} Run \`${prefix}verify setup\` again with a different role.`)]
+        });
+      }
+
+      const channelStep = await infoEmbed(guildId, 'Verification Setup — Step 3 of 3',
+        `Verified role recorded as ${role}, Master.\n\n` +
+        'Mention the channel where the verification panel should be posted.\n*Example: #verify or #welcome*');
+      await message.channel.send({ embeds: [channelStep] });
+
+      const channelReply = await awaitMention(message, m => m.mentions.channels.first());
+      if (!channelReply) return await sendTimedOut(message, prefix);
+
+      const channel = channelReply.value;
+      const channelError = getPanelChannelError(channel, type);
+      if (channelError) {
+        return await channelReply.message.reply({
+          embeds: [await errorEmbed(guildId, 'Invalid Channel', `${channelError} Run \`${prefix}verify setup\` again with a different channel.`)]
+        });
+      }
+
+      await sendVerificationPanel(channel, type);
+
+      await Guild.updateGuild(guildId, {
+        $set: {
+          'features.verificationSystem.type': type,
+          'features.verificationSystem.role': role.id,
+          'features.verificationSystem.channel': channel.id,
+          'features.verificationSystem.enabled': true,
+          'roles.verifiedRole': role.id
+        }
+      });
+
+      const complete = await successEmbed(guildId, 'Verification System Configured',
+        `**Confirmed:** Verification system is now active, Master.\n\n` +
+        `**${GLYPHS.ARROW_RIGHT} Type:** ${type}\n` +
+        `**${GLYPHS.ARROW_RIGHT} Role:** ${role}\n` +
+        `**${GLYPHS.ARROW_RIGHT} Channel:** ${channel}\n\n` +
+        'New members will require verification for server access.');
+      complete.setFooter({ text: `Use ${prefix}verify panel to resend the panel` });
+
+      return await message.channel.send({ embeds: [complete] });
+    } catch (error) {
+      logger.error('[Verify] Setup wizard failed', error);
+      const embed = await errorEmbed(guildId, 'Setup Failed',
+        'An anomaly interrupted the setup, Master. No changes were saved unless confirmed above.').catch(() => null);
+      if (embed) await message.channel.send({ embeds: [embed] }).catch(() => {});
+      return null;
+    }
+  });
+
+  collector.on('end', async (_collected, reason) => {
+    if (reason === 'selected') return; // the selection already replaced the buttons
+    try {
+      const expired = await infoEmbed(guildId, 'Verification Setup — Expired',
+        `No verification method was selected within 60 seconds. Run \`${prefix}verify setup\` again when ready, Master.`);
+      await setupMsg.edit({ embeds: [expired], components: [buildRow(true)] });
+    } catch {
+      // Setup message deleted
+    }
+  });
+
+  return setupMsg;
+}
+
+// The next message from the command author for which `pick` returns a value, or null on timeout
+async function awaitMention(message, pick) {
+  const collected = await message.channel.awaitMessages({
+    filter: m => m.author.id === message.author.id && Boolean(pick(m)),
+    max: 1,
+    time: STEP_TIMEOUT_MS
+  });
+  const reply = collected.first();
+  return reply ? { message: reply, value: pick(reply) } : null;
+}
+
+async function sendTimedOut(message, prefix) {
+  const embed = await errorEmbed(message.guild.id, 'Setup Timed Out',
+    `No response was received within 60 seconds. Run \`${prefix}verify setup\` again when ready, Master. No changes were saved.`);
+  return message.channel.send({ embeds: [embed] });
+}
+
+async function manualVerify(message, guildConfig, prefix) {
+  const guildId = message.guild.id;
+  const targetMember = message.mentions.members?.first();
+  if (!targetMember) {
+    return message.reply({
+      embeds: [await errorEmbed(guildId, 'Invalid Usage', `Mention the member to verify: \`${prefix}verify manual @user\`, Master.`)]
+    });
+  }
+
+  const verifiedRole = guildConfig.features?.verificationSystem?.role || guildConfig.roles?.verifiedRole;
+  if (!verifiedRole) {
+    return message.reply({
+      embeds: [await errorEmbed(guildId, 'Not Configured', `No verified role is configured. Run \`${prefix}verify setup\` first, Master.`)]
+    });
+  }
+
+  try {
+    await targetMember.roles.add(verifiedRole);
+  } catch (error) {
+    logger.error(`[Verify] Failed to add the verified role to ${targetMember.id} in ${guildId}`, error);
+    return message.reply({
+      embeds: [await errorEmbed(guildId, 'Verification Failed',
+        'I could not assign the verified role, Master. Confirm that it still exists and sits below my highest role.')]
+    });
+  }
+
+  // Remove unverified role if configured
+  const unverifiedRole = guildConfig.features?.verificationSystem?.unverifiedRole;
+  if (unverifiedRole && targetMember.roles.cache.has(unverifiedRole)) {
+    await targetMember.roles.remove(unverifiedRole).catch(() => {});
+  }
+
+  const verification = await Verification.getVerification(guildId, targetMember.id);
+  await verification.verify(`staff:${message.author.id}`);
+
+  await logManualVerification(targetMember, message.author, guildConfig);
+
+  return message.reply({
+    embeds: [await successEmbed(guildId, 'Member Verified', `**${targetMember.user.username}** has been manually verified, Master.`)]
+  });
+}
+
+async function configure(message, args, prefix) {
+  const guildId = message.guild.id;
+  const setting = args[1]?.toLowerCase();
+  const value = args.slice(2).join(' ').trim().toLowerCase();
+
+  const showOptions = async (lead) => {
+    const embed = await infoEmbed(guildId, 'Verification Config', lead);
+    embed.addFields(
+      { name: `${GLYPHS.ARROW_RIGHT} type <button|captcha|reaction>`, value: 'Set the verification type' },
+      { name: `${GLYPHS.ARROW_RIGHT} role <@role>`, value: 'Set the verified role' },
+      { name: `${GLYPHS.ARROW_RIGHT} unverifiedrole <@role|remove>`, value: 'Set the role removed on verification' },
+      { name: `${GLYPHS.ARROW_RIGHT} channel <#channel>`, value: 'Set the verification channel' },
+      { name: `${GLYPHS.ARROW_RIGHT} enable | disable`, value: 'Toggle the verification system' }
+    );
+    return message.reply({ embeds: [embed] });
+  };
+
+  const confirm = async (title, description) => message.reply({ embeds: [await successEmbed(guildId, title, description)] });
+  const reject = async (title, description) => message.reply({ embeds: [await errorEmbed(guildId, title, description)] });
+
+  switch (setting) {
+    case undefined:
+      return showOptions(`Usage: \`${prefix}verify config <option> [value]\`, Master.`);
+
+    case 'type': {
+      if (!TYPE_NAMES.includes(value)) {
+        return reject('Invalid Usage', 'The type must be `button`, `captcha` or `reaction`, Master.');
+      }
+      await Guild.updateGuild(guildId, { $set: { 'features.verificationSystem.type': value } });
+      return confirm('Verification Updated', `Verification type set to **${value}**, Master.`);
+    }
+
+    case 'role': {
+      const role = message.mentions.roles.first();
+      if (!role) return reject('Invalid Usage', 'Please mention a role, Master.');
+      const roleError = getAssignableRoleError(role, message.member);
+      if (roleError) return reject('Invalid Role', roleError);
+      await Guild.updateGuild(guildId, {
+        $set: {
+          'features.verificationSystem.role': role.id,
+          'roles.verifiedRole': role.id
+        }
+      });
+      return confirm('Verification Updated', `Verified role set to ${role}, Master.`);
+    }
+
+    case 'unverifiedrole': {
+      if (value === 'remove' || value === 'none') {
+        await Guild.updateGuild(guildId, { $unset: { 'features.verificationSystem.unverifiedRole': '' } });
+        return confirm('Verification Updated', 'Unverified role cleared, Master.');
+      }
+      const unverifiedRole = message.mentions.roles.first();
+      if (!unverifiedRole) return reject('Invalid Usage', 'Please mention a role, or use `remove` to clear it, Master.');
+      await Guild.updateGuild(guildId, { $set: { 'features.verificationSystem.unverifiedRole': unverifiedRole.id } });
+      return confirm('Verification Updated',
+        `Unverified role set to ${unverifiedRole}. It will be **removed** when a member verifies, Master.`);
+    }
+
+    case 'channel': {
+      const channel = message.mentions.channels.first();
+      if (!channel) return reject('Invalid Usage', 'Please mention a channel, Master.');
+      if (!channel.isTextBased()) return reject('Invalid Channel', `${channel} is not a text channel, Master.`);
+      await Guild.updateGuild(guildId, { $set: { 'features.verificationSystem.channel': channel.id } });
+      return confirm('Verification Updated', `Verification channel set to ${channel}, Master.`);
+    }
+
+    case 'enable':
+      await Guild.updateGuild(guildId, { $set: { 'features.verificationSystem.enabled': true } });
+      return confirm('Verification Activated', 'Verification system activated, Master.');
+
+    case 'disable':
+      await Guild.updateGuild(guildId, { $set: { 'features.verificationSystem.enabled': false } });
+      return confirm('Verification Deactivated', '**Notice:** Verification system deactivated, Master.');
+
+    default:
+      return showOptions(`**Notice:** \`${setting.slice(0, 50).replace(/`/g, '')}\` is not a recognised option, Master.`);
+  }
+}
+
+// Why the panel cannot be posted in `channel`, or null if it can
+function getPanelChannelError(channel, type) {
+  if (!channel?.isTextBased?.()) return `${channel ?? 'That channel'} is not a text channel, Master.`;
+  const me = channel.guild.members.me;
+  const needed = type === 'reaction' ? [...PANEL_PERMISSIONS, PermissionFlagsBits.AddReactions] : PANEL_PERMISSIONS;
+  if (!channel.permissionsFor(me)?.has(needed)) {
+    return `I lack permission to post the panel in ${channel}, Master. I need View Channel, Send Messages and Embed Links${type === 'reaction' ? ', and Add Reactions' : ''}.`;
+  }
+  return null;
+}
+
+async function sendVerificationPanel(channel, type = 'button') {
   const embed = new EmbedBuilder()
-    .setColor('#00CED1')
+    .setColor(COLORS.RAPHAEL)
     .setTitle('『 Server Verification 』')
     .setDescription('**Notice:** Access to this server requires verification, Master.\n\n' +
       (type === 'button' ? '**Activate the button below to proceed.**' :
-        type === 'captcha' ? '**Activate the button below to receive verification code.**' :
+        type === 'captcha' ? '**Activate the button below to receive a verification code.**' :
           '**Apply the reaction below to verify.**'))
     .setFooter({ text: 'Security protocol active.' });
 
@@ -319,12 +402,12 @@ async function sendVerificationPanel(channel, guildConfig, client) {
           .setCustomId(`verify_${type}`)
           .setLabel(type === 'captcha' ? 'Get Captcha' : 'Verify')
           .setStyle(ButtonStyle.Success)
-          .setEmoji('◉')
       );
 
-    await channel.send({ embeds: [embed], components: [row] });
-  } else {
-    const msg = await channel.send({ embeds: [embed] });
-    await msg.react('✅');
+    return channel.send({ embeds: [embed], components: [row] });
   }
+
+  const msg = await channel.send({ embeds: [embed] });
+  await msg.react('✅');
+  return msg;
 }

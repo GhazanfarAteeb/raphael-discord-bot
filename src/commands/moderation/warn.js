@@ -3,9 +3,18 @@ import Member from '../../models/Member.js';
 import ModLog from '../../models/ModLog.js';
 import Guild from '../../models/Guild.js';
 import { successEmbed, errorEmbed, modLogEmbed, GLYPHS } from '../../utils/embeds.js';
+import { getPrefix, truncate } from '../../utils/helpers.js';
+import logger from '../../utils/logger.js';
+
+const USER_ID = /^\d{17,20}$/;
+const EMBED_REASON_LIMIT = 1000;
+// Discord API codes for "not in this server" and "no such user"
+const UNKNOWN_MEMBER = 10007;
+const UNKNOWN_USER = 10013;
 
 export default {
   name: 'warn',
+  category: 'moderation',
   description: 'Warn a member',
   usage: '<@user|user_id> [reason]',
   aliases: ['warning'],
@@ -16,112 +25,146 @@ export default {
   cooldown: 2,
 
   async execute(message, args) {
-    if (!args[0]) {
-      const embed = await errorEmbed(message.guild.id, 'Invalid Usage',
-        `${GLYPHS.ARROW_RIGHT} Usage: \`warn <@user|user_id> [reason]\``
-      );
-      return message.reply({ embeds: [embed] });
-    }
+    const guildId = message.guild.id;
 
-    // Parse user
-    const userId = args[0].replace(/[<@!>]/g, '');
-    const targetMember = await message.guild.members.fetch(userId).catch(() => null);
-
-    if (!targetMember) {
-      const embed = await errorEmbed(message.guild.id, 'User Not Found',
-        `${GLYPHS.ERROR} Could not find that user.`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    // Check hierarchy
-    if (targetMember.roles.highest.position >= message.member.roles.highest.position) {
-      const embed = await errorEmbed(message.guild.id, 'Permission Denied',
-        `${GLYPHS.LOCK} You cannot warn someone with equal or higher role than you.`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    const reason = args.slice(1).join(' ') || 'No reason provided';
-
-    // Add warning to member data
-    let memberData = await Member.findOne({
-      userId: targetMember.user.id,
-      guildId: message.guild.id
-    });
-
-    if (!memberData) {
-      memberData = await Member.create({
-        userId: targetMember.user.id,
-        guildId: message.guild.id,
-        username: targetMember.user.username,
-        discriminator: targetMember.user.discriminator,
-        accountCreatedAt: targetMember.user.createdAt
-      });
-    }
-
-    memberData.warnings.push({
-      moderatorId: message.author.id,
-      moderatorTag: message.author.tag,
-      reason,
-      timestamp: new Date()
-    });
-    await memberData.save();
-
-    // Create mod log
-    const caseNumber = await ModLog.getNextCaseNumber(message.guild.id);
-    const guildConfig = await Guild.getGuild(message.guild.id);
-
-    const logData = {
-      caseNumber,
-      targetTag: targetMember.user.tag,
-      targetId: targetMember.user.id,
-      moderatorTag: message.author.tag,
-      reason
-    };
-
-    // Save to database
-    await ModLog.create({
-      guildId: message.guild.id,
-      caseNumber,
-      action: 'warn',
-      moderatorId: message.author.id,
-      moderatorTag: message.author.tag,
-      targetId: targetMember.user.id,
-      targetTag: targetMember.user.tag,
-      reason
-    });
-
-    // Send to mod log channel
-    if (guildConfig.channels.modLog) {
-      const modLogChannel = message.guild.channels.cache.get(guildConfig.channels.modLog);
-      if (modLogChannel) {
-        const logEmbed = await modLogEmbed(message.guild.id, 'warn', logData);
-        await modLogChannel.send({ embeds: [logEmbed] });
-      }
-    }
-
-    // DM the user
     try {
-      const dmEmbed = await errorEmbed(message.guild.id, `Official Warning`,
-        `**Caution:** You have received an official warning in **${message.guild.name}**.\n\n` +
-        `▸ **Justification:** ${reason}\n` +
-        `▸ **Issued by:** ${message.author.tag}\n\n` +
-        `▸ **Accumulated Warnings:** ${memberData.warnings.length}\n\n` +
-        `*Further infractions may result in escalated disciplinary action.*`
-      );
-      await targetMember.send({ embeds: [dmEmbed] });
-    } catch (error) {
-      // User has DMs disabled
-    }
+      const userId = args[0]?.replace(/[<@!>]/g, '');
+      if (!userId || !USER_ID.test(userId)) {
+        const prefix = await getPrefix(guildId);
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Invalid Usage',
+            `${GLYPHS.ARROW_RIGHT} Usage: \`${prefix}warn <@user|user_id> [reason]\``)]
+        });
+      }
 
-    // Confirm to moderator
-    const embed = await successEmbed(message.guild.id, 'Warning Issued',
-      `**Notice:** Disciplinary warning has been recorded, Master.\n\n` +
-      `▸ **Subject:** ${targetMember.user.tag}\n` +
-      `▸ **Case Reference:** #${caseNumber}\n` +
-      `▸ **Total Infractions:** ${memberData.warnings.length}`
-    );
-    return message.reply({ embeds: [embed] });
+      if (userId === message.author.id) {
+        return message.reply({ embeds: [await errorEmbed(guildId, 'Permission Denied', 'You cannot warn yourself, Master.')] });
+      }
+      if (userId === message.guild.ownerId) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Permission Denied', 'The server owner is immune to moderation actions, Master.')]
+        });
+      }
+
+      const targetMember = await fetchMember(message.guild, userId);
+      if (!targetMember) {
+        return message.reply({ embeds: [await errorEmbed(guildId, 'User Not Found', 'That user is not a member of this server, Master.')] });
+      }
+
+      if (targetMember.user.bot) {
+        return message.reply({ embeds: [await errorEmbed(guildId, 'Invalid Usage', 'Automated accounts cannot be warned, Master.')] });
+      }
+
+      // Server owner and Administrators may warn anyone; others only below their own top role
+      const isOwner = message.author.id === message.guild.ownerId;
+      const isAdmin = message.member.permissions.has(PermissionFlagsBits.Administrator);
+      if (!isOwner && !isAdmin && targetMember.roles.highest.position >= message.member.roles.highest.position) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Permission Denied',
+            'Their highest role is equal to or above yours, so you cannot warn them, Master.')]
+        });
+      }
+
+      const reason = truncate(args.slice(1).join(' ').trim() || 'No reason provided', EMBED_REASON_LIMIT);
+      const targetUser = targetMember.user;
+
+      // The warning itself is the record, so it must save before anything is announced
+      const memberData = await Member.findOneAndUpdate(
+        { userId: targetUser.id, guildId },
+        {
+          $push: {
+            warnings: {
+              moderatorId: message.author.id,
+              moderatorTag: message.author.tag,
+              reason,
+              timestamp: new Date()
+            }
+          },
+          $setOnInsert: {
+            username: targetUser.username,
+            discriminator: targetUser.discriminator || '0',
+            accountCreatedAt: targetUser.createdAt
+          }
+        },
+        { upsert: true, new: true, projection: { warnings: 1 } }
+      ).lean();
+      const warningCount = memberData?.warnings?.length ?? 1;
+
+      let caseNumber = null;
+      try {
+        caseNumber = await ModLog.getNextCaseNumber(guildId);
+        await ModLog.create({
+          guildId,
+          caseNumber,
+          action: 'warn',
+          moderatorId: message.author.id,
+          moderatorTag: message.author.tag,
+          targetId: targetUser.id,
+          targetTag: targetUser.tag,
+          reason
+        });
+      } catch (error) {
+        caseNumber = null;
+        logger.error(`[Warn] Failed to save the case for ${targetUser.id} in ${guildId}`, error);
+      }
+
+      // Mod log channel
+      try {
+        const guildConfig = await Guild.getGuild(guildId);
+        const channelId = guildConfig?.channels?.modLog;
+        const modLogChannel = channelId ? message.guild.channels.cache.get(channelId) : null;
+        if (modLogChannel) {
+          const logEmbed = await modLogEmbed(guildId, 'warn', {
+            caseNumber: caseNumber ?? '—',
+            targetTag: targetUser.tag,
+            targetId: targetUser.id,
+            moderatorTag: message.author.tag,
+            reason
+          });
+          await modLogChannel.send({ embeds: [logEmbed] });
+        }
+      } catch (error) {
+        logger.warn(`[Warn] Failed to post to the mod log in ${guildId}: ${error.message}`);
+      }
+
+      try {
+        const dmEmbed = await errorEmbed(guildId, 'Official Warning',
+          `**Caution:** You have received an official warning in **${message.guild.name}**.\n\n` +
+          `${GLYPHS.ARROW_RIGHT} **Reason:** ${reason}\n` +
+          `${GLYPHS.ARROW_RIGHT} **Moderator:** ${message.author.tag}\n` +
+          `${GLYPHS.ARROW_RIGHT} **Accumulated Warnings:** ${warningCount}\n\n` +
+          `*Further infractions may result in escalated disciplinary action.*`
+        );
+        await targetMember.send({ embeds: [dmEmbed] });
+      } catch {
+        // DMs closed
+      }
+
+      const embed = await successEmbed(guildId, 'Warning Issued',
+        `**Notice:** Disciplinary warning has been recorded, Master.\n\n` +
+        `${GLYPHS.ARROW_RIGHT} **Subject:** ${targetUser.tag}\n` +
+        `${GLYPHS.ARROW_RIGHT} **Reason:** ${reason}\n` +
+        `${GLYPHS.ARROW_RIGHT} **Total Infractions:** ${warningCount}\n` +
+        (caseNumber
+          ? `${GLYPHS.ARROW_RIGHT} **Case Reference:** #${caseNumber}`
+          : `${GLYPHS.ERROR} The case record could not be saved. The incident has been logged.`)
+      );
+      return message.reply({ embeds: [embed] });
+    } catch (error) {
+      logger.error('[Warn] Command failed', error);
+      const embed = await errorEmbed(guildId, 'Warning Failed',
+        'An anomaly prevented the warning from being recorded, Master. The incident has been logged.').catch(() => null);
+      return message.reply(embed ? { embeds: [embed] } : { content: '**Alert:** The warning could not be recorded, Master.' }).catch(() => null);
+    }
   }
 };
+
+// The member, or null when they are not in the server; other lookup failures are rethrown
+async function fetchMember(guild, userId) {
+  try {
+    return await guild.members.fetch({ user: userId, force: true });
+  } catch (error) {
+    if (error.code === UNKNOWN_MEMBER || error.code === UNKNOWN_USER) return null;
+    throw error;
+  }
+}

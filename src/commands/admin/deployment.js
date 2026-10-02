@@ -1,94 +1,122 @@
 import logger from '../../utils/logger.js';
+import { readFileSync } from 'fs';
 import { PermissionFlagsBits } from 'discord.js';
 import Guild from '../../models/Guild.js';
+import { successEmbed, errorEmbed, warningEmbed, infoEmbed, GLYPHS } from '../../utils/embeds.js';
+import { getPrefix, hasAdminPerms } from '../../utils/helpers.js';
+
+const ACTIONS = ['start', 'complete', 'rollback', 'status'];
+
+// Version recorded in deployment logs, read once from package.json
+const BOT_VERSION = (() => {
+  try {
+    return JSON.parse(readFileSync(new URL('../../../package.json', import.meta.url), 'utf8')).version || 'unknown';
+  } catch {
+    return 'unknown';
+  }
+})();
 
 export default {
   name: 'deployment',
   description: 'Log deployment and build information',
-  usage: 'deployment [start|complete|rollback]',
+  usage: 'deployment <start|complete [version]|rollback [version] [reason]|status>',
   category: 'admin',
   ownerOnly: true, // bot-wide: reads and changes the bot's own logs
   permissions: [PermissionFlagsBits.Administrator],
   execute: async (message, args) => {
-    const guildConfig = await Guild.getGuild(message.guild.id);
-
-    // Check for admin role
-    const hasAdminRole = guildConfig.roles.adminRoles?.some(roleId =>
-      message.member.roles.cache.has(roleId)
-    );
-
-    if (!message.member.permissions.has(PermissionFlagsBits.Administrator) && !hasAdminRole) {
-      return message.reply('**Warning:** Administrator permission required, Master.');
-    }
-
-    const action = args[0]?.toLowerCase();
-
-    if (!action || !['start', 'complete', 'rollback', 'status'].includes(action)) {
-      return message.reply('Usage: `deployment [start|complete|rollback|status]`');
-    }
+    const guildId = message.guild.id;
 
     try {
+      const guildConfig = await Guild.getGuild(guildId);
+      if (!hasAdminPerms(message.member, guildConfig)) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Permission Denied', 'Administrator permission or a configured admin role is required, Master.')]
+        });
+      }
+
+      const action = args[0]?.toLowerCase();
+      if (!ACTIONS.includes(action)) {
+        const prefix = await getPrefix(guildId);
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Invalid Usage',
+            `${GLYPHS.ARROW_RIGHT} Usage: \`${prefix}deployment <start|complete [version]|rollback [version] [reason]|status>\``)]
+        });
+      }
+
+      const actor = `${message.author.tag} (${message.author.id})`;
+      const guildLabel = `${message.guild.name} (${message.guild.id})`;
+
       switch (action) {
-        case 'start':
+        case 'start': {
           logger.deployment('Deployment started', {
-            initiatedBy: `${message.author.tag} (${message.author.id})`,
-            guild: `${message.guild.name} (${message.guild.id})`,
+            initiatedBy: actor,
+            guild: guildLabel,
             timestamp: new Date().toISOString(),
-            version: '2.1.0'
+            version: BOT_VERSION
           });
+          return message.reply({
+            embeds: [await successEmbed(guildId, 'Deployment Started',
+              `Deployment of v${BOT_VERSION} has been logged, Master. Details are in the deployment log.`)]
+          });
+        }
 
-          await message.reply('✅ Deployment started and logged. Check logs directory for details.');
-          break;
-
-        case 'complete':
-          const version = args[1] || '2.1.0';
+        case 'complete': {
+          const version = args[1] || BOT_VERSION;
           logger.deployment('Deployment completed successfully', {
             version,
-            completedBy: `${message.author.tag} (${message.author.id})`,
-            guild: `${message.guild.name} (${message.guild.id})`,
+            completedBy: actor,
+            guild: guildLabel,
             timestamp: new Date().toISOString(),
             status: 'success'
           });
+          return message.reply({
+            embeds: [await successEmbed(guildId, 'Deployment Complete', `Deployment of v${version.slice(0, 100)} has been logged as complete, Master.`)]
+          });
+        }
 
-          await message.reply(`✅ Deployment v${version} completed and logged successfully.`);
-          break;
-
-        case 'rollback':
+        case 'rollback': {
           const previousVersion = args[1] || 'previous';
+          const reason = args.slice(2).join(' ') || 'No reason provided';
           logger.deployment('Deployment rollback initiated', {
             rollbackTo: previousVersion,
-            initiatedBy: `${message.author.tag} (${message.author.id})`,
-            guild: `${message.guild.name} (${message.guild.id})`,
+            initiatedBy: actor,
+            guild: guildLabel,
             timestamp: new Date().toISOString(),
-            reason: args.slice(2).join(' ') || 'No reason provided'
+            reason
           });
+          return message.reply({
+            embeds: [await warningEmbed(guildId, 'Rollback Logged',
+              `Rollback to **${previousVersion.slice(0, 100)}** has been logged, Master.`)]
+          });
+        }
 
-          await message.reply(`⚠️ Rollback to ${previousVersion} initiated and logged.`);
-          break;
-
-        case 'status':
+        case 'status': {
           const stats = logger.getStats();
-
           if (!stats) {
-            return message.reply('❌ Could not retrieve log statistics.');
+            return message.reply({ embeds: [await errorEmbed(guildId, 'Log Statistics', 'I could not read the log directory, Master.')] });
           }
 
-          let response = '📊 **Deployment & Build Logs Status**\n\n';
-          response += `**Total Log Files:** ${stats.totalFiles}\n`;
-          response += `**Total Size:** ${stats.totalSize}\n\n`;
-          response += '**Logs by Type:**\n';
+          const embed = await infoEmbed(guildId, 'Deployment & Build Logs',
+            `Current version: **v${BOT_VERSION}**`);
+          embed.addFields(
+            { name: `${GLYPHS.ARROW_RIGHT} Total Log Files`, value: String(stats.totalFiles), inline: true },
+            { name: `${GLYPHS.ARROW_RIGHT} Total Size`, value: stats.totalSize, inline: true }
+          );
 
-          for (const [type, data] of Object.entries(stats.filesByType)) {
-            const sizeMB = (data.size / (1024 * 1024)).toFixed(2);
-            response += `• ${type}: ${data.count} file(s), ${sizeMB} MB\n`;
-          }
+          const byType = Object.entries(stats.filesByType)
+            .map(([type, data]) => `${GLYPHS.DOT} ${type}: ${data.count} file(s), ${(data.size / (1024 * 1024)).toFixed(2)} MB`)
+            .join('\n');
+          if (byType) embed.addFields({ name: `${GLYPHS.ARROW_RIGHT} Logs by Type`, value: byType.slice(0, 1024) });
 
-          await message.reply(response);
-          break;
+          return message.reply({ embeds: [embed] });
+        }
       }
+      return null;
     } catch (error) {
       logger.error('Deployment command error', error);
-      await message.reply('**Error:** An anomaly occurred while processing the deployment command, Master.');
+      const embed = await errorEmbed(guildId, 'Deployment Log Failed',
+        'An anomaly occurred while processing the deployment command, Master.').catch(() => null);
+      return message.reply(embed ? { embeds: [embed] } : { content: '**Alert:** The deployment command failed, Master.' }).catch(() => null);
     }
   }
 };

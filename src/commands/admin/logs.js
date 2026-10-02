@@ -1,162 +1,195 @@
 import logger from '../../utils/logger.js';
 import { EmbedBuilder } from 'discord.js';
-import { readdir, stat } from 'fs/promises';
+import { readdir, readFile } from 'fs/promises';
 import { join } from 'path';
-import { fileURLToPath } from 'url';
-import { dirname } from 'path';
 import Guild from '../../models/Guild.js';
+import { errorEmbed, successEmbed, warningEmbed, COLORS, GLYPHS } from '../../utils/embeds.js';
+import { getPrefix } from '../../utils/helpers.js';
+import { getRandomFooter } from '../../utils/raphael.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+// File name prefixes the logger writes (`<type>-YYYY-MM-DD.log`), with what each holds
+const LOG_TYPES = {
+  app: 'General application logs',
+  error: 'Error logs only',
+  commands: 'Command execution logs',
+  events: 'Discord event logs',
+  database: 'Database operation logs',
+  performance: 'Performance metrics',
+  deployment: 'Deployment and build logs',
+  startup: 'Bot startup logs',
+  debug: 'Debug logs (development only)',
+  build: 'Build information logs'
+};
+const LOG_TYPE_ALIASES = { command: 'commands', event: 'events' };
+const MIN_KEEP_DAYS = 7;
+const DEFAULT_KEEP_DAYS = 30;
+const RECENT_LINES = 20;
+const RECENT_MAX_CHARS = 1900;
 
 export default {
   name: 'botlogs',
   description: 'View bot logs and statistics',
-  usage: 'botlogs [stats|clean|types]',
+  usage: 'botlogs [stats|clean <days>|types|recent <type>]',
   aliases: ['blogs', 'systemlogs'],
   category: 'admin',
   ownerOnly: true, // bot-wide: reads and changes the bot's own logs
   permissions: [], // Custom permission check below
   execute: async (message, args) => {
-    // Check for Administrator OR admin/staff/moderator roles
-    const hasAdmin = message.member.permissions.has('Administrator');
-
-    if (!hasAdmin) {
-      const guildConfig = await Guild.getGuild(message.guild.id);
-      const memberRoles = message.member.roles.cache.map(r => r.id);
-      const adminRoles = guildConfig?.roles?.adminRoles || [];
-      const staffRoles = guildConfig?.roles?.staffRoles || [];
-      const modRoles = guildConfig?.roles?.moderatorRoles || [];
-
-      const hasAdminRole = adminRoles.some(roleId => memberRoles.includes(roleId));
-      const hasStaffRole = staffRoles.some(roleId => memberRoles.includes(roleId));
-      const hasModRole = modRoles.some(roleId => memberRoles.includes(roleId));
-
-      if (!hasAdminRole && !hasStaffRole && !hasModRole) {
-        return message.reply('**Warning:** Administrator permission or admin/staff/moderator role required, Master.');
-      }
-    }
-    const action = args[0]?.toLowerCase() || 'stats';
+    const guildId = message.guild.id;
 
     try {
-      switch (action) {
-        case 'stats':
-          const stats = logger.getStats();
+      // Administrator OR admin/staff/moderator roles
+      if (!message.member.permissions.has('Administrator')) {
+        const guildConfig = await Guild.getGuild(guildId);
+        const roles = [
+          ...(guildConfig?.roles?.adminRoles || []),
+          ...(guildConfig?.roles?.staffRoles || []),
+          ...(guildConfig?.roles?.moderatorRoles || [])
+        ];
+        if (!roles.some(roleId => message.member.roles.cache.has(roleId))) {
+          return message.reply({
+            embeds: [await errorEmbed(guildId, 'Permission Denied',
+              'Administrator permission or an admin, staff or moderator role is required, Master.')]
+          });
+        }
+      }
 
+      const action = args[0]?.toLowerCase() || 'stats';
+
+      switch (action) {
+        case 'stats': {
+          const stats = logger.getStats();
           if (!stats) {
-            return message.reply('**Error:** Could not retrieve log statistics, Master.');
+            return message.reply({ embeds: [await errorEmbed(guildId, 'Log Statistics', 'I could not read the log directory, Master.')] });
           }
 
           const embed = new EmbedBuilder()
             .setTitle('『 Log Statistics 』')
-            .setColor('#00CED1')
+            .setColor(COLORS.RAPHAEL)
             .addFields(
-              { name: '▸ Total Files', value: stats.totalFiles.toString(), inline: true },
-              { name: '▸ Total Size', value: stats.totalSize, inline: true },
-              { name: '\u200B', value: '\u200B', inline: true }
+              { name: `${GLYPHS.ARROW_RIGHT} Total Files`, value: stats.totalFiles.toString(), inline: true },
+              { name: `${GLYPHS.ARROW_RIGHT} Total Size`, value: stats.totalSize, inline: true },
+              { name: '​', value: '​', inline: true }
             )
+            .setFooter({ text: getRandomFooter() })
             .setTimestamp();
 
-          // Add log types
-          for (const [type, data] of Object.entries(stats.filesByType)) {
+          // Discord allows 25 fields; three are used above
+          for (const [type, data] of Object.entries(stats.filesByType).slice(0, 22)) {
             const sizeMB = (data.size / (1024 * 1024)).toFixed(2);
             embed.addFields({
-              name: `${type.charAt(0).toUpperCase() + type.slice(1)} Logs`,
+              name: `${GLYPHS.DOT} ${type.charAt(0).toUpperCase() + type.slice(1)} Logs`,
               value: `${data.count} file(s) • ${sizeMB} MB`,
               inline: true
             });
           }
 
-          await message.reply({ embeds: [embed] });
-          break;
+          return message.reply({ embeds: [embed] });
+        }
 
-        case 'clean':
-          const days = parseInt(args[1]) || 30;
-
-          if (days < 7) {
-            return message.reply('**Warning:** Cannot purge logs newer than 7 days for safety, Master.');
+        case 'clean': {
+          const days = args[1] === undefined ? DEFAULT_KEEP_DAYS : Number(args[1]);
+          if (!Number.isInteger(days)) {
+            return message.reply({
+              embeds: [await errorEmbed(guildId, 'Invalid Usage', 'Specify the number of days of logs to keep, Master.')]
+            });
+          }
+          if (days < MIN_KEEP_DAYS) {
+            return message.reply({
+              embeds: [await errorEmbed(guildId, 'Retention Too Short',
+                `Logs newer than ${MIN_KEEP_DAYS} days cannot be purged, Master.`)]
+            });
           }
 
+          // cleanOldLogs reports nothing, so compare the directory before and after
+          const before = new Set(await readdir(logger.logsDir));
           logger.cleanOldLogs(days);
+          const after = new Set(await readdir(logger.logsDir));
+          const removed = [...before].filter(file => !after.has(file)).length;
+
           logger.deployment(`Logs cleaned: older than ${days} days`, {
             cleanedBy: `${message.author.tag} (${message.author.id})`,
-            daysKept: days
+            daysKept: days,
+            filesRemoved: removed
           });
 
-          await message.reply(`**Confirmed:** Logs older than ${days} days have been purged, Master.`);
-          break;
+          const embed = removed > 0
+            ? await successEmbed(guildId, 'Logs Purged',
+              `Removed **${removed}** log file${removed === 1 ? '' : 's'} older than ${days} days, Master.`)
+            : await warningEmbed(guildId, 'Nothing to Purge',
+              `No log files are older than ${days} days, Master. Nothing was removed.`);
+          return message.reply({ embeds: [embed] });
+        }
 
-        case 'types':
-          const logTypes = [
-            '**app** - General application logs',
-            '**error** - Error logs only',
-            '**command** - Command execution logs',
-            '**event** - Discord event logs',
-            '**database** - Database operation logs',
-            '**performance** - Performance metrics',
-            '**deployment** - Deployment & build logs',
-            '**startup** - Bot startup logs',
-            '**debug** - Debug logs (dev only)',
-            '**build** - Build information logs'
-          ];
-
-          const typesEmbed = new EmbedBuilder()
-            .setTitle('📋 Log Types')
-            .setDescription(logTypes.join('\n'))
-            .setColor('#2ecc71')
+        case 'types': {
+          const embed = new EmbedBuilder()
+            .setTitle('『 Log Types 』')
+            .setDescription(Object.entries(LOG_TYPES).map(([type, summary]) => `${GLYPHS.ARROW_RIGHT} **${type}** — ${summary}`).join('\n'))
+            .setColor(COLORS.RAPHAEL)
             .setFooter({ text: 'All logs are stored in the logs/ directory' })
             .setTimestamp();
 
-          await message.reply({ embeds: [typesEmbed] });
-          break;
+          return message.reply({ embeds: [embed] });
+        }
 
-        case 'recent':
-          const logType = args[1] || 'app';
-          const logsDir = join(__dirname, '../../logs');
+        case 'recent': {
+          const requested = (args[1] || 'app').toLowerCase();
+          const logType = LOG_TYPE_ALIASES[requested] || requested;
+          // Only known types reach the file path
+          if (!Object.hasOwn(LOG_TYPES, logType)) {
+            return message.reply({
+              embeds: [await errorEmbed(guildId, 'Unknown Log Type',
+                `Valid types: ${Object.keys(LOG_TYPES).map(t => `\`${t}\``).join(', ')}, Master.`)]
+            });
+          }
+
           const today = new Date().toISOString().split('T')[0];
           const filename = `${logType}-${today}.log`;
 
+          let content;
           try {
-            const { readFile } = await import('fs/promises');
-            const logPath = join(logsDir, filename);
-            const content = await readFile(logPath, 'utf8');
-            const lines = content.split('\n').filter(line => line.trim());
-            const recentLines = lines.slice(-20); // Last 20 lines
-
-            if (recentLines.length === 0) {
-              return message.reply(`No recent logs found for type: ${logType}`);
-            }
-
-            // Truncate if too long
-            let logContent = recentLines.join('\n');
-            if (logContent.length > 1900) {
-              logContent = logContent.slice(-1900);
-            }
-
-            const recentEmbed = new EmbedBuilder()
-              .setTitle(`📄 Recent ${logType} Logs`)
-              .setDescription(`\`\`\`\n${logContent}\n\`\`\``)
-              .setColor('#f39c12')
-              .setFooter({ text: `Showing last ${recentLines.length} lines from ${filename}` })
-              .setTimestamp();
-
-            await message.reply({ embeds: [recentEmbed] });
+            content = await readFile(join(logger.logsDir, filename), 'utf8');
           } catch (error) {
-            if (error.code === 'ENOENT') {
-              await message.reply(`**Notice:** No log file found for today: ${filename}, Master.`);
-            } else {
-              logger.error('Error reading recent logs', error);
-              await message.reply('**Error:** Failed to read log file, Master.');
-            }
+            if (error.code !== 'ENOENT') throw error;
+            return message.reply({
+              embeds: [await warningEmbed(guildId, 'No Log File', `No **${logType}** log has been written today (\`${filename}\`), Master.`)]
+            });
           }
-          break;
 
-        default:
-          await message.reply('**Usage:** `logs [stats|clean <days>|types|recent <type>]`');
+          const recentLines = content.split('\n').filter(line => line.trim()).slice(-RECENT_LINES);
+          if (recentLines.length === 0) {
+            return message.reply({
+              embeds: [await warningEmbed(guildId, 'No Log Entries', `The **${logType}** log for today is empty, Master.`)]
+            });
+          }
+
+          // Keep the newest text, and stop log content from closing the code block early
+          let logContent = recentLines.join('\n').replace(/```/g, "'''");
+          if (logContent.length > RECENT_MAX_CHARS) logContent = logContent.slice(-RECENT_MAX_CHARS);
+
+          const embed = new EmbedBuilder()
+            .setTitle(`『 Recent ${logType.charAt(0).toUpperCase() + logType.slice(1)} Logs 』`)
+            .setDescription(`\`\`\`\n${logContent}\n\`\`\``)
+            .setColor(COLORS.RAPHAEL)
+            .setFooter({ text: `Showing the last ${recentLines.length} lines of ${filename}` })
+            .setTimestamp();
+
+          return message.reply({ embeds: [embed] });
+        }
+
+        default: {
+          const prefix = await getPrefix(guildId);
+          return message.reply({
+            embeds: [await errorEmbed(guildId, 'Invalid Usage',
+              `${GLYPHS.ARROW_RIGHT} Usage: \`${prefix}botlogs [stats|clean <days>|types|recent <type>]\``)]
+          });
+        }
       }
     } catch (error) {
       logger.error('Logs command error', error);
-      await message.reply('**Error:** An error occurred while processing the logs command, Master.');
+      const embed = await errorEmbed(guildId, 'Log Access Failed',
+        'An anomaly occurred while processing the log request, Master. The incident has been logged.').catch(() => null);
+      return message.reply(embed ? { embeds: [embed] } : { content: '**Alert:** The log request failed, Master.' }).catch(() => null);
     }
   }
 };

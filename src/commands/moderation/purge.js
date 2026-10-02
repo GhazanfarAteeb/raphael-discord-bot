@@ -1,10 +1,18 @@
-import { PermissionFlagsBits } from 'discord.js';
+import { Message, MessageFlags, PermissionFlagsBits } from 'discord.js';
 import { successEmbed, errorEmbed, GLYPHS } from '../../utils/embeds.js';
+import { getPrefix } from '../../utils/helpers.js';
 import logger from '../../utils/logger.js';
-import { getRandomFooter } from '../../utils/raphael.js';
+
+const USER_ID = /^\d{17,20}$/;
+const MAX_PURGE = 100; // Discord's bulk delete and fetch limit
+const BULK_DELETE_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000; // Discord refuses to bulk delete older messages
+const CONFIRMATION_LIFETIME_MS = 5000;
+const MISSING_PERMISSIONS = 50013;
+const MISSING_ACCESS = 50001;
 
 export default {
   name: 'purge',
+  category: 'moderation',
   description: 'Delete multiple messages',
   usage: '<amount> [@user]',
   aliases: ['clean', 'delete'],
@@ -15,61 +23,75 @@ export default {
   cooldown: 3,
 
   async execute(message, args) {
-    if (!args[0]) {
-      const embed = await errorEmbed(message.guild.id, 'Protocol Parameters',
-        `**Notice:** Correct syntax required, Master.\n\`purge <amount> [@user]\``
-      );
-      return message.reply({ embeds: [embed] });
-    }
+    const guildId = message.guild.id;
+    // Bridged slash commands pass a stand-in object; only a real message can be deleted or referenced
+    const isPrefixCommand = message instanceof Message;
 
-    const amount = parseInt(args[0]);
-
-    // Discord max is 100, but we fetch amount+1 to include the command message
-    // So limit to 99 to avoid exceeding 100
-    if (isNaN(amount) || amount < 1 || amount > 99) {
-      const embed = await errorEmbed(message.guild.id, 'Invalid Quantity',
-        `**Warning:** Value must be between 1 and 99, Master.`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    // Check if targeting specific user
-    const targetUser = args[1] ? args[1].replace(/[<@!>]/g, '') : null;
+    // Prefix: the command message is deleted, so confirmations go to the channel and expire.
+    // Slash: the deferred reply is edited.
+    const respond = async (embed, { expire = false } = {}) => {
+      if (!isPrefixCommand) return message.reply({ embeds: [embed] });
+      const sent = await message.channel.send({ embeds: [embed] }).catch(() => null);
+      if (sent && expire) setTimeout(() => sent.delete().catch(() => {}), CONFIRMATION_LIFETIME_MS);
+      return sent;
+    };
 
     try {
-      // Fetch messages (amount + 1 to include the command message)
-      const messages = await message.channel.messages.fetch({ limit: amount + 1 });
+      const prefix = await getPrefix(guildId);
+      const usage = `${GLYPHS.ARROW_RIGHT} Usage: \`${prefix}purge <amount> [@user|user_id]\` — amount from 1 to ${MAX_PURGE}`;
 
-      // Filter messages
-      let toDelete;
-      if (targetUser) {
-        toDelete = messages.filter(m => m.author.id === targetUser);
-      } else {
-        toDelete = messages;
+      const amount = Number(args[0]);
+      if (!args[0] || !Number.isInteger(amount) || amount < 1 || amount > MAX_PURGE) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Invalid Usage', `**Notice:** Specify how many messages to remove, Master.\n\n${usage}`)]
+        });
       }
 
-      // Remove messages older than 14 days (Discord limitation)
-      const twoWeeksAgo = Date.now() - 14 * 24 * 60 * 60 * 1000;
-      toDelete = toDelete.filter(m => m.createdTimestamp > twoWeeksAgo);
+      let targetUserId = null;
+      if (args[1]) {
+        targetUserId = args[1].replace(/[<@!>]/g, '');
+        if (!USER_ID.test(targetUserId)) {
+          return message.reply({
+            embeds: [await errorEmbed(guildId, 'Invalid Usage', `**Warning:** The user filter must be a mention or a user ID, Master.\n\n${usage}`)]
+          });
+        }
+      }
 
-      // Bulk delete
+      // Look back over the last 100 messages (before the command itself), then keep the
+      // newest `amount` that match: a user filter would otherwise only scan `amount` messages
+      const fetched = await message.channel.messages.fetch(
+        isPrefixCommand ? { limit: MAX_PURGE, before: message.id } : { limit: MAX_PURGE }
+      );
+      const cutoff = Date.now() - BULK_DELETE_MAX_AGE_MS;
+      const toDelete = [...fetched.values()]
+        .filter(m => !m.pinned)
+        .filter(m => !m.flags.has(MessageFlags.Loading)) // the slash command's own pending reply
+        .filter(m => m.createdTimestamp > cutoff)
+        .filter(m => !targetUserId || m.author.id === targetUserId)
+        .slice(0, amount);
+
+      // The command message is removed but not counted
+      if (isPrefixCommand) await message.delete().catch(() => {});
+
+      if (toDelete.length === 0) {
+        return respond(await errorEmbed(guildId, 'Nothing to Purge',
+          `**Notice:** No eligible messages${targetUserId ? ` from <@${targetUserId}>` : ''} were found among the last ${MAX_PURGE}, Master. ` +
+          'Pinned messages and messages older than 14 days are skipped.'), { expire: true });
+      }
+
       const deleted = await message.channel.bulkDelete(toDelete, true);
 
-      const embed = await successEmbed(message.guild.id, 'Data Purge Complete',
-        `**Confirmed:** Removed **${deleted.size}** message records${targetUser ? ` from <@${targetUser}>` : ''}, Master.`
-      );
-
-      const reply = await message.channel.send({ embeds: [embed] });
-
-      // Delete confirmation after 5 seconds
-      setTimeout(() => reply.delete().catch(() => { }), 5000);
-
+      return respond(await successEmbed(guildId, 'Data Purge Complete',
+        `**Confirmed:** Removed **${deleted.size}** message${deleted.size === 1 ? '' : 's'}${targetUserId ? ` from <@${targetUserId}>` : ''}, Master.`
+      ), { expire: true });
     } catch (error) {
-      logger.error('Error purging messages:', error);
-      const embed = await errorEmbed(message.guild.id, 'Purge Protocol Failed',
-        `**Warning:** Unable to remove messages, Master. They may exceed the 14-day threshold.`
-      );
-      return message.reply({ embeds: [embed] });
+      logger.error('[Purge] Command failed', error);
+      const description = error.code === MISSING_PERMISSIONS || error.code === MISSING_ACCESS
+        ? 'I lack permission to read or delete messages in this channel, Master.'
+        : 'An anomaly interrupted the purge, Master. The incident has been logged.';
+      const embed = await errorEmbed(guildId, 'Purge Protocol Failed', description).catch(() => null);
+      if (!embed) return null;
+      return respond(embed).catch(() => null);
     }
   }
 };

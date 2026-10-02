@@ -1,12 +1,20 @@
-import { PermissionFlagsBits, SlashCommandBuilder } from 'discord.js';
+import { PermissionFlagsBits } from 'discord.js';
 import ModLog from '../../models/ModLog.js';
 import Guild from '../../models/Guild.js';
-import { successEmbed, errorEmbed, modLogEmbed, GLYPHS } from '../../utils/embeds.js';
+import { successEmbed, errorEmbed, modLogEmbed, GLYPHS, COLORS } from '../../utils/embeds.js';
+import { getPrefix, truncate } from '../../utils/helpers.js';
 import logger from '../../utils/logger.js';
-import { getPrefix } from '../../utils/helpers.js';
+
+const USER_ID = /^\d{17,20}$/;
+const EMBED_REASON_LIMIT = 1000;
+const AUDIT_REASON_LIMIT = 512;
+// Discord API codes for "not in this server" and "no such user"
+const UNKNOWN_MEMBER = 10007;
+const UNKNOWN_USER = 10013;
 
 export default {
   name: 'untimeout',
+  category: 'moderation',
   description: 'Remove timeout from a member',
   usage: '<@user|user_id> [reason]',
   aliases: ['unmute', 'removetimeout', 'cleartimeout'],
@@ -16,278 +24,164 @@ export default {
   },
   cooldown: 3,
 
-  // Slash command data
-  slashCommand: true,
-  data: new SlashCommandBuilder()
-    .setName('untimeout')
-    .setDescription('Remove timeout from a member')
-    .addUserOption(option =>
-      option.setName('user')
-        .setDescription('The user to remove timeout from')
-        .setRequired(true))
-    .addStringOption(option =>
-      option.setName('reason')
-        .setDescription('Reason for removing the timeout')
-        .setRequired(false))
-    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
-
   async execute(message, args) {
-    const prefix = await getPrefix(message.guild.id);
-    if (!args[0]) {
-      const embed = await errorEmbed(message.guild.id, 'Invalid Usage',
-        `${GLYPHS.ARROW_RIGHT} Usage: \`untimeout <@user|user_id> [reason]\`\n\n` +
-        `**Examples:**\n` +
-        `${GLYPHS.DOT} \`${prefix}untimeout @User\`\n` +
-        `${GLYPHS.DOT} \`${prefix}unmute @User Appeal accepted\``
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    const userId = args[0].replace(/[<@!>]/g, '');
-    // Force fetch to bypass cache and get fresh member data
-    const targetMember = await message.guild.members.fetch({ user: userId, force: true }).catch(() => null);
-
-    if (!targetMember) {
-      const embed = await errorEmbed(message.guild.id, 'User Not Found',
-        `${GLYPHS.ERROR} Could not find that user.`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    // Check if target is the server owner (owners can't be timed out anyway)
-    if (targetMember.id === message.guild.ownerId) {
-      const embed = await errorEmbed(message.guild.id, 'Cannot Modify Owner',
-        `${GLYPHS.ERROR} The server owner cannot be timed out or have timeouts removed.`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    if (!targetMember.moderatable) {
-      const botMember = message.guild.members.me;
-      const isRoleIssue = targetMember.roles.highest.position >= botMember.roles.highest.position;
-      
-      // Log detailed permission info for debugging
-      logger.info(`[Untimeout Debug] Cannot modify user in ${message.guild.name}`);
-      logger.info(`  Target: ${targetMember.user.tag} (${targetMember.id})`);
-      logger.info(`  Target highest role: ${targetMember.roles.highest.name} (pos: ${targetMember.roles.highest.position})`);
-      logger.info(`  Target role permissions: ${targetMember.roles.highest.permissions.bitfield}`);
-      logger.info(`  Bot highest role: ${botMember.roles.highest.name} (pos: ${botMember.roles.highest.position})`);
-      logger.info(`  Bot role permissions: ${botMember.roles.highest.permissions.bitfield}`);
-      logger.info(`  Bot has Admin: ${botMember.permissions.has('Administrator')}`);
-      logger.info(`  Bot has ModerateMembers: ${botMember.permissions.has('ModerateMembers')}`);
-      logger.info(`  Target is moderatable: ${targetMember.moderatable}`);
-      logger.info(`  All target roles: ${targetMember.roles.cache.map(r => `${r.name}(${r.position})`).join(', ')}`);
-      logger.info(`  All bot roles: ${botMember.roles.cache.map(r => `${r.name}(${r.position})`).join(', ')}`);
-      
-      const embed = await errorEmbed(message.guild.id, 'Cannot Modify',
-        `${GLYPHS.ERROR} I cannot modify this user.\n\n` +
-        `**Debug Info:**\n` +
-        `${GLYPHS.DOT} My highest role: \`${botMember.roles.highest.name}\` (pos: ${botMember.roles.highest.position})\n` +
-        `${GLYPHS.DOT} Their highest role: \`${targetMember.roles.highest.name}\` (pos: ${targetMember.roles.highest.position})\n` +
-        `${GLYPHS.DOT} Bot has Admin: ${botMember.permissions.has('Administrator') ? 'Yes' : 'No'}\n\n` +
-        `**Issue:** ${isRoleIssue ? 'Their role is higher or equal to mine.' : 'Unknown - check Discord permissions.'}`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    // Check if user is actually timed out
-    if (!targetMember.isCommunicationDisabled()) {
-      const embed = await errorEmbed(message.guild.id, 'Not Timed Out',
-        `${GLYPHS.ERROR} ${targetMember.user.tag} is not currently timed out.`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    const reason = args.slice(1).join(' ') || 'No reason provided';
+    const guildId = message.guild.id;
 
     try {
-      // Remove the timeout
-      await targetMember.timeout(null, `${reason} | Removed by ${message.author.tag}`);
-
-      // Get guild config and remove muted role if configured
-      const guildConfig = await Guild.getGuild(message.guild.id, message.guild.name);
-      
-      if (guildConfig.roles?.mutedRole) {
-        const mutedRole = message.guild.roles.cache.get(guildConfig.roles.mutedRole);
-        if (mutedRole && targetMember.roles.cache.has(mutedRole.id)) {
-          try {
-            await targetMember.roles.remove(mutedRole, `${reason} | Removed by ${message.author.tag}`);
-          } catch (err) {
-            logger.warn(`[Untimeout] Failed to remove muted role: ${err.message}`);
-          }
-        }
+      const userId = args[0]?.replace(/[<@!>]/g, '');
+      if (!userId || !USER_ID.test(userId)) {
+        const prefix = await getPrefix(guildId);
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Invalid Usage',
+            `${GLYPHS.ARROW_RIGHT} Usage: \`${prefix}untimeout <@user|user_id> [reason]\`\n\n` +
+            `**Examples:**\n` +
+            `${GLYPHS.DOT} \`${prefix}untimeout @User\`\n` +
+            `${GLYPHS.DOT} \`${prefix}unmute @User Appeal accepted\``)]
+        });
       }
 
-      // Log to mod log channel
-      const modLogChannel = guildConfig.channels?.modLogChannel;
+      if (userId === message.guild.ownerId) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Permission Denied', 'The server owner cannot be timed out, so there is nothing to remove, Master.')]
+        });
+      }
 
-      // Get next case number
-      const caseNumber = await ModLog.getNextCaseNumber(message.guild.id);
+      const targetMember = await fetchMember(message.guild, userId);
+      if (!targetMember) {
+        return message.reply({ embeds: [await errorEmbed(guildId, 'User Not Found', 'That user is not a member of this server, Master.')] });
+      }
 
-      if (modLogChannel) {
-        const logChannel = message.guild.channels.cache.get(modLogChannel);
+      if (!targetMember.moderatable) {
+        return message.reply({ embeds: [await errorEmbed(guildId, 'Cannot Modify', botLimitReason(targetMember))] });
+      }
+      if (!outranks(message.member, targetMember)) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Permission Denied',
+            'Their highest role is equal to or above yours, so you cannot moderate them, Master.')]
+        });
+      }
+
+      const targetUser = targetMember.user;
+      if (!targetMember.isCommunicationDisabled()) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'No Active Timeout', `**Notice:** **${targetUser.tag}** is not currently timed out, Master.`)]
+        });
+      }
+
+      const reason = truncate(args.slice(1).join(' ').trim() || 'No reason provided', EMBED_REASON_LIMIT);
+      const auditReason = truncate(`${reason} | Removed by ${message.author.tag}`, AUDIT_REASON_LIMIT);
+      const guildConfig = await Guild.getGuild(guildId, message.guild.name);
+
+      try {
+        await targetMember.timeout(null, auditReason);
+      } catch (error) {
+        logger.error(`[Untimeout] Discord rejected the timeout removal for ${userId} in ${guildId}`, error);
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Timeout Removal Failed', 'Discord rejected the request, Master. The incident has been logged.')]
+        });
+      }
+
+      const mutedRole = guildConfig?.roles?.mutedRole ? message.guild.roles.cache.get(guildConfig.roles.mutedRole) : null;
+      if (mutedRole && targetMember.roles.cache.has(mutedRole.id)) {
+        await targetMember.roles.remove(mutedRole, auditReason)
+          .catch(err => logger.warn(`[Untimeout] Failed to remove muted role: ${err.message}`));
+      }
+
+      const caseNumber = await recordCase(message, targetUser, reason);
+
+      // Mod log channel
+      try {
+        const channelId = guildConfig?.channels?.modLog;
+        const logChannel = channelId ? message.guild.channels.cache.get(channelId) : null;
         if (logChannel) {
-          const logEmbed = await modLogEmbed(message.guild.id, 'untimeout', {
-            caseNumber,
+          const logEmbed = await modLogEmbed(guildId, 'untimeout', {
+            caseNumber: caseNumber ?? '—',
             moderatorTag: message.author.tag,
-            targetTag: targetMember.user.tag,
-            targetId: targetMember.id,
-            reason: reason
+            targetTag: targetUser.tag,
+            targetId: targetUser.id,
+            reason
           });
-          logEmbed.setColor(0x57F287); // Green for removal
-          await logChannel.send({ embeds: [logEmbed] }).catch(() => { });
+          logEmbed.setColor(COLORS.RAPHAEL_SUCCESS);
+          await logChannel.send({ embeds: [logEmbed] });
         }
+      } catch (error) {
+        logger.warn(`[Untimeout] Failed to post to the mod log in ${guildId}: ${error.message}`);
       }
 
-      // Create mod log entry
-      await ModLog.create({
-        guildId: message.guild.id,
-        caseNumber,
-        moderatorId: message.author.id,
-        moderatorTag: message.author.tag,
-        targetId: targetMember.id,
-        targetTag: targetMember.user.tag,
-        action: 'untimeout',
-        reason: reason
-      });
-
-      // Try to DM the user
       try {
-        const dmEmbed = await successEmbed(message.guild.id, '🔔 Timeout Removed',
-          `Your timeout in **${message.guild.name}** has been removed.\n\n` +
-          `**Reason:** ${reason}\n` +
-          `**Removed by:** ${message.author.tag}`
+        const dmEmbed = await successEmbed(guildId, 'Timeout Lifted',
+          `**Notice:** Your timeout in **${message.guild.name}** has been removed.\n\n` +
+          `${GLYPHS.ARROW_RIGHT} **Reason:** ${reason}\n` +
+          `${GLYPHS.ARROW_RIGHT} **Moderator:** ${message.author.tag}`
         );
         await targetMember.send({ embeds: [dmEmbed] });
-      } catch (err) {
-        // User has DMs disabled
+      } catch {
+        // DMs closed
       }
 
-      const embed = await successEmbed(message.guild.id, '🔔 Timeout Removed',
-        `${GLYPHS.SUCCESS} Successfully removed timeout from **${targetMember.user.tag}**\n\n` +
-        `**Reason:** ${reason}`
+      const embed = await successEmbed(guildId, 'Restriction Lifted',
+        `**Confirmed:** Communication restriction removed from **${targetUser.tag}**, Master.\n\n` +
+        `${GLYPHS.ARROW_RIGHT} **Reason:** ${reason}\n` +
+        (caseNumber
+          ? `${GLYPHS.ARROW_RIGHT} **Case Reference:** #${caseNumber}`
+          : `${GLYPHS.ERROR} The case record could not be saved. The incident has been logged.`)
       );
       return message.reply({ embeds: [embed] });
-
     } catch (error) {
-      console.error('Error removing timeout:', error);
-      const embed = await errorEmbed(message.guild.id, 'Error',
-        `${GLYPHS.ERROR} Failed to remove timeout. Please try again.`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-  },
-
-  // Slash command execution
-  async executeSlash(interaction) {
-    // Force fetch member for fresh data
-    const userId = interaction.options.getUser('user')?.id;
-    const targetMember = userId 
-      ? await interaction.guild.members.fetch({ user: userId, force: true }).catch(() => null)
-      : null;
-    const reason = interaction.options.getString('reason') || 'No reason provided';
-
-    if (!targetMember) {
-      const embed = await errorEmbed(interaction.guild.id, 'User Not Found',
-        `${GLYPHS.ERROR} Could not find that user in this server.`
-      );
-      return interaction.reply({ embeds: [embed], ephemeral: true });
-    }
-
-    if (!targetMember.moderatable) {
-      const botMember = interaction.guild.members.me;
-      const embed = await errorEmbed(interaction.guild.id, 'Cannot Modify',
-        `${GLYPHS.ERROR} I cannot modify this user.\n\n` +
-        `**Possible reasons:**\n` +
-        `${GLYPHS.DOT} My highest role: \`${botMember.roles.highest.name}\` (pos: ${botMember.roles.highest.position})\n` +
-        `${GLYPHS.DOT} Their highest role: \`${targetMember.roles.highest.name}\` (pos: ${targetMember.roles.highest.position})`
-      );
-      return interaction.reply({ embeds: [embed], ephemeral: true });
-    }
-
-    // Check if user is actually timed out
-    if (!targetMember.isCommunicationDisabled()) {
-      const embed = await errorEmbed(interaction.guild.id, 'Not Timed Out',
-        `${GLYPHS.ERROR} ${targetMember.user.tag} is not currently timed out.`
-      );
-      return interaction.reply({ embeds: [embed], ephemeral: true });
-    }
-
-    try {
-      // Remove the timeout
-      await targetMember.timeout(null, `${reason} | Removed by ${interaction.user.tag}`);
-
-      // Get guild config and remove muted role if configured
-      const guildConfig = await Guild.getGuild(interaction.guild.id, interaction.guild.name);
-      
-      if (guildConfig.roles?.mutedRole) {
-        const mutedRole = interaction.guild.roles.cache.get(guildConfig.roles.mutedRole);
-        if (mutedRole && targetMember.roles.cache.has(mutedRole.id)) {
-          try {
-            await targetMember.roles.remove(mutedRole, `${reason} | Removed by ${interaction.user.tag}`);
-          } catch (err) {
-            logger.warn(`[Untimeout Slash] Failed to remove muted role: ${err.message}`);
-          }
-        }
-      }
-
-      // Log to mod log channel
-      const modLogChannel = guildConfig.channels?.modLogChannel;
-
-      // Get next case number
-      const caseNumber = await ModLog.getNextCaseNumber(interaction.guild.id);
-
-      if (modLogChannel) {
-        const logChannel = interaction.guild.channels.cache.get(modLogChannel);
-        if (logChannel) {
-          const logEmbed = await modLogEmbed(interaction.guild.id, 'untimeout', {
-            caseNumber,
-            moderatorTag: interaction.user.tag,
-            targetTag: targetMember.user.tag,
-            targetId: targetMember.id,
-            reason: reason
-          });
-          logEmbed.setColor(0x57F287);
-          await logChannel.send({ embeds: [logEmbed] }).catch(() => { });
-        }
-      }
-
-      // Create mod log entry
-      await ModLog.create({
-        guildId: interaction.guild.id,
-        caseNumber,
-        moderatorId: interaction.user.id,
-        moderatorTag: interaction.user.tag,
-        targetId: targetMember.id,
-        targetTag: targetMember.user.tag,
-        action: 'untimeout',
-        reason: reason
-      });
-
-      // Try to DM the user
-      try {
-        const dmEmbed = await successEmbed(interaction.guild.id, '🔔 Timeout Removed',
-          `Your timeout in **${interaction.guild.name}** has been removed.\n\n` +
-          `**Reason:** ${reason}\n` +
-          `**Removed by:** ${interaction.user.tag}`
-        );
-        await targetMember.send({ embeds: [dmEmbed] });
-      } catch (err) {
-        // User has DMs disabled
-      }
-
-      const embed = await successEmbed(interaction.guild.id, '🔔 Timeout Removed',
-        `${GLYPHS.SUCCESS} Successfully removed timeout from **${targetMember.user.tag}**\n\n` +
-        `**Reason:** ${reason}`
-      );
-      return interaction.reply({ embeds: [embed] });
-
-    } catch (error) {
-      console.error('Error removing timeout:', error);
-      const embed = await errorEmbed(interaction.guild.id, 'Error',
-        `${GLYPHS.ERROR} Failed to remove timeout. Please try again.`
-      );
-      return interaction.reply({ embeds: [embed], ephemeral: true });
+      logger.error('[Untimeout] Command failed', error);
+      const embed = await errorEmbed(guildId, 'Timeout Removal Failed',
+        'An anomaly interrupted the request, Master. The incident has been logged.').catch(() => null);
+      return message.reply(embed ? { embeds: [embed] } : { content: '**Alert:** The timeout could not be removed, Master.' }).catch(() => null);
     }
   }
 };
+
+// The member, or null when they are not in the server; other lookup failures are rethrown
+async function fetchMember(guild, userId) {
+  try {
+    return await guild.members.fetch({ user: userId, force: true });
+  } catch (error) {
+    if (error.code === UNKNOWN_MEMBER || error.code === UNKNOWN_USER) return null;
+    throw error;
+  }
+}
+
+// Server owner and Administrators may act on anyone; others only below their own top role
+function outranks(moderator, target) {
+  if (moderator.id === moderator.guild.ownerId) return true;
+  if (moderator.permissions.has(PermissionFlagsBits.Administrator)) return true;
+  return target.roles.highest.position < moderator.roles.highest.position;
+}
+
+function botLimitReason(target) {
+  if (target.id === target.guild.members.me.id) return 'I cannot modify my own timeout, Master.';
+  if (target.permissions.has(PermissionFlagsBits.Administrator)) {
+    return 'Members with the Administrator permission are exempt from timeouts, so there is nothing for me to remove, Master.';
+  }
+  const me = target.guild.members.me;
+  return target.roles.highest.position >= me.roles.highest.position
+    ? 'Their highest role is equal to or above mine, so I cannot moderate them, Master. Move my role above theirs in Server Settings › Roles.'
+    : 'Discord does not permit me to moderate this member, Master.';
+}
+
+// Case record, written only after the timeout was removed. Returns the case number, or null
+// if it could not be saved (the removal itself stands either way).
+async function recordCase(message, user, reason) {
+  try {
+    const caseNumber = await ModLog.getNextCaseNumber(message.guild.id);
+    await ModLog.create({
+      guildId: message.guild.id,
+      caseNumber,
+      action: 'untimeout',
+      moderatorId: message.author.id,
+      moderatorTag: message.author.tag,
+      targetId: user.id,
+      targetTag: user.tag,
+      reason
+    });
+    return caseNumber;
+  } catch (error) {
+    logger.error(`[Untimeout] Failed to save the case for ${user.id} in ${message.guild.id}`, error);
+    return null;
+  }
+}
