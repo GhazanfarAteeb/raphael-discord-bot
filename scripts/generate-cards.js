@@ -67,36 +67,21 @@ function drawFrame(ctx) {
   ctx.stroke();
 }
 
-function drawCorner(ctx, value, suit) {
-  // Cards render ~22px tall inside embeds, so the corner index is oversized
-  const valueSize = value === '10' ? 46 : 56;
-  ctx.fillStyle = SUIT_COLOR[suit];
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'top';
-  ctx.font = `bold ${valueSize}px ${FONT}`;
-  ctx.fillText(value, 40, 16);
-  ctx.font = `bold 34px ${FONT}`;
-  ctx.fillText(SUIT_SYMBOL[suit], 40, 16 + valueSize);
-}
-
+// Emojis render at roughly 16x22px inside embeds, so the face is just a large
+// value over a large suit: anything smaller (corner pips) is unreadable there
 function drawFace(ctx, value, suit) {
   roundRect(ctx, 0, 0, W, H, RADIUS);
   ctx.fillStyle = '#fdfbf4';
   ctx.fill();
   drawFrame(ctx);
 
-  drawCorner(ctx, value, suit);
-  ctx.save();
-  ctx.translate(W, H);
-  ctx.rotate(Math.PI);
-  drawCorner(ctx, value, suit);
-  ctx.restore();
-
   ctx.fillStyle = SUIT_COLOR[suit];
   ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.font = `bold ${value === 'A' ? 124 : 96}px ${FONT}`;
-  ctx.fillText(SUIT_SYMBOL[suit], W / 2, H / 2 + 4);
+  ctx.textBaseline = 'alphabetic';
+  ctx.font = `bold ${value === '10' ? 100 : 124}px ${FONT}`;
+  ctx.fillText(value, W / 2, 128);
+  ctx.font = `bold 118px ${FONT}`;
+  ctx.fillText(SUIT_SYMBOL[suit], W / 2, 246);
 }
 
 function drawBack(ctx, art) {

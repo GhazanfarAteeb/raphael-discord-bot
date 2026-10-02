@@ -48,6 +48,10 @@ export const REPUTATION_AMOUNT = 1; // +1 rep per give
 export const COINFLIP_MIN = 10;
 export const COINFLIP_MAX = 10000;
 
+// Blackjack bet limits ('all'/'max' bet up to BLACKJACK_MAX)
+export const BLACKJACK_MIN = 10;
+export const BLACKJACK_MAX = 10000;
+
 export const SLOTS_MIN = 10;
 export const SLOTS_MAX = 5000;
 export const SLOTS_EMOJIS = ['🍒', '🍋', '🍊', '🍉', '💎', '7️⃣', '🔔'];

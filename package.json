@@ -11,7 +11,8 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "test-encryption": "node test-encryption.js",
     "debug-voice": "node debug-voice-deps.js",
-    "cards": "node scripts/generate-cards.js"
+    "cards": "node scripts/generate-cards.js",
+    "cards:upload": "node scripts/upload-card-emojis.js"
   },
   "repository": {
     "type": "git",
