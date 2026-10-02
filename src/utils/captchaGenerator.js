@@ -1,4 +1,5 @@
 import { createCanvas } from '@napi-rs/canvas';
+import './fonts.js';
 
 /**
  * Generate a captcha image with distortion and noise

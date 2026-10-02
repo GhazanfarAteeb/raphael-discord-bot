@@ -1,18 +1,11 @@
 import { AttachmentBuilder, EmbedBuilder } from 'discord.js';
-import { createCanvas, loadImage, GlobalFonts } from '@napi-rs/canvas';
+import { createCanvas, loadImage } from '@napi-rs/canvas';
+import '../../utils/fonts.js';
 import Economy from '../../models/Economy.js';
 import Member from '../../models/Member.js';
 import Level from '../../models/Level.js';
 import Guild from '../../models/Guild.js';
 import { getBackground } from '../../utils/shopItems.js';
-
-// Register fonts if available
-try {
-  GlobalFonts.registerFromPath('./assets/fonts/Poppins-Bold.ttf', 'Poppins Bold');
-  GlobalFonts.registerFromPath('./assets/fonts/Poppins-Regular.ttf', 'Poppins');
-} catch (error) {
-  console.log('Custom fonts not found, using system fonts');
-}
 
 // Helper function to convert hex to rgba
 function hexToRgba(hex, opacity) {

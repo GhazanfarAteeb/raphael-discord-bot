@@ -1,5 +1,6 @@
 import { AttachmentBuilder, EmbedBuilder } from 'discord.js';
 import { createCanvas, loadImage } from '@napi-rs/canvas';
+import '../../utils/fonts.js';
 import { getPrefix } from '../../utils/helpers.js';
 
 const memeTemplates = {

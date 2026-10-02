@@ -21,7 +21,10 @@ RUN apk add --no-cache \
     pango-dev \
     libjpeg-turbo-dev \
     giflib-dev \
-    librsvg-dev
+    librsvg-dev \
+    # Alpine ships no fonts, so canvas text (profile, level, captcha, meme)
+    # renders blank. Liberation Sans is metric-compatible with Arial.
+    font-liberation
 
 WORKDIR /app
 
