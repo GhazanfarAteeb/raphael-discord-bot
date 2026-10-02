@@ -146,7 +146,19 @@ const guildSchema = new mongoose.Schema({
       message: { type: String, default: 'Welcome {user} to {server}!' },
       embedEnabled: { type: Boolean, default: true },
       dmWelcome: { type: Boolean, default: false },
-      bannerUrl: String // Optional banner image for welcome embed
+      bannerUrl: String, // Optional banner image for welcome embed
+      // Embed customisation set by the welcome command. No defaults on purpose:
+      // buildWelcomeEmbed (config/welcome.js) supplies the fallback for unset values.
+      embedColor: String,
+      embedTitle: String,
+      thumbnailType: String, // avatar | server | custom
+      thumbnailUrl: String,
+      footerText: String,
+      authorType: String, // username | displayname | server | none
+      showTimestamp: Boolean,
+      mentionUser: Boolean,
+      greetingText: String,
+      autoRole: String // Role given to new members on join
     },
     boostSystem: {
       enabled: { type: Boolean, default: false },
