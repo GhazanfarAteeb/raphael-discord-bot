@@ -1,7 +1,7 @@
 import { PermissionFlagsBits, EmbedBuilder, ChannelType } from 'discord.js';
 import Guild from '../../models/Guild.js';
 import { successEmbed, errorEmbed, infoEmbed, GLYPHS } from '../../utils/embeds.js';
-import { hasModPerms, getPrefix } from '../../utils/helpers.js';
+import { hasModPerms, getPrefix, getAssignableRoleError } from '../../utils/helpers.js';
 
 export default {
   name: 'birthdayconfig',
@@ -105,6 +105,11 @@ export default {
               `\`${prefix}birthdayconfig role none\` - Remove birthday role\n\n` +
               `This role will be given to users on their birthday and removed the next day.`)]
           });
+        }
+
+        const roleError = getAssignableRoleError(role, message.member);
+        if (roleError) {
+          return message.reply({ embeds: [await errorEmbed(message.guild.id, 'Role Not Allowed', roleError)] });
         }
 
         await Guild.updateGuild(message.guild.id, {

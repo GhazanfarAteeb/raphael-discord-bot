@@ -1,7 +1,7 @@
 import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionFlagsBits } from 'discord.js';
 import Guild from '../../models/Guild.js';
 import Verification from '../../models/Verification.js';
-import { getPrefix } from '../../utils/helpers.js';
+import { getPrefix, getAssignableRoleError } from '../../utils/helpers.js';
 import { logManualVerification } from '../../events/client/verificationHandler.js';
 
 export default {
@@ -96,6 +96,10 @@ export default {
 
           roleCollector.on('collect', async roleMsg => {
             const role = roleMsg.mentions.roles.first();
+            const roleError = getAssignableRoleError(role, message.member);
+            if (roleError) {
+              return roleMsg.reply(`**Error:** ${roleError} Run the setup again with a different role.`);
+            }
             await Guild.updateGuild(guildId, {
               $set: {
                 'features.verificationSystem.role': role.id,
@@ -222,6 +226,8 @@ export default {
           case 'role':
             const role = message.mentions.roles.first();
             if (!role) return message.reply('**Error:** Please mention a role, Master.');
+            const roleError = getAssignableRoleError(role, message.member);
+            if (roleError) return message.reply(`**Error:** ${roleError}`);
             await Guild.updateGuild(guildId, {
               $set: {
                 'features.verificationSystem.role': role.id,

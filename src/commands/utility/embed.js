@@ -50,6 +50,14 @@ export default {
                 });
             }
             
+            // The sender must be able to post there themselves; the bot is not a way around channel permissions
+            const senderPerms = targetChannel.permissionsFor(message.member);
+            if (!senderPerms?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks])) {
+                return message.reply({
+                    embeds: [await errorEmbed(guildId, 'Access Denied', `You cannot post embeds in ${targetChannel}, Master.`)]
+                });
+            }
+            
             const template = await EmbedTemplate.findOne({ guildId, name: embedName });
             
             if (!template) {
@@ -69,7 +77,11 @@ export default {
             
             await targetChannel.send({
                 content: template.content ? template.replaceVariables(template.content, { user: message.author, guild: message.guild, channel: targetChannel }) : null,
-                embeds: [embed]
+                embeds: [embed],
+                // @everyone/@here and role pings only for members allowed to make them in that channel
+                allowedMentions: senderPerms.has(PermissionFlagsBits.MentionEveryone)
+                    ? { parse: ['users', 'roles', 'everyone'] }
+                    : { parse: ['users'] }
             });
             
             // Update usage stats

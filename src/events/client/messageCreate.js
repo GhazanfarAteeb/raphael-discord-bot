@@ -3,6 +3,7 @@ import Event from "../../structures/Event.js";
 import { ChannelType, Collection, PermissionFlagsBits } from "discord.js";
 import Context from "../../structures/Context.js";
 import { Raphael, getRandomFooter } from "../../utils/raphael.js";
+import { hasModPerms } from "../../utils/helpers.js";
 
 class MessageCreate extends Event {
   constructor(client, file) {
@@ -66,6 +67,9 @@ class MessageCreate extends Event {
       this.client.commands.get(this.client.aliases.get(cmd));
     if (!command) return;
 
+    // Owner-only commands are bot-wide tools (server invites, bot logs); ignore everyone else
+    if (command.ownerOnly && message.author.id !== process.env.BOT_OWNER_ID) return;
+
     // Check channel restrictions (skip for config commands to prevent lockout)
     const guildConfig = await this.client.db.getGuild(message.guildId);
 
@@ -114,6 +118,17 @@ class MessageCreate extends Event {
 
     const ctx = new Context(message, args);
     ctx.setArgs(args);
+    // Array form lists the Discord permissions a member needs. Configured
+    // admin/moderator/staff roles also qualify, matching the commands' own checks.
+    if (
+      Array.isArray(command.permissions) &&
+      !message.member.permissions.has(command.permissions) &&
+      !hasModPerms(message.member, guildConfig)
+    ) {
+      return await safeReply({
+        content: "**Notice:** Your authority level is insufficient for this skill, Master.",
+      });
+    }
     if (command.permissions) {
       if (command.permissions.client) {
         if (
@@ -253,9 +268,10 @@ class MessageCreate extends Event {
       });
     try {
       if (command.run) {
-        return command.run(this.client, ctx, ctx.args);
+        return await command.run(this.client, ctx, ctx.args);
       } else if (command.execute) {
-        return command.execute(message, args, this.client);
+        // Awaited so errors from async commands reach the catch below
+        return await command.execute(message, args, this.client);
       }
     } catch (error) {
       this.client.logger.error(error);

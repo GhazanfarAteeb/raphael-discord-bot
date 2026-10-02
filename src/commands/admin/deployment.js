@@ -7,6 +7,7 @@ export default {
   description: 'Log deployment and build information',
   usage: 'deployment [start|complete|rollback]',
   category: 'admin',
+  ownerOnly: true, // bot-wide: reads and changes the bot's own logs
   permissions: [PermissionFlagsBits.Administrator],
   execute: async (message, args) => {
     const guildConfig = await Guild.getGuild(message.guild.id);

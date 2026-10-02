@@ -1,6 +1,7 @@
 import { Events, Collection, PermissionFlagsBits, MessageFlags, GuildOnboardingPromptType } from 'discord.js';
 import logger from '../../utils/logger.js';
 import Guild from '../../models/Guild.js';
+import { hasModPerms, isServerAdmin, normalizeAntiNukeAction } from '../../utils/helpers.js';
 
 export default {
   name: Events.InteractionCreate,
@@ -56,6 +57,36 @@ export default {
         flags: MessageFlags.Ephemeral
       }).catch(console.error);
       return;
+    }
+
+    // Same gates as the prefix dispatcher: owner-only tools, then array-form permissions
+    if (command.ownerOnly && interaction.user.id !== process.env.BOT_OWNER_ID) {
+      return interaction.reply({
+        content: '**Notice:** This skill is reserved for my creator, Master.',
+        flags: MessageFlags.Ephemeral
+      });
+    }
+    if (
+      Array.isArray(command.permissions) &&
+      !interaction.member.permissions.has(command.permissions) &&
+      !hasModPerms(interaction.member, guildConfig)
+    ) {
+      return interaction.reply({
+        content: '**Notice:** Your authority level is insufficient for this skill, Master.',
+        flags: MessageFlags.Ephemeral
+      });
+    }
+    if (command.permissions?.user && !interaction.member.permissions.has(command.permissions.user)) {
+      return interaction.reply({
+        content: '**Notice:** Your authority level is insufficient for this skill, Master.',
+        flags: MessageFlags.Ephemeral
+      });
+    }
+    if (command.permissions?.client && !interaction.guild.members.me.permissions.has(command.permissions.client)) {
+      return interaction.reply({
+        content: '**Alert:** I lack the required permissions to execute this skill, Master.',
+        flags: MessageFlags.Ephemeral
+      });
     }
 
     try {
@@ -196,10 +227,11 @@ async function handleSpecialCommand(interaction, client, guildConfig, hasAdminRo
   const manageGuildCommands = ['feature'];
 
   // Commands that moderators/staff can use (not just admins)
-  const moderatorCommands = ['welcome', 'giveaway', 'automod', 'logs', 'noxp', 'manageshop', 'award', 'confession', 'cmdchannels', 'setoverlay', 'lockdown', 'verify', 'birthdaysettings', 'setbirthday', 'feature'];
+  const moderatorCommands = ['welcome', 'giveaway', 'automod', 'logs', 'noxp', 'manageshop', 'confession', 'cmdchannels', 'setoverlay', 'verify', 'birthdaysettings', 'setbirthday', 'feature'];
 
   // Admin-only commands (require Administrator or admin role)
-  const adminOnlyCommands = ['setup', 'setrole', 'setchannel', 'config', 'slashcommands', 'autorole', 'refreshcache'];
+  // award mints currency/XP and lockdown rewrites every channel: admin-only, as in their prefix versions
+  const adminOnlyCommands = ['setup', 'setrole', 'setchannel', 'config', 'slashcommands', 'autorole', 'refreshcache', 'award', 'lockdown'];
 
   // Check permissions based on command type
   if (adminOnlyCommands.includes(interaction.commandName)) {
@@ -420,8 +452,15 @@ async function handleAutomodCommand(interaction, guildConfig) {
       break;
 
     case 'antinuke':
+      // Owner/Administrator only: staff roles must not be able to disable anti-nuke
+      if (!isServerAdmin(interaction.member)) {
+        return interaction.editReply({
+          embeds: [await errorEmbed(interaction.guild.id, 'Permission Denied',
+            'Anti-nuke can only be configured by the server owner or an Administrator, Master.')]
+        });
+      }
       const nukeEnabled = interaction.options.getBoolean('enabled');
-      const nukeAction = interaction.options.getString('action');
+      const nukeAction = normalizeAntiNukeAction(interaction.options.getString('action'));
 
       // Ensure antiNuke is an object (fix for legacy boolean values)
       // Ensure antiNuke is an object (fix for legacy boolean values)
@@ -887,10 +926,24 @@ async function handleLockdownCommand(interaction, guildConfig) {
 }
 
 async function handleSetroleCommand(interaction, guildConfig) {
-  const { successEmbed, GLYPHS } = await import('../../utils/embeds.js');
+  const { successEmbed, errorEmbed, GLYPHS } = await import('../../utils/embeds.js');
 
   const type = interaction.options.getString('type');
   const role = interaction.options.getRole('role');
+
+  // @everyone or an integration's role here would make every member (or a bot) staff
+  if (role.id === interaction.guild.id || role.managed) {
+    return interaction.editReply({
+      embeds: [await errorEmbed(interaction.guild.id, 'Role Not Allowed', `${role} cannot be used as a bot role, Master.`)]
+    });
+  }
+  // Only the owner or a real Administrator may create more bot admins/moderators ('staff' also adds a moderator role)
+  if (['admin', 'staff'].includes(type) && !isServerAdmin(interaction.member)) {
+    return interaction.editReply({
+      embeds: [await errorEmbed(interaction.guild.id, 'Permission Denied',
+        'Only the server owner or an Administrator can grant bot admin or moderator roles, Master.')]
+    });
+  }
 
   let updateData = {};
 
@@ -3032,6 +3085,13 @@ async function handleAwardCommand(interaction, client, guildConfig) {
   const targetUser = interaction.options.getUser('user');
   const amount = interaction.options.getInteger('amount');
   const reason = interaction.options.getString('reason') || 'No reason provided';
+
+  // Only the server owner may award themselves
+  if (targetUser.id === interaction.user.id && interaction.user.id !== interaction.guild.ownerId) {
+    return interaction.editReply({
+      embeds: [await errorEmbed(interaction.guild.id, 'Invalid Target', 'You cannot award yourself, Master.')]
+    });
+  }
 
   // Check if target is a bot
   if (targetUser.bot) {

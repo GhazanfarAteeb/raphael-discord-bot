@@ -2,7 +2,7 @@ import { PermissionFlagsBits } from 'discord.js';
 import Guild from '../../models/Guild.js';
 import { successEmbed, errorEmbed, infoEmbed, GLYPHS } from '../../utils/embeds.js';
 import { getBuiltInWordCount } from '../../utils/badWordsFilter.js';
-import { hasModPerms } from '../../utils/helpers.js';
+import { hasModPerms, isServerAdmin, normalizeAntiNukeAction } from '../../utils/helpers.js';
 
 export default {
   name: 'automod',
@@ -470,6 +470,14 @@ async function handleAntiraid(message, args, guildConfig) {
 }
 
 async function handleAntinuke(message, args, guildConfig) {
+  // Owner/Administrator only: staff roles must not be able to disable anti-nuke or whitelist themselves
+  if (args[0] && !isServerAdmin(message.member)) {
+    return message.reply({
+      embeds: [await errorEmbed(message.guild.id, 'Permission Denied',
+        'Anti-nuke can only be configured by the server owner or an Administrator, Master.')]
+    });
+  }
+
   if (!guildConfig.features.autoMod.antiNuke) {
     guildConfig.features.autoMod.antiNuke = {
       enabled: true,
@@ -522,8 +530,8 @@ async function handleAntinuke(message, args, guildConfig) {
       });
 
     case 'action':
-      const nukeAction = args[1]?.toLowerCase();
-      if (!['removeroles', 'kick', 'ban'].includes(nukeAction)) {
+      const nukeAction = normalizeAntiNukeAction(args[1]);
+      if (!nukeAction) {
         return message.reply({
           embeds: [await errorEmbed(message.guild.id, 'Invalid Action', 'Valid actions: removeRoles, kick, ban')]
         });

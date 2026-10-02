@@ -180,8 +180,9 @@ export default {
     if (!executorMember) return;
 
     try {
-      switch (action) {
-        case 'removeRoles':
+      // Lowercased: older configs saved the action as 'removeroles'
+      switch (String(action || 'removeRoles').toLowerCase()) {
+        case 'removeroles':
           // Remove all roles from the user
           if (executorMember.manageable) {
             const rolesToRemove = executorMember.roles.cache.filter(r => r.id !== guild.id);

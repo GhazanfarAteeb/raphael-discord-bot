@@ -1,4 +1,4 @@
-import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
+import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionFlagsBits } from 'discord.js';
 import { errorEmbed, infoEmbed, GLYPHS } from '../../utils/embeds.js';
 
 export default {
@@ -21,6 +21,13 @@ export default {
         if (!channel.isTextBased()) {
             return message.reply({
                 embeds: [await errorEmbed(guildId, '**Notice:** This function is restricted to text-based channels, Master.')]
+            });
+        }
+
+        // Only reveal history the requester could read themselves (no peeking into private channels)
+        if (!channel.permissionsFor(message.member)?.has([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory])) {
+            return message.reply({
+                embeds: [await errorEmbed(guildId, 'Access Denied', 'You lack access to the history of that channel, Master.')]
             });
         }
         

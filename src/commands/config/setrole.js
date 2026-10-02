@@ -1,6 +1,7 @@
 import { PermissionFlagsBits } from 'discord.js';
 import Guild from '../../models/Guild.js';
 import { successEmbed, errorEmbed, GLYPHS } from '../../utils/embeds.js';
+import { isServerAdmin } from '../../utils/helpers.js';
 
 export default {
   name: 'setrole',
@@ -72,6 +73,22 @@ export default {
         `${GLYPHS.ERROR} Could not find that role.`
       );
       return message.reply({ embeds: [embed] });
+    }
+
+    // @everyone or an integration's role here would make every member (or a bot) staff
+    if (role.id === message.guild.id || role.managed) {
+      return message.reply({
+        embeds: [await errorEmbed(message.guild.id, 'Role Not Allowed',
+          `${role} cannot be used as a bot role, Master.`)]
+      });
+    }
+
+    // Only the owner or a real Administrator may create more bot admins/moderators
+    if (['admin', 'administrator', 'mod', 'moderator'].includes(type) && !isServerAdmin(message.member)) {
+      return message.reply({
+        embeds: [await errorEmbed(message.guild.id, 'Permission Denied',
+          'Only the server owner or an Administrator can grant bot admin or moderator roles, Master.')]
+      });
     }
 
     let updateData = {};

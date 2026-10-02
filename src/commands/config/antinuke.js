@@ -1,6 +1,6 @@
 import { EmbedBuilder, PermissionFlagsBits } from 'discord.js';
 import Guild from '../../models/Guild.js';
-import { getPrefix, hasModPerms } from '../../utils/helpers.js';
+import { getPrefix, isServerAdmin, normalizeAntiNukeAction } from '../../utils/helpers.js';
 import { successEmbed, errorEmbed, infoEmbed, GLYPHS } from '../../utils/embeds.js';
 
 export default {
@@ -16,11 +16,11 @@ export default {
     const prefix = await getPrefix(message.guild.id);
     const guildConfig = await Guild.getGuild(message.guild.id, message.guild.name);
 
-    // Check for moderator permissions (admin, mod role, or ManageGuild)
-    if (!hasModPerms(message.member, guildConfig)) {
+    // Owner/Administrator only: staff roles must not be able to disable anti-nuke or whitelist themselves
+    if (!isServerAdmin(message.member)) {
       return message.reply({
         embeds: [await errorEmbed(message.guild.id, 'Permission Denied',
-          `${GLYPHS.LOCK} You need Moderator/Staff permissions to configure anti-nuke.`)]
+          'Anti-nuke can only be configured by the server owner or an Administrator, Master.')]
       });
     }
 
@@ -45,7 +45,7 @@ export default {
       case 'enable':
       case 'on':
         antiNuke.enabled = true;
-        await guildConfig.save();
+        await Guild.updateGuild(message.guild.id, { $set: { 'features.autoMod.antiNuke': antiNuke } });
 
         return message.reply({
           embeds: [new EmbedBuilder()
@@ -61,7 +61,7 @@ export default {
       case 'disable':
       case 'off':
         antiNuke.enabled = false;
-        await guildConfig.save();
+        await Guild.updateGuild(message.guild.id, { $set: { 'features.autoMod.antiNuke': antiNuke } });
 
         return message.reply({
           embeds: [new EmbedBuilder()
@@ -89,14 +89,14 @@ export default {
         }
 
         if (setting === 'action') {
-          if (!['ban', 'kick', 'removeroles'].includes(value?.toLowerCase())) {
+          if (!normalizeAntiNukeAction(value)) {
             return message.reply({
               embeds: [await errorEmbed(message.guild.id, 'Invalid Action',
                 `${GLYPHS.ERROR} Action must be: \`removeRoles\`, \`kick\`, or \`ban\``)]
             });
           }
-          antiNuke.action = value.toLowerCase();
-          await guildConfig.save();
+          antiNuke.action = normalizeAntiNukeAction(value);
+          await Guild.updateGuild(message.guild.id, { $set: { 'features.autoMod.antiNuke': antiNuke } });
 
           return message.reply({
             embeds: [await successEmbed(message.guild.id, 'Action Updated',
@@ -114,7 +114,7 @@ export default {
           }
 
           antiNuke.timeWindow = seconds;
-          await guildConfig.save();
+          await Guild.updateGuild(message.guild.id, { $set: { 'features.autoMod.antiNuke': antiNuke } });
 
           return message.reply({
             embeds: [await successEmbed(message.guild.id, 'Time Window Updated',
@@ -131,7 +131,7 @@ export default {
             });
           }
           antiNuke.banThreshold = threshold;
-          await guildConfig.save();
+          await Guild.updateGuild(message.guild.id, { $set: { 'features.autoMod.antiNuke': antiNuke } });
           return message.reply({
             embeds: [await successEmbed(message.guild.id, 'Ban Threshold Updated',
               `${GLYPHS.SUCCESS} Ban threshold set to **${threshold}** actions`)]
@@ -147,7 +147,7 @@ export default {
             });
           }
           antiNuke.kickThreshold = threshold;
-          await guildConfig.save();
+          await Guild.updateGuild(message.guild.id, { $set: { 'features.autoMod.antiNuke': antiNuke } });
           return message.reply({
             embeds: [await successEmbed(message.guild.id, 'Kick Threshold Updated',
               `${GLYPHS.SUCCESS} Kick threshold set to **${threshold}** actions`)]
@@ -163,7 +163,7 @@ export default {
             });
           }
           antiNuke.roleDeleteThreshold = threshold;
-          await guildConfig.save();
+          await Guild.updateGuild(message.guild.id, { $set: { 'features.autoMod.antiNuke': antiNuke } });
           return message.reply({
             embeds: [await successEmbed(message.guild.id, 'Role Delete Threshold Updated',
               `${GLYPHS.SUCCESS} Role delete threshold set to **${threshold}** actions`)]
@@ -179,7 +179,7 @@ export default {
             });
           }
           antiNuke.channelDeleteThreshold = threshold;
-          await guildConfig.save();
+          await Guild.updateGuild(message.guild.id, { $set: { 'features.autoMod.antiNuke': antiNuke } });
           return message.reply({
             embeds: [await successEmbed(message.guild.id, 'Channel Delete Threshold Updated',
               `${GLYPHS.SUCCESS} Channel delete threshold set to **${threshold}** actions`)]
@@ -246,7 +246,7 @@ export default {
           }
 
           antiNuke.whitelistedUsers.push(user.id);
-          await guildConfig.save();
+          await Guild.updateGuild(message.guild.id, { $set: { 'features.autoMod.antiNuke': antiNuke } });
 
           return message.reply({
             embeds: [await successEmbed(message.guild.id, 'User Whitelisted',
@@ -264,7 +264,7 @@ export default {
           }
 
           antiNuke.whitelistedUsers.splice(index, 1);
-          await guildConfig.save();
+          await Guild.updateGuild(message.guild.id, { $set: { 'features.autoMod.antiNuke': antiNuke } });
 
           return message.reply({
             embeds: [await successEmbed(message.guild.id, 'User Removed',

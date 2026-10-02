@@ -1,7 +1,7 @@
 import { PermissionFlagsBits, EmbedBuilder, ChannelType } from 'discord.js';
 import Guild from '../../models/Guild.js';
 import { successEmbed, errorEmbed, infoEmbed, GLYPHS } from '../../utils/embeds.js';
-import { hasModPerms } from '../../utils/helpers.js';
+import { hasModPerms, getAssignableRoleError } from '../../utils/helpers.js';
 
 export default {
   name: 'welcome',
@@ -532,6 +532,11 @@ export default {
             embeds: [await errorEmbed(message.guild.id, 'Role Not Found',
               'Please mention a role or provide a valid role ID.')]
           });
+        }
+
+        const roleError = getAssignableRoleError(role, message.member);
+        if (roleError) {
+          return message.reply({ embeds: [await errorEmbed(message.guild.id, 'Role Not Allowed', roleError)] });
         }
 
         await Guild.updateGuild(message.guild.id, {

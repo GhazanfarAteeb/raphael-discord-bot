@@ -1,7 +1,7 @@
 import { EmbedBuilder, PermissionFlagsBits } from 'discord.js';
 import Guild from '../../models/Guild.js';
 import { successEmbed, errorEmbed, infoEmbed, GLYPHS } from '../../utils/embeds.js';
-import { getPrefix } from '../../utils/helpers.js';
+import { getPrefix, getAssignableRoleError } from '../../utils/helpers.js';
 
 export default {
   name: 'autorole',
@@ -92,6 +92,11 @@ export default {
             `${GLYPHS.ERROR} Please mention a valid role!\n\n**Usage:** \`${prefix}autorole add @role\``
           );
           return message.reply({ embeds: [embed] });
+        }
+
+        const roleError = getAssignableRoleError(role, message.member);
+        if (roleError) {
+          return message.reply({ embeds: [await errorEmbed(message.guild.id, 'Role Not Allowed', roleError)] });
         }
 
         // Check role hierarchy

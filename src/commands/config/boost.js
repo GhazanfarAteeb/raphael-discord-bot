@@ -2,7 +2,7 @@ import { PermissionFlagsBits, EmbedBuilder, ChannelType } from 'discord.js';
 import Guild from '../../models/Guild.js';
 import BoosterRole from '../../models/BoosterRole.js';
 import { successEmbed, errorEmbed, infoEmbed, GLYPHS } from '../../utils/embeds.js';
-import { hasModPerms, getPrefix } from '../../utils/helpers.js';
+import { hasModPerms, getPrefix, getAssignableRoleError } from '../../utils/helpers.js';
 import { parseBoostMessage, buildBoostEmbed } from '../../events/client/boostHandler.js';
 
 export default {
@@ -876,6 +876,11 @@ async function setBoosterRole(message, args, guildConfig, prefix) {
     });
   }
 
+  const roleError = getAssignableRoleError(role, message.member);
+  if (roleError) {
+    return message.reply({ embeds: [await errorEmbed(message.guild.id, 'Role Not Allowed', roleError)] });
+  }
+
   // Check role hierarchy
   if (role.position >= message.guild.members.me.roles.highest.position) {
     return message.reply({
@@ -1171,6 +1176,11 @@ async function addBoostTier(message, args, guildConfig, prefix) {
         `**Usage:** \`${prefix}boost addtier <boost_count> @role\`\n` +
         `**Example:** \`${prefix}boost addtier 3 @TripleBooster\``)]
     });
+  }
+
+  const roleError = getAssignableRoleError(role, message.member);
+  if (roleError) {
+    return message.reply({ embeds: [await errorEmbed(message.guild.id, 'Role Not Allowed', roleError)] });
   }
 
   // Check if role is manageable

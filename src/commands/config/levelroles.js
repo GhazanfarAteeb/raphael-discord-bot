@@ -1,7 +1,7 @@
 import { EmbedBuilder, PermissionFlagsBits } from 'discord.js';
 import Guild from '../../models/Guild.js';
 import { successEmbed, errorEmbed, infoEmbed, GLYPHS } from '../../utils/embeds.js';
-import { getPrefix, hasModPerms } from '../../utils/helpers.js';
+import { getPrefix, hasModPerms, getAssignableRoleError } from '../../utils/helpers.js';
 
 export default {
   name: 'levelroles',
@@ -96,6 +96,11 @@ export default {
         `**Usage:** \`${prefix}levelroles add ${level} @role\``
       );
       return message.reply({ embeds: [embed] });
+    }
+
+    const roleError = getAssignableRoleError(role, message.member);
+    if (roleError) {
+      return message.reply({ embeds: [await errorEmbed(guildId, 'Role Not Allowed', roleError)] });
     }
 
     // Check if role is manageable

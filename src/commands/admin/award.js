@@ -4,7 +4,7 @@ import Level from '../../models/Level.js';
 import Guild from '../../models/Guild.js';
 import ModLog from '../../models/ModLog.js';
 import { successEmbed, errorEmbed, infoEmbed, GLYPHS, createEmbed } from '../../utils/embeds.js';
-import { getPrefix, hasModPerms } from '../../utils/helpers.js';
+import { getPrefix, hasAdminPerms } from '../../utils/helpers.js';
 import { getRandomFooter } from '../../utils/raphael.js';
 
 export default {
@@ -12,7 +12,7 @@ export default {
   description: 'Award or deduct XP, coins, or reputation from a user (Admin only)',
   usage: '<xp|coins|rep> <@user> <amount>',
   category: 'admin',
-  aliases: ['give', 'take', 'modify'],
+  aliases: ['give', 'modify'], // no 'take': it can't flip the sign; deduct with a negative amount
   permissions: [PermissionFlagsBits.ManageGuild],
   cooldown: 3,
   examples: [
@@ -27,11 +27,11 @@ export default {
     const prefix = await getPrefix(guildId);
     const guildConfig = await Guild.getGuild(guildId);
 
-    // Check for moderator permissions (admin, mod role, or ManageGuild)
-    if (!hasModPerms(message.member, guildConfig)) {
+    // Admin only: awarding mints currency and XP
+    if (!hasAdminPerms(message.member, guildConfig)) {
       return message.reply({
         embeds: [await errorEmbed(guildId, 'Permission Denied',
-          `${GLYPHS.LOCK} You need Moderator/Staff permissions to award users.`)]
+          'Awards can only be issued by administrators, Master.')]
       });
     }
 
@@ -54,6 +54,12 @@ export default {
       return message.reply({
         embeds: [await errorEmbed(guildId, 'Target Required',
           `**Notice:** Please specify a subject, Master.\n\nSyntax: \`${prefix}award <type> @user <amount>\``)]
+      });
+    }
+    // Only the server owner may award themselves
+    if (targetUser.id === message.author.id && message.author.id !== message.guild.ownerId) {
+      return message.reply({
+        embeds: [await errorEmbed(guildId, 'Invalid Target', 'You cannot award yourself, Master.')]
       });
     }
     // Check if target is a bot

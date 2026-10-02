@@ -27,6 +27,52 @@ export function hasAdminPerms(member, guildConfig) {
   return false;
 }
 
+// Server owner or Discord Administrator. Used for anti-nuke settings: anti-nuke exists to
+// stop rogue staff, so bot admin/staff roles must not be able to turn it off or whitelist themselves.
+export function isServerAdmin(member) {
+  return member.id === member.guild.ownerId || member.permissions.has(PermissionFlagsBits.Administrator);
+}
+
+// Anti-nuke actions as stored in the schema, keyed by lowercase input
+const ANTI_NUKE_ACTIONS = { removeroles: 'removeRoles', kick: 'kick', ban: 'ban' };
+export function normalizeAntiNukeAction(value) {
+  return ANTI_NUKE_ACTIONS[String(value ?? '').toLowerCase()] ?? null;
+}
+
+// Permissions that must never be handed out automatically (autoroles, rewards, booster/verified roles)
+const DANGEROUS_ROLE_PERMISSIONS = [
+  PermissionFlagsBits.Administrator,
+  PermissionFlagsBits.ManageGuild,
+  PermissionFlagsBits.ManageRoles,
+  PermissionFlagsBits.ManageChannels,
+  PermissionFlagsBits.ManageWebhooks,
+  PermissionFlagsBits.BanMembers,
+  PermissionFlagsBits.KickMembers,
+  PermissionFlagsBits.ModerateMembers,
+  PermissionFlagsBits.MentionEveryone
+];
+
+/**
+ * Why `role` can't be configured by `member` as a role the bot gives out automatically,
+ * or null if it can. Stops staff from turning the bot into a way to grant themselves (or
+ * every new member) a powerful role.
+ */
+export function getAssignableRoleError(role, member) {
+  const { guild } = role;
+  if (role.id === guild.id) return 'The @everyone role cannot be assigned, Master.';
+  if (role.managed) return `${role} is managed by an integration and cannot be assigned manually, Master.`;
+  if (role.position >= guild.members.me.roles.highest.position) {
+    return `${role} is at or above my highest role, so I cannot assign it, Master.`;
+  }
+  if (member.id !== guild.ownerId && role.position >= member.roles.highest.position) {
+    return `${role} is at or above your highest role, Master.`;
+  }
+  if (role.permissions.any(DANGEROUS_ROLE_PERMISSIONS)) {
+    return `${role} has moderation or administrator permissions and cannot be given out automatically, Master.`;
+  }
+  return null;
+}
+
 // Check if user has moderator permissions (ManageGuild, admin role, or mod/staff role)
 export function hasModPerms(member, guildConfig) {
   // Admins always have mod perms

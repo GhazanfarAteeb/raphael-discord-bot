@@ -15,6 +15,7 @@ export default {
   usage: 'botlogs [stats|clean|types]',
   aliases: ['blogs', 'systemlogs'],
   category: 'admin',
+  ownerOnly: true, // bot-wide: reads and changes the bot's own logs
   permissions: [], // Custom permission check below
   execute: async (message, args) => {
     // Check for Administrator OR admin/staff/moderator roles
