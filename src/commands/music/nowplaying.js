@@ -6,6 +6,15 @@
 import Command from "../../structures/Command.js";
 import { EmbedBuilder } from "discord.js";
 import { getRandomFooter } from "../../utils/raphael.js";
+import { COLORS, errorEmbed, warningEmbed } from "../../utils/embeds.js";
+import {
+  currentPosition,
+  formatDuration,
+  progressBar,
+  safeUrl,
+  truncate,
+  DISCORD_LIMITS,
+} from "../../music/format.js";
 
 export default class NowPlaying extends Command {
   constructor(client) {
@@ -37,93 +46,87 @@ export default class NowPlaying extends Command {
   }
 
   async run(client, ctx, args) {
-    const player = client.moonlink?.players.get(ctx.guild.id);
+    const guildId = ctx.guild.id;
 
-    if (!player || !player.current) {
+    try {
+      const player = client.moonlink?.players.get(guildId);
+
+      if (!player || !player.current) {
+        return ctx.sendMessage({
+          embeds: [
+            await warningEmbed(
+              guildId,
+              "Audio Playback",
+              "**Notice:** No audio track is currently playing, Master.",
+            ),
+          ],
+        });
+      }
+
+      const track = player.current;
+      const live = Boolean(track.isStream);
+      const duration = live ? 0 : Number(track.duration) || 0;
+      const position = currentPosition(player);
+      const timeline = live
+        ? `${formatDuration(position)} / Live`
+        : `${formatDuration(position)} / ${formatDuration(duration)}`;
+
+      const embed = new EmbedBuilder()
+        .setColor(COLORS.RAPHAEL)
+        .setAuthor({ name: "『 Audio Playback 』" })
+        .setTitle(truncate(track.title || "Unknown Track", DISCORD_LIMITS.TITLE))
+        .setURL(safeUrl(track.uri))
+        .setThumbnail(safeUrl(track.thumbnail))
+        .setDescription(
+          `**Notice:** ${player.paused ? "Audio stream suspended" : "Currently processing audio stream"}, Master.\n\n${progressBar(position, duration)}\n\`${timeline}\``,
+        )
+        .addFields(
+          {
+            name: "▸ Artist",
+            value: truncate(track.author || "Unknown", DISCORD_LIMITS.FIELD_VALUE),
+            inline: true,
+          },
+          {
+            name: "▸ Requested By",
+            value: track.requester?.toString() || "Unknown",
+            inline: true,
+          },
+          { name: "▸ Volume", value: `${player.volume}%`, inline: true },
+        );
+
+      // Add loop status if enabled
+      if (player.loop === "track" || player.loop === "queue") {
+        embed.addFields({
+          name: "▸ Loop Mode",
+          value: player.loop === "track" ? "◉ Track Repeat" : "◉ Queue Repeat",
+          inline: true,
+        });
+      }
+
+      // Add queue info
+      if (player.queue.size > 0) {
+        embed.addFields({
+          name: "▸ Queue Status",
+          value: `${player.queue.size} track${player.queue.size !== 1 ? "s" : ""} pending`,
+          inline: true,
+        });
+      }
+
+      embed.setFooter({ text: getRandomFooter() });
+      embed.setTimestamp();
+
+      return ctx.sendMessage({ embeds: [embed] });
+    } catch (error) {
+      client.logger.error("[Music:nowplaying] Error:", error);
       return ctx.sendMessage({
         embeds: [
-          {
-            color: 0xff4757,
-            description:
-              "**Notice:** No audio track is currently playing, Master.",
-          },
+          await errorEmbed(
+            guildId,
+            "Audio Playback",
+            "**Alert:** An anomaly occurred while retrieving playback data, Master.",
+          ),
         ],
       });
     }
-
-    const track = player.current;
-
-    // Format duration
-    const formatDuration = (ms) => {
-      if (!ms || isNaN(ms)) return "Live";
-      const seconds = Math.floor((ms / 1000) % 60);
-      const minutes = Math.floor((ms / (1000 * 60)) % 60);
-      const hours = Math.floor(ms / (1000 * 60 * 60));
-
-      if (hours > 0) {
-        return `${hours}:${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;
-      }
-      return `${minutes}:${seconds.toString().padStart(2, "0")}`;
-    };
-
-    // Create progress bar
-    const createProgressBar = (current, total, length = 15) => {
-      if (!total || isNaN(total)) return "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬ [LIVE]";
-
-      const progress = Math.round((current / total) * length);
-      const empty = length - progress;
-
-      return (
-        "▬".repeat(Math.max(0, progress)) +
-        "🔘" +
-        "▬".repeat(Math.max(0, empty - 1))
-      );
-    };
-
-    const position = player.position || 0;
-    const duration = track.duration || 0;
-    const progressBar = createProgressBar(position, duration);
-
-    const embed = new EmbedBuilder()
-      .setColor("#00CED1")
-      .setAuthor({ name: "『 Audio Playback 』" })
-      .setTitle(track.title)
-      .setURL(track.uri)
-      .setThumbnail(track.thumbnail || null)
-      .setDescription(
-        `**Notice:** Currently processing audio stream, Master.\n\n${progressBar}\n\`${formatDuration(position)} / ${formatDuration(duration)}\``,
-      )
-      .addFields(
-        { name: "▸ Artist", value: track.author || "Unknown", inline: true },
-        {
-          name: "▸ Requested By",
-          value: track.requester?.toString() || "Unknown",
-          inline: true,
-        },
-        { name: "▸ Volume", value: `${player.volume}%`, inline: true },
-      );
-
-    // Add loop status if enabled
-    if (player.loop && player.loop !== "none" && player.loop !== "off") {
-      embed.addFields({
-        name: "▸ Loop Mode",
-        value: player.loop === "track" ? "◉ Track Repeat" : "◉ Queue Repeat",
-        inline: true,
-      });
-    }
-
-    // Add queue info
-    if (player.queue.size > 0) {
-      embed.addFields({
-        name: "▸ Queue Status",
-        value: `${player.queue.size} track${player.queue.size !== 1 ? "s" : ""} pending`,
-        inline: true,
-      });
-    }
-
-    embed.setFooter({ text: getRandomFooter() });
-    embed.setTimestamp();
-
-    return ctx.sendMessage({ embeds: [embed] });
   }
 }

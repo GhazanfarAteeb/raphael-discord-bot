@@ -1,93 +1,101 @@
 import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
-import { errorEmbed } from '../../utils/embeds.js';
+import { COLORS, errorEmbed, infoEmbed } from '../../utils/embeds.js';
+import { getRandomFooter } from '../../utils/raphael.js';
+import { escapeMarkdown } from '../../utils/helpers.js';
+
+const SNOWFLAKE = /^\d{17,20}$/;
+const MAX_SIZE = 4096;
+const SIZES = [256, 512, 1024, 2048, 4096];
+
+const linkButton = (label, url) => new ButtonBuilder().setLabel(label).setStyle(ButtonStyle.Link).setURL(url);
 
 export default {
     name: 'banner',
     aliases: ['userbanner', 'profilebanner'],
     description: 'Get a user\'s profile banner in full size',
-    usage: 'banner [@user]',
+    usage: 'banner [@user | user ID]',
     category: 'utility',
     cooldown: 3,
-    
+
     async execute(message, args, client) {
         const guildId = message.guild.id;
-        
-        // Get target user - need to force fetch for banner
-        let userId = message.mentions.users.first()?.id || args[0] || message.author.id;
-        
+
         try {
-            // Force fetch user to get banner
-            const user = await client.users.fetch(userId, { force: true });
-            
-            if (!user.banner) {
-                // Check if user has accent color instead
-                if (user.accentColor) {
-                    const hexColor = user.hexAccentColor || `#${user.accentColor.toString(16).padStart(6, '0')}`;
-                    const embed = new EmbedBuilder()
-                        .setTitle(`${user.username}'s Profile`)
-                        .setDescription(`This user doesn't have a banner, but has a profile color: **${hexColor}**`)
-                        .setColor(user.accentColor)
-                        .setThumbnail(user.displayAvatarURL({ extension: 'png', size: 256 }))
-                        .setTimestamp();
-                    
-                    return message.reply({ embeds: [embed] });
-                }
-                
+            // Target: mention, then a user ID, then the requester
+            const mentioned = message.mentions.users.first();
+            if (!mentioned && args[0] && !SNOWFLAKE.test(args[0])) {
                 return message.reply({
-                    embeds: [await errorEmbed(guildId, `**${user.username}** doesn't have a profile banner.`)]
+                    embeds: [await errorEmbed(guildId, 'Invalid Target', 'Specify a user by mention or user ID, Master.')]
                 });
             }
-            
-            // Get banner URL
-            const bannerUrl = user.bannerURL({ extension: 'png', size: 4096 });
-            
-            const embed = new EmbedBuilder()
-                .setTitle(`${user.username}'s Banner`)
-                .setColor(user.accentColor || '#5865F2')
-                .setImage(bannerUrl)
-                .setTimestamp();
-            
-            // Format links for different sizes
-            const sizes = [256, 512, 1024, 2048, 4096];
-            const formatLinks = sizes.map(size => {
-                const sizedUrl = bannerUrl.replace(/size=\d+/, `size=${size}`);
-                return `[${size}](${sizedUrl})`;
-            }).join(' • ');
-            
-            embed.addFields({
-                name: '📐 Sizes',
-                value: formatLinks,
-                inline: false
+            const userId = mentioned?.id || args[0] || message.author.id;
+
+            // Banner and accent color are only present on a forced fetch.
+            // Unknown User (10013) / invalid ID (50035) mean "no such user"; anything else is a real failure.
+            const user = await client.users.fetch(userId, { force: true }).catch(error => {
+                if (error?.code === 10013 || error?.code === 50035) return null;
+                throw error;
             });
-            
-            // Create button for quick access
-            const row = new ActionRowBuilder().addComponents(
-                new ButtonBuilder()
-                    .setLabel('Open Banner')
-                    .setStyle(ButtonStyle.Link)
-                    .setURL(bannerUrl)
-                    .setEmoji('🖼️')
-            );
-            
-            // Add GIF version if animated
-            if (user.banner?.startsWith('a_')) {
-                const gifUrl = user.bannerURL({ extension: 'gif', size: 4096 });
-                row.addComponents(
-                    new ButtonBuilder()
-                        .setLabel('GIF Version')
-                        .setStyle(ButtonStyle.Link)
-                        .setURL(gifUrl)
-                        .setEmoji('🎞️')
-                );
+            if (!user) {
+                return message.reply({
+                    embeds: [await errorEmbed(guildId, 'User Not Found', 'No user matches that ID, Master.')]
+                });
             }
-            
-            message.reply({ embeds: [embed], components: [row] });
-            
+
+            const name = escapeMarkdown(user.username);
+
+            if (!user.banner) {
+                // The profile color is shown instead, when one is set
+                if (user.accentColor != null) {
+                    const embed = new EmbedBuilder()
+                        .setTitle(`『 ${user.username}'s Profile 』`)
+                        .setDescription(`**Analysis:** **${name}** has no profile banner, Master. Their profile color is **${user.hexAccentColor}**.`)
+                        .setColor(user.accentColor)
+                        .setThumbnail(user.displayAvatarURL({ extension: 'png', size: 256 }))
+                        .setFooter({ text: getRandomFooter() })
+                        .setTimestamp();
+
+                    return message.reply({ embeds: [embed] });
+                }
+
+                return message.reply({
+                    embeds: [await infoEmbed(guildId, 'No Banner', `**Analysis:** **${name}** has no profile banner or profile color, Master.`)]
+                });
+            }
+
+            // Static PNG for the main image; animated banners get a separate GIF button
+            const bannerUrl = user.bannerURL({ extension: 'png', size: MAX_SIZE, forceStatic: true });
+
+            const sizeLinks = SIZES
+                .map(size => `[${size}](${bannerUrl.replace(/size=\d+/, `size=${size}`)})`)
+                .join(' • ');
+
+            const embed = new EmbedBuilder()
+                .setTitle(`『 ${user.username}'s Banner 』`)
+                .setDescription(`**Report:** Banner data for **${name}** retrieved successfully, Master.`)
+                .setColor(user.accentColor ?? COLORS.RAPHAEL)
+                .setImage(bannerUrl)
+                .addFields({ name: '▸ Sizes', value: sizeLinks, inline: false })
+                .setFooter({ text: getRandomFooter() })
+                .setTimestamp();
+
+            const row = new ActionRowBuilder().addComponents(linkButton('Open Banner', bannerUrl));
+
+            if (user.banner.startsWith('a_')) {
+                row.addComponents(linkButton('GIF Version', user.bannerURL({ extension: 'gif', size: MAX_SIZE })));
+            }
+
+            return await message.reply({ embeds: [embed], components: [row] });
+
         } catch (error) {
             console.error('Banner fetch error:', error);
-            return message.reply({
-                embeds: [await errorEmbed(guildId, 'Failed to fetch user banner. Please try again.')]
-            });
+            try {
+                await message.reply({
+                    embeds: [await errorEmbed(guildId, 'Retrieval Failed', 'The user banner could not be retrieved, Master. Please try again.')]
+                });
+            } catch {
+                // Reply failed too (message deleted or no permission); nothing more to do
+            }
         }
     }
 };

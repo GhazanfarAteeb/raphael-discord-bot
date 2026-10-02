@@ -1,142 +1,174 @@
-import { EmbedBuilder } from 'discord.js';
 import Afk from '../../models/Afk.js';
-import Guild from '../../models/Guild.js';
-import { successEmbed, infoEmbed, GLYPHS } from '../../utils/embeds.js';
+import { successEmbed, infoEmbed, errorEmbed, GLYPHS } from '../../utils/embeds.js';
 import { getPrefix, parseDuration } from '../../utils/helpers.js';
-import { getRandomFooter } from '../../utils/raphael.js';
+import {
+  AFK_NICKNAME_TAG,
+  addAwayLinks,
+  restoreAfkNickname,
+  sendAfkReturnSummary,
+  splitAwayReason,
+  truncate
+} from '../../events/client/afkHandler.js';
 
-// URL regex pattern
-const urlRegex = /(https?:\/\/[^\s]+)/gi;
-
-// Image URL pattern - handles query strings like ?size=4096
-const imageUrlPattern = /\.(png|jpg|jpeg|gif|webp)($|\?)/i;
+// `afk off` (alone) clears the status; `afk off to lunch` is still a reason
+const OFF_KEYWORDS = ['off', 'remove', 'clear'];
+const MAX_SCHEDULED_RETURN = 365 * 24 * 60 * 60 * 1000;
+const NICKNAME_LIMIT = 32;
+const MAX_REASON_DISPLAY = 1500;
 
 export default {
   name: 'afk',
+  category: 'utility',
   description: 'Configure away-from-keyboard status with optional parameters, Master',
-  usage: '[reason] [--time <duration>] [--sticky]',
+  usage: '[reason] [--time <duration>] [--sticky] | off',
   aliases: ['away', 'brb'],
   cooldown: 5,
 
   async execute(message, args) {
-    const guildConfig = await Guild.getGuild(message.guild.id, message.guild.name);
-    const prefix = await getPrefix(message.guild.id);
-
-    // Parse options
-    const options = {
-      autoRemove: true,
-      scheduledReturn: null,
-      originalNickname: message.member.displayName
-    };
-
-    // Filter out flags
-    let reasonArgs = [];
-    let i = 0;
-    while (i < args.length) {
-      if (args[i] === '--time' || args[i] === '-t') {
-        const duration = args[i + 1];
-        if (duration) {
-          const ms = parseDuration(duration);
-          if (ms) {
-            options.scheduledReturn = new Date(Date.now() + ms);
-          }
-          i += 2;
-          continue;
-        }
-      } else if (args[i] === '--sticky' || args[i] === '-s') {
-        options.autoRemove = false;
-        i++;
-        continue;
-      }
-      reasonArgs.push(args[i]);
-      i++;
-    }
-
-    const reason = reasonArgs.join(' ') || 'AFK';
-
-    // Set AFK status
-    await Afk.setAfk(message.guild.id, message.author.id, reason, options);
-
-    // Check if reason contains links
-    const links = reason.match(urlRegex);
-    const textWithoutLinks = reason.replace(urlRegex, '').trim();
-
-    // Build response
-    if (links && links.length > 0) {
-      // Has links - create embed for links
-      const embed = new EmbedBuilder()
-        .setColor('#00CED1')
-        .setAuthor({
-          name: `『 ${message.author.username} • Away Status 』`,
-          iconURL: message.author.displayAvatarURL({ dynamic: true })
-        })
-        .setTimestamp();
-
-      // Add text reason if exists
-      if (textWithoutLinks) {
-        embed.setDescription(`**Reason:** ${textWithoutLinks}`);
-      }
-
-      // Add links as fields
-      links.forEach((link, index) => {
-        // Try to get a nice title for the link
-        let linkTitle = 'Link';
-        if (link.includes('youtube.com') || link.includes('youtu.be')) linkTitle = '🎬 YouTube';
-        else if (link.includes('twitter.com') || link.includes('x.com')) linkTitle = '🐦 Twitter/X';
-        else if (link.includes('github.com')) linkTitle = '🐙 GitHub';
-        else if (link.includes('discord.gg') || link.includes('discord.com')) linkTitle = '💬 Discord';
-        else if (link.includes('twitch.tv')) linkTitle = '🎮 Twitch';
-        else if (link.includes('instagram.com')) linkTitle = '📷 Instagram';
-        else if (link.includes('tiktok.com')) linkTitle = '🎵 TikTok';
-        else if (link.includes('spotify.com')) linkTitle = '🎧 Spotify';
-        else if (imageUrlPattern.test(link)) linkTitle = '🖼️ Image';
-        else linkTitle = `🔗 Link ${links.length > 1 ? index + 1 : ''}`;
-
-        embed.addFields({ name: linkTitle, value: link, inline: false });
-      });
-
-      // If it's an image link, set it as the embed image
-      const imageLink = links.find(link => imageUrlPattern.test(link));
-      if (imageLink) {
-        embed.setImage(imageLink);
-      }
-
-      // Add options info
-      let footerText = '';
-      if (options.scheduledReturn) {
-        footerText += `Auto-return: <t:${Math.floor(options.scheduledReturn.getTime() / 1000)}:R>`;
-      }
-      if (!options.autoRemove) {
-        footerText += (footerText ? ' | ' : '') + 'Sticky mode enabled';
-      }
-      if (footerText) {
-        embed.setFooter({ text: footerText });
-      }
-
-      await message.reply({ embeds: [embed] });
-    } else {
-      // No links - just text
-      let description = `**Notice:** ${message.author} has entered away status.\n\n▸ **Reason:** ${reason}`;
-
-      if (options.scheduledReturn) {
-        description += `\n\n▸ **Scheduled Return:** <t:${Math.floor(options.scheduledReturn.getTime() / 1000)}:R>`;
-      }
-      if (!options.autoRemove) {
-        description += `\n▸ **Sticky Mode:** Use \`${prefix}afk off\` to deactivate`;
-      }
-
-      const embed = await successEmbed(message.guild.id, 'Away Status Active', description);
-      embed.setFooter({ text: getRandomFooter() });
-      await message.reply({ embeds: [embed] });
-    }
-
-    // Try to update nickname
     try {
-      if (message.member.manageable && !message.member.displayName.startsWith('[AFK]')) {
-        await message.member.setNickname(`[AFK] ${message.member.displayName.slice(0, 26)}`);
+      if (args.length === 1 && OFF_KEYWORDS.includes(args[0].toLowerCase())) {
+        return await clearAfk(message);
       }
+
+      return await setAfk(message, args);
     } catch (error) {
-      // Can't change nickname, that's fine
+      console.error('[AFK] Command error:', error);
+      try {
+        await message.reply({
+          embeds: [await errorEmbed(message.guild.id, 'Away Status Error',
+            'The away status could not be updated, Master. Please try again shortly.')]
+        });
+      } catch {
+        // Reply failed as well (message deleted or database unavailable)
+      }
     }
   }
 };
+
+async function setAfk(message, args) {
+  const guildId = message.guild.id;
+  const prefix = await getPrefix(guildId);
+
+  // Parse options
+  const options = {
+    autoRemove: true,
+    scheduledReturn: null
+  };
+
+  // Filter out flags
+  const reasonArgs = [];
+  for (let i = 0; i < args.length; i++) {
+    const flag = args[i].toLowerCase();
+
+    if (flag === '--time' || flag === '-t') {
+      const value = args[i + 1];
+      const ms = value ? parseDuration(value.toLowerCase()) : 0;
+
+      if (!ms || ms > MAX_SCHEDULED_RETURN) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Invalid Duration',
+            `**Notice:** \`--time\` requires a duration between 1 second and 365 days, Master. ` +
+            `Valid formats: \`30m\`, \`2h\`, \`1d\`, \`1h30m\`.\n\n` +
+            `Example: \`${prefix}afk lunch --time 1h\``)]
+        });
+      }
+
+      options.scheduledReturn = new Date(Date.now() + ms);
+      i++;
+      continue;
+    }
+
+    if (flag === '--sticky' || flag === '-s') {
+      options.autoRemove = false;
+      continue;
+    }
+
+    reasonArgs.push(args[i]);
+  }
+
+  const reason = reasonArgs.join(' ') || 'AFK';
+
+  // Re-running the command while away updates the status but keeps its start time and mentions
+  const existing = await Afk.getAfk(guildId, message.author.id);
+  const keepHistory = Boolean(existing) && !existing.isExpired();
+
+  // Remember the real nickname (null = none) so it can be restored on return
+  const currentNickname = message.member.nickname;
+  let originalNickname = currentNickname ?? null;
+  if (currentNickname?.startsWith(AFK_NICKNAME_TAG)) {
+    originalNickname = existing
+      ? existing.originalNickname ?? null
+      : currentNickname.slice(AFK_NICKNAME_TAG.length).trim() || null;
+  }
+
+  // Set AFK status
+  await Afk.setAfk(guildId, message.author.id, reason, {
+    ...options,
+    originalNickname,
+    keepHistory
+  });
+
+  // Build response
+  const { text, links } = splitAwayReason(reason);
+
+  const lines = [
+    keepHistory
+      ? `**Notice:** ${message.author}, your away status has been updated, Master.`
+      : `**Notice:** ${message.author} has entered away status, Master.`,
+    '',
+    `${GLYPHS.ARROW_RIGHT} **Reason:** ${text ? truncate(text, MAX_REASON_DISPLAY) : 'See the links below.'}`
+  ];
+
+  if (options.scheduledReturn) {
+    lines.push(`${GLYPHS.ARROW_RIGHT} **Scheduled Return:** <t:${Math.floor(options.scheduledReturn.getTime() / 1000)}:R>`);
+  }
+
+  lines.push(options.autoRemove
+    ? `${GLYPHS.ARROW_RIGHT} **Return:** Your next message clears this status, or use \`${prefix}afk off\`.`
+    : `${GLYPHS.ARROW_RIGHT} **Sticky Mode:** Active. Use \`${prefix}afk off\` to deactivate.`);
+
+  const embed = await successEmbed(guildId,
+    keepHistory ? 'Away Status Updated' : 'Away Status Active',
+    lines.join('\n'));
+
+  if (links.length > 0) {
+    embed.setAuthor({
+      name: truncate(message.author.username, 256),
+      iconURL: message.author.displayAvatarURL()
+    });
+    addAwayLinks(embed, links);
+  }
+
+  await message.reply({ embeds: [embed] });
+
+  await applyAfkNickname(message.member);
+}
+
+async function clearAfk(message) {
+  const guildId = message.guild.id;
+  const removed = await Afk.removeAfk(guildId, message.author.id);
+
+  if (!removed) {
+    // Strip a leftover tag, if any, even though no status is stored
+    await restoreAfkNickname(message.member);
+
+    return message.reply({
+      embeds: [await infoEmbed(guildId, 'Away Status',
+        `${GLYPHS.INFO} You are not currently marked as away, Master. No changes were made.`)]
+    });
+  }
+
+  await restoreAfkNickname(message.member, removed);
+  await sendAfkReturnSummary(message, removed, { manual: true });
+}
+
+async function applyAfkNickname(member) {
+  try {
+    if (!member?.manageable || member.displayName.startsWith(AFK_NICKNAME_TAG)) return;
+
+    const base = member.displayName.slice(0, NICKNAME_LIMIT - AFK_NICKNAME_TAG.length - 1);
+    await member.setNickname(`${AFK_NICKNAME_TAG} ${base}`, 'Away status set');
+  } catch {
+    // Can't change nickname, that's fine
+  }
+}

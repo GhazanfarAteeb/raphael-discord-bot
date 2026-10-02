@@ -4,6 +4,8 @@
  */
 
 import Command from "../../structures/Command.js";
+import { errorEmbed, successEmbed, warningEmbed } from "../../utils/embeds.js";
+import { buildControlRow } from "../../music/format.js";
 
 export default class Resume extends Command {
   constructor(client) {
@@ -35,40 +37,36 @@ export default class Resume extends Command {
   }
 
   async run(client, ctx, args) {
-    const player = client.moonlink?.players.get(ctx.guild.id);
+    const guildId = ctx.guild.id;
+    const fail = async (description) =>
+      ctx.sendMessage({ embeds: [await errorEmbed(guildId, "Audio System", description)] });
+    const notice = async (description) =>
+      ctx.sendMessage({ embeds: [await warningEmbed(guildId, "Audio System", description)] });
+    const confirm = async (description) =>
+      ctx.sendMessage({ embeds: [await successEmbed(guildId, "Audio System", description)] });
 
-    if (!player) {
-      return ctx.sendMessage({
-        embeds: [
-          {
-            color: 0xff4757,
-            description:
-              "**Warning:** No audio playback system detected, Master.",
-          },
-        ],
-      });
+    try {
+      const player = client.moonlink?.players.get(guildId);
+
+      if (!player || player.destroyed) {
+        return await fail("**Warning:** No active audio session detected, Master.");
+      }
+
+      if (!player.paused) {
+        return await notice("**Notice:** Audio stream is already active, Master.");
+      }
+
+      await player.resume();
+
+      // Keep the now-playing card's Pause/Resume button in step
+      await player.message
+        ?.edit({ components: [buildControlRow(player)] })
+        .catch(() => {});
+
+      return await confirm("**Confirmed.** Audio stream resumed, Master.");
+    } catch (error) {
+      client.logger.error("[Music:resume] Error:", error);
+      return fail("**Alert:** An anomaly occurred while resuming playback, Master.");
     }
-
-    if (!player.paused) {
-      return ctx.sendMessage({
-        embeds: [
-          {
-            color: 0xffd700,
-            description: "**Notice:** Audio stream is already active, Master.",
-          },
-        ],
-      });
-    }
-
-    await player.resume();
-
-    return ctx.sendMessage({
-      embeds: [
-        {
-          color: 0x00ced1,
-          description: "**Confirmed:** Audio stream resumed, Master.",
-        },
-      ],
-    });
   }
 }

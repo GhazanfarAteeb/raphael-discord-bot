@@ -1,44 +1,65 @@
-import { EmbedBuilder } from 'discord.js';
 import Reminder from '../../models/Reminder.js';
-import Guild from '../../models/Guild.js';
 import { successEmbed, errorEmbed, infoEmbed, GLYPHS } from '../../utils/embeds.js';
+import { getPrefix } from '../../utils/helpers.js';
+
+const MIN_DURATION = 10 * 1000; // 10 seconds
+const MAX_DURATION = 30 * 24 * 60 * 60 * 1000; // 30 days
+const MAX_REMINDERS = 25; // per member, per server
+const PREVIEW_LENGTH = 50;
+const MAX_MESSAGE_DISPLAY = 3500;
+const EMBED_DESCRIPTION_LIMIT = 4096;
+const DELETE_ACTIONS = ['delete', 'remove', 'cancel'];
 
 export default {
   name: 'remind',
+  category: 'utility',
   description: 'Configure temporal alerts for future notification, Master',
-  usage: '<time> <message> | list | delete <id>',
+  usage: '<time> <message> | list | delete <number>',
   aliases: ['reminder', 'remindme', 'setreminder'],
   cooldown: 5,
 
   async execute(message, args) {
-    if (!args[0]) {
-      return showHelp(message);
+    try {
+      if (!args[0]) {
+        return await showHelp(message);
+      }
+
+      const action = args[0].toLowerCase();
+
+      if (action === 'list') {
+        return await listReminders(message);
+      }
+
+      if (DELETE_ACTIONS.includes(action)) {
+        return await deleteReminder(message, args[1]);
+      }
+
+      // Otherwise, create a reminder
+      return await createReminder(message, args);
+    } catch (error) {
+      console.error('[Remind] Command error:', error);
+      try {
+        await message.reply({
+          embeds: [await errorEmbed(message.guild.id, 'Temporal Alert Failure',
+            'The temporal alert system encountered an unexpected error, Master. Please try again shortly.')]
+        });
+      } catch {
+        // Reply failed as well (message deleted or database unavailable)
+      }
     }
-
-    const action = args[0].toLowerCase();
-
-    if (action === 'list') {
-      return listReminders(message);
-    }
-
-    if (action === 'delete' || action === 'remove' || action === 'cancel') {
-      return deleteReminder(message, args[1]);
-    }
-
-    // Otherwise, create a reminder
-    return createReminder(message, args);
   }
 };
 
 async function showHelp(message) {
-  const embed = await infoEmbed(message.guild.id, '『 Temporal Alert Protocol 』',
+  const prefix = await getPrefix(message.guild.id);
+  const embed = await infoEmbed(message.guild.id, 'Temporal Alert Protocol',
     `**Create a reminder:**\n` +
-    `\`remind <time> <message>\`\n` +
-    `Example: \`remind 2h check the oven\`\n\n` +
-    `**List your reminders:**\n` +
-    `\`remind list\`\n\n` +
+    `\`${prefix}remind <time> <message>\`\n` +
+    `Example: \`${prefix}remind 2h check the oven\`\n\n` +
+    `**List your reminders in this server:**\n` +
+    `\`${prefix}remind list\`\n\n` +
     `**Delete a reminder:**\n` +
-    `\`remind delete <number>\`\n\n` +
+    `\`${prefix}remind delete <number>\`\n\n` +
     `**Time formats:**\n` +
     `${GLYPHS.DOT} \`s\` - seconds (30s)\n` +
     `${GLYPHS.DOT} \`m\` - minutes (10m)\n` +
@@ -53,19 +74,20 @@ async function showHelp(message) {
 }
 
 async function createReminder(message, args) {
+  const guildId = message.guild.id;
   const timeStr = args[0];
   const duration = parseDuration(timeStr);
 
-  if (!duration || duration < 10000) { // Minimum 10 seconds
+  if (!duration || duration < MIN_DURATION) {
     return message.reply({
-      embeds: [await errorEmbed(message.guild.id, 'Invalid Time',
+      embeds: [await errorEmbed(guildId, 'Invalid Time',
         '**Notice:** Invalid temporal format detected, Master. Valid formats: 10m, 2h, 1d. Minimum duration: 10 seconds.')]
     });
   }
 
-  if (duration > 30 * 24 * 60 * 60 * 1000) { // Max 30 days
+  if (duration > MAX_DURATION) {
     return message.reply({
-      embeds: [await errorEmbed(message.guild.id, 'Time Too Long',
+      embeds: [await errorEmbed(guildId, 'Time Too Long',
         '**Notice:** Maximum temporal range is 30 days, Master.')]
     });
   }
@@ -73,80 +95,120 @@ async function createReminder(message, args) {
   const reminderMessage = args.slice(1).join(' ') || 'No message specified';
   const remindAt = new Date(Date.now() + duration);
 
-  // Check user's reminder count (max 25)
-  const userReminders = await Reminder.getUserReminders(message.author.id);
-  if (userReminders.length >= 25) {
+  // Check the member's reminder count in this server
+  const userReminders = await Reminder.getUserReminders(message.author.id, guildId);
+  if (userReminders.length >= MAX_REMINDERS) {
     return message.reply({
-      embeds: [await errorEmbed(message.guild.id, 'Reminder Limit',
-        '**Notice:** Maximum reminder capacity (25) reached, Master. Remove existing entries with `remind delete <number>`.')]
+      embeds: [await errorEmbed(guildId, 'Reminder Limit',
+        `**Notice:** Maximum reminder capacity (${MAX_REMINDERS}) reached in this server, Master. Remove existing entries with \`remind delete <number>\`.`)]
     });
   }
 
   // Create reminder
   await Reminder.createReminder({
-    guildId: message.guild.id,
+    guildId,
     channelId: message.channel.id,
     userId: message.author.id,
     message: reminderMessage,
     remindAt
   });
 
-  const embed = await successEmbed(message.guild.id, '『 Temporal Alert Scheduled 』',
-    `${GLYPHS.SUCCESS} **Confirmed:** Alert scheduled for <t:${Math.floor(remindAt.getTime() / 1000)}:R>, Master.\n\n` +
-    `**Message:** ${reminderMessage}`
+  const embed = await successEmbed(guildId, 'Temporal Alert Scheduled',
+    truncate(
+      `${GLYPHS.SUCCESS} **Confirmed:** Alert scheduled for <t:${Math.floor(remindAt.getTime() / 1000)}:R>, Master.\n\n` +
+      `**Message:** ${truncate(reminderMessage, MAX_MESSAGE_DISPLAY)}`,
+      EMBED_DESCRIPTION_LIMIT
+    )
   );
 
   return message.reply({ embeds: [embed] });
 }
 
 async function listReminders(message) {
-  const reminders = await Reminder.getUserReminders(message.author.id);
+  const guildId = message.guild.id;
+  const reminders = await Reminder.getUserReminders(message.author.id, guildId);
 
   if (reminders.length === 0) {
     return message.reply({
-      embeds: [await infoEmbed(message.guild.id, '『 Temporal Alerts 』',
-        '**Notice:** No active temporal alerts detected in your registry, Master.')]
+      embeds: [await infoEmbed(guildId, 'Temporal Alerts',
+        '**Notice:** No active temporal alerts detected in your registry for this server, Master.')]
     });
   }
 
   const reminderList = reminders.map((r, i) =>
-    `**${i + 1}.** ${r.message.slice(0, 50)}${r.message.length > 50 ? '...' : ''}\n` +
+    `**${i + 1}.** ${preview(r.message)}\n` +
     `   ${GLYPHS.DOT} Reminds: <t:${Math.floor(r.remindAt.getTime() / 1000)}:R>`
   ).join('\n\n');
 
-  const embed = await infoEmbed(message.guild.id, '『 Temporal Alerts 』',
-    `${reminderList}\n\n` +
-    `Use \`remind delete <number>\` to remove a reminder.`
+  const embed = await infoEmbed(guildId, 'Temporal Alerts',
+    truncate(`${reminderList}\n\nUse \`remind delete <number>\` to remove a reminder.`, EMBED_DESCRIPTION_LIMIT)
   );
 
   return message.reply({ embeds: [embed] });
 }
 
-async function deleteReminder(message, indexStr) {
-  const reminders = await Reminder.getUserReminders(message.author.id);
+/**
+ * Delete by list number (as shown by `remind list`) or by reminder ID.
+ * Either way only the author's own pending reminders in this server can be touched.
+ */
+async function deleteReminder(message, target) {
+  const guildId = message.guild.id;
+  const userId = message.author.id;
 
-  if (reminders.length === 0) {
+  if (!target) {
     return message.reply({
-      embeds: [await infoEmbed(message.guild.id, 'No Reminders',
-        'You have no active reminders to delete.')]
+      embeds: [await errorEmbed(guildId, 'Missing Number',
+        '**Notice:** Specify which reminder to delete, Master: `remind delete <number>`. Use `remind list` to view the numbers.')]
     });
   }
 
-  const index = parseInt(indexStr) - 1;
-  if (isNaN(index) || index < 0 || index >= reminders.length) {
-    return message.reply({
-      embeds: [await errorEmbed(message.guild.id, 'Invalid Number',
-        `Please provide a number between 1 and ${reminders.length}.`)]
-    });
+  let removed = null;
+
+  if (/^[a-f\d]{24}$/i.test(target)) {
+    removed = await Reminder.deleteUserReminder(userId, guildId, target);
+  } else {
+    const reminders = await Reminder.getUserReminders(userId, guildId);
+
+    if (reminders.length === 0) {
+      return message.reply({
+        embeds: [await infoEmbed(guildId, 'No Reminders',
+          '**Notice:** You have no active reminders in this server to delete, Master.')]
+      });
+    }
+
+    const index = /^\d+$/.test(target) ? Number.parseInt(target, 10) - 1 : -1;
+    if (index < 0 || index >= reminders.length) {
+      return message.reply({
+        embeds: [await errorEmbed(guildId, 'Invalid Number',
+          `**Notice:** Please provide a number between 1 and ${reminders.length}, Master.`)]
+      });
+    }
+
+    removed = await Reminder.deleteUserReminder(userId, guildId, reminders[index]._id);
   }
 
-  const reminder = reminders[index];
-  await Reminder.findByIdAndDelete(reminder._id);
+  if (!removed) {
+    return message.reply({
+      embeds: [await errorEmbed(guildId, 'Reminder Not Found',
+        '**Notice:** That reminder no longer exists in your registry for this server, Master. It may have already been delivered.')]
+    });
+  }
 
   return message.reply({
-    embeds: [await successEmbed(message.guild.id, 'Reminder Deleted',
-      `${GLYPHS.SUCCESS} Deleted reminder: "${reminder.message.slice(0, 50)}${reminder.message.length > 50 ? '...' : ''}"`)]
+    embeds: [await successEmbed(guildId, 'Reminder Deleted',
+      `${GLYPHS.SUCCESS} Deleted reminder: "${preview(removed.message)}"`)]
   });
+}
+
+// Single-line preview of a reminder message
+function preview(text) {
+  const value = String(text || '').replace(/\s+/g, ' ').trim();
+  return value.length > PREVIEW_LENGTH ? `${value.slice(0, PREVIEW_LENGTH)}...` : value;
+}
+
+function truncate(text, max) {
+  const value = String(text ?? '');
+  return value.length > max ? `${value.slice(0, max - 3)}...` : value;
 }
 
 // Helper function to parse duration (supports combined formats like 1h30m)

@@ -75,13 +75,48 @@ const ticketSchema = new mongoose.Schema({
 ticketSchema.index({ guildId: 1, ticketNumber: 1 }, { unique: true });
 ticketSchema.index({ guildId: 1, status: 1 });
 
+// Per-guild ticket number counter. A single $inc on one document is atomic, so concurrent
+// ticket opens can never be handed the same number (reading max+1 raced on the unique index).
+// seq deliberately has no schema default: an upsert would otherwise add $setOnInsert { seq }
+// and conflict with the $max below.
+const ticketCounterSchema = new mongoose.Schema({
+    guildId: {
+        type: String,
+        required: true,
+        unique: true
+    },
+    seq: Number
+}, {
+    versionKey: false
+});
+
+export const TicketCounter = mongoose.model('TicketCounter', ticketCounterSchema);
+
 // Get next ticket number
 ticketSchema.statics.getNextTicketNumber = async function(guildId) {
+    // Keep the counter at or above the highest number already used. This seeds it for guilds
+    // that had tickets before the counter existed, and $max can only raise it, never lower it.
     const lastTicket = await this.findOne({ guildId })
         .sort({ ticketNumber: -1 })
-        .limit(1);
-    
-    return lastTicket ? lastTicket.ticketNumber + 1 : 1;
+        .select('ticketNumber')
+        .lean();
+    const floor = lastTicket?.ticketNumber || 0;
+
+    try {
+        await TicketCounter.updateOne({ guildId }, { $max: { seq: floor } }, { upsert: true });
+    } catch (error) {
+        // Two first-ever tickets raced to insert the counter; the other insert won, so update it
+        if (error?.code !== 11000) throw error;
+        await TicketCounter.updateOne({ guildId }, { $max: { seq: floor } });
+    }
+
+    const counter = await TicketCounter.findOneAndUpdate(
+        { guildId },
+        { $inc: { seq: 1 } },
+        { new: true, upsert: true }
+    ).lean();
+
+    return counter.seq;
 };
 
 // Add message to ticket

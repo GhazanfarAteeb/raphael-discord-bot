@@ -4,6 +4,16 @@
  */
 
 import Command from "../../structures/Command.js";
+import { errorEmbed, successEmbed } from "../../utils/embeds.js";
+import { buildControlRow } from "../../music/format.js";
+
+const MODE_ALIASES = { track: "track", queue: "queue", off: "off", none: "off" };
+const LOOP_CYCLE = { off: "track", track: "queue", queue: "off" };
+const LOOP_MESSAGES = {
+  track: "**Confirmed.** Now repeating the current track, Master.",
+  queue: "**Confirmed.** Now repeating the entire queue, Master.",
+  off: "**Confirmed.** Repeat mode disabled, Master.",
+};
 
 export default class Loop extends Command {
   constructor(client) {
@@ -39,7 +49,7 @@ export default class Loop extends Command {
           choices: [
             { name: "Track", value: "track" },
             { name: "Queue", value: "queue" },
-            { name: "Off", value: "none" },
+            { name: "Off", value: "off" },
           ],
         },
       ],
@@ -47,82 +57,66 @@ export default class Loop extends Command {
   }
 
   async run(client, ctx, args) {
-    const player = client.moonlink?.players.get(ctx.guild.id);
+    const guildId = ctx.guild.id;
 
-    if (!player) {
-      return ctx.sendMessage({
-        embeds: [
-          {
-            color: 0xff4757,
-            description:
-              "**Warning:** No audio playback system detected, Master.",
-          },
-        ],
-      });
-    }
+    try {
+      const player = client.moonlink?.players.get(guildId);
 
-    const mode = args[0]?.toLowerCase();
-
-    // If specific mode provided
-    if (mode) {
-      if (!["track", "queue", "off", "none"].includes(mode)) {
+      if (!player || player.destroyed) {
         return ctx.sendMessage({
           embeds: [
-            {
-              color: 0xff4757,
-              description:
-                "**Warning:** Invalid mode. Valid options: `track`, `queue`, `off`, Master.",
-            },
+            await errorEmbed(
+              guildId,
+              "Audio System",
+              "**Warning:** No audio playback system detected, Master.",
+            ),
           ],
         });
       }
 
-      const loopMode = mode === "off" ? "none" : mode;
-      player.setLoop(loopMode);
+      const mode = args[0]?.toLowerCase();
+      let newLoop;
 
-      const messages = {
-        track: "**Confirmed:** Now repeating current track, Master.",
-        queue: "**Confirmed:** Now repeating entire queue, Master.",
-        none: "**Confirmed:** Repeat mode disabled, Master.",
-      };
+      if (mode) {
+        // moonlink's PlayerLoop is "off" | "track" | "queue"; "none" is accepted as an alias
+        newLoop = Object.hasOwn(MODE_ALIASES, mode) ? MODE_ALIASES[mode] : null;
+        if (!newLoop) {
+          return ctx.sendMessage({
+            embeds: [
+              await errorEmbed(
+                guildId,
+                "Audio System",
+                "**Warning:** Invalid mode. Valid options: `track`, `queue`, `off`, Master.",
+              ),
+            ],
+          });
+        }
+      } else {
+        // Toggle through modes if no argument: off -> track -> queue -> off
+        newLoop = LOOP_CYCLE[player.loop] ?? "track";
+      }
+
+      player.setLoop(newLoop);
+
+      // Keep the now-playing card's loop button in step with the new mode
+      await player.message
+        ?.edit({ components: [buildControlRow(player)] })
+        .catch(() => {});
 
       return ctx.sendMessage({
+        embeds: [await successEmbed(guildId, "Loop Mode", LOOP_MESSAGES[newLoop])],
+      });
+    } catch (error) {
+      client.logger.error("[Music:loop] Error:", error);
+      return ctx.sendMessage({
         embeds: [
-          {
-            color: 0x00ced1,
-            description: messages[loopMode],
-          },
+          await errorEmbed(
+            guildId,
+            "Audio System",
+            "**Alert:** An anomaly occurred while changing the loop mode, Master.",
+          ),
         ],
       });
     }
-
-    // Toggle through modes if no argument
-    // moonlink default is 'off'; normalize to 'none' for toggle logic
-    const currentLoop =
-      player.loop === "track" || player.loop === "queue" ? player.loop : "none";
-    let newLoop;
-    let message;
-
-    if (currentLoop === "none") {
-      newLoop = "track";
-      message = "**Confirmed:** Now repeating current track, Master.";
-    } else if (currentLoop === "track") {
-      newLoop = "queue";
-      message = "**Confirmed:** Now repeating entire queue, Master.";
-    } else {
-      newLoop = "none";
-      message = "**Confirmed:** Repeat mode disabled, Master.";
-    }
-
-    player.setLoop(newLoop);
-
-    return ctx.sendMessage({
-      embeds: [
-        {
-          color: 0x00ced1,
-          description: message,
-        },
-      ],
-    });
   }
 }

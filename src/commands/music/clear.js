@@ -4,6 +4,7 @@
  */
 
 import Command from "../../structures/Command.js";
+import { errorEmbed, successEmbed, warningEmbed } from "../../utils/embeds.js";
 
 export default class Clear extends Command {
   constructor(client) {
@@ -35,41 +36,34 @@ export default class Clear extends Command {
   }
 
   async run(client, ctx, args) {
-    const player = client.moonlink?.players.get(ctx.guild.id);
+    const guildId = ctx.guild.id;
+    const fail = async (description) =>
+      ctx.sendMessage({ embeds: [await errorEmbed(guildId, "Audio System", description)] });
+    const notice = async (description) =>
+      ctx.sendMessage({ embeds: [await warningEmbed(guildId, "Audio System", description)] });
+    const confirm = async (description) =>
+      ctx.sendMessage({ embeds: [await successEmbed(guildId, "Audio System", description)] });
 
-    if (!player) {
-      return ctx.sendMessage({
-        embeds: [
-          {
-            color: 0xff4757,
-            description:
-              "**Warning:** No active audio session detected, Master.",
-          },
-        ],
-      });
+    try {
+      const player = client.moonlink?.players.get(guildId);
+
+      if (!player || player.destroyed) {
+        return await fail("**Warning:** No active audio session detected, Master.");
+      }
+
+      if (player.queue.isEmpty) {
+        return await notice("**Notice:** The queue is already empty, Master.");
+      }
+
+      const queueLength = player.queue.size;
+      player.queue.clear();
+
+      return await confirm(
+        `**Confirmed.** Queue purged. **${queueLength}** track${queueLength !== 1 ? "s" : ""} removed, Master.`,
+      );
+    } catch (error) {
+      client.logger.error("[Music:clear] Error:", error);
+      return fail("**Alert:** An anomaly occurred while clearing the queue, Master.");
     }
-
-    if (player.queue.isEmpty) {
-      return ctx.sendMessage({
-        embeds: [
-          {
-            color: 0xffd700,
-            description: "**Notice:** The queue is already empty, Master.",
-          },
-        ],
-      });
-    }
-
-    const queueLength = player.queue.size;
-    player.queue.clear();
-
-    return ctx.sendMessage({
-      embeds: [
-        {
-          color: 0x00ced1,
-          description: `**Confirmed:** Queue purged. **${queueLength}** track${queueLength !== 1 ? "s" : ""} removed, Master.`,
-        },
-      ],
-    });
   }
 }

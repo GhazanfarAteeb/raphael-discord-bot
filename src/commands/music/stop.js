@@ -4,6 +4,11 @@
  */
 
 import Command from "../../structures/Command.js";
+import { errorEmbed, successEmbed } from "../../utils/embeds.js";
+import { clearNowPlaying } from "../../music/RiffyManager.js";
+
+// Gateway opcode 4: Voice State Update
+const GATEWAY_VOICE_STATE_UPDATE = 4;
 
 export default class Stop extends Command {
   constructor(client) {
@@ -35,31 +40,66 @@ export default class Stop extends Command {
   }
 
   async run(client, ctx, args) {
-    const player = client.moonlink?.players.get(ctx.guild.id);
+    const guildId = ctx.guild.id;
 
-    if (!player) {
+    try {
+      const player = client.moonlink?.players.get(guildId);
+
+      if (!player || player.destroyed) {
+        // No session, but still in a voice channel (e.g. a session lost to a restart)
+        // Leave over the gateway as moonlink does (the REST route needs Move Members)
+        if (!player && ctx.guild.members.me?.voice?.channelId) {
+          ctx.guild.shard.send({
+            op: GATEWAY_VOICE_STATE_UPDATE,
+            d: { guild_id: guildId, channel_id: null, self_mute: false, self_deaf: false },
+          });
+          return ctx.sendMessage({
+            embeds: [
+              await successEmbed(
+                guildId,
+                "Audio System",
+                "**Confirmed.** Voice connection severed, Master.",
+              ),
+            ],
+          });
+        }
+
+        return ctx.sendMessage({
+          embeds: [
+            await errorEmbed(
+              guildId,
+              "Audio System",
+              "**Warning:** No audio playback system detected, Master.",
+            ),
+          ],
+        });
+      }
+
+      // Remove the now-playing card (its buttons would otherwise stay live),
+      // then clear the queue, leave the channel and release the node player.
+      await clearNowPlaying(player);
+      await player.destroy("Stop command");
+
       return ctx.sendMessage({
         embeds: [
-          {
-            color: 0xff4757,
-            description:
-              "**Warning:** No audio playback system detected, Master.",
-          },
+          await successEmbed(
+            guildId,
+            "Audio System",
+            "**Confirmed.** Audio playback terminated and voice connection severed, Master.",
+          ),
+        ],
+      });
+    } catch (error) {
+      client.logger.error("[Music:stop] Error:", error);
+      return ctx.sendMessage({
+        embeds: [
+          await errorEmbed(
+            guildId,
+            "Audio System",
+            "**Alert:** An anomaly occurred while terminating playback, Master.",
+          ),
         ],
       });
     }
-
-    // Clear the queue and destroy the player
-    player.destroy();
-
-    return ctx.sendMessage({
-      embeds: [
-        {
-          color: 0x00ced1,
-          description:
-            "**Confirmed:** Audio playback terminated and voice connection severed, Master.",
-        },
-      ],
-    });
   }
 }

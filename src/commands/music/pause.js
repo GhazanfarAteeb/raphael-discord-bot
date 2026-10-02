@@ -4,6 +4,8 @@
  */
 
 import Command from "../../structures/Command.js";
+import { errorEmbed, successEmbed, warningEmbed } from "../../utils/embeds.js";
+import { buildControlRow } from "../../music/format.js";
 
 export default class Pause extends Command {
   constructor(client) {
@@ -35,41 +37,38 @@ export default class Pause extends Command {
   }
 
   async run(client, ctx, args) {
-    const player = client.moonlink?.players.get(ctx.guild.id);
+    const guildId = ctx.guild.id;
+    const fail = async (description) =>
+      ctx.sendMessage({ embeds: [await errorEmbed(guildId, "Audio System", description)] });
+    const notice = async (description) =>
+      ctx.sendMessage({ embeds: [await warningEmbed(guildId, "Audio System", description)] });
+    const confirm = async (description) =>
+      ctx.sendMessage({ embeds: [await successEmbed(guildId, "Audio System", description)] });
 
-    if (!player) {
-      return ctx.sendMessage({
-        embeds: [
-          {
-            color: 0xff4757,
-            description:
-              "**Warning:** No audio playback system detected, Master.",
-          },
-        ],
-      });
+    try {
+      const player = client.moonlink?.players.get(guildId);
+
+      if (!player || player.destroyed) {
+        return await fail("**Warning:** No active audio session detected, Master.");
+      }
+
+      if (player.paused) {
+        return await notice(
+          "**Notice:** Audio stream is already suspended, Master. Use `resume` to continue.",
+        );
+      }
+
+      await player.pause();
+
+      // Keep the now-playing card's Pause/Resume button in step
+      await player.message
+        ?.edit({ components: [buildControlRow(player)] })
+        .catch(() => {});
+
+      return await confirm("**Confirmed.** Audio stream suspended, Master.");
+    } catch (error) {
+      client.logger.error("[Music:pause] Error:", error);
+      return fail("**Alert:** An anomaly occurred while pausing playback, Master.");
     }
-
-    if (player.paused) {
-      return ctx.sendMessage({
-        embeds: [
-          {
-            color: 0xffd700,
-            description:
-              "**Notice:** Audio stream is already suspended, Master. Use `resume` to continue.",
-          },
-        ],
-      });
-    }
-
-    await player.pause();
-
-    return ctx.sendMessage({
-      embeds: [
-        {
-          color: 0x00ced1,
-          description: "**Confirmed:** Audio stream suspended, Master.",
-        },
-      ],
-    });
   }
 }

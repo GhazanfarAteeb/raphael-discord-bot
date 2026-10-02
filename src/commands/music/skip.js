@@ -4,6 +4,11 @@
  */
 
 import Command from "../../structures/Command.js";
+import { errorEmbed, successEmbed } from "../../utils/embeds.js";
+import { truncate } from "../../music/format.js";
+import { skipCurrent } from "../../music/RiffyManager.js";
+
+const MAX_TITLE_LENGTH = 200;
 
 export default class Skip extends Command {
   constructor(client) {
@@ -35,30 +40,60 @@ export default class Skip extends Command {
   }
 
   async run(client, ctx, args) {
-    const player = client.moonlink?.players.get(ctx.guild.id);
+    const guildId = ctx.guild.id;
 
-    if (!player) {
+    try {
+      const player = client.moonlink?.players.get(guildId);
+
+      if (!player || player.destroyed) {
+        return ctx.sendMessage({
+          embeds: [
+            await errorEmbed(
+              guildId,
+              "Audio System",
+              "**Warning:** No audio playback system detected, Master.",
+            ),
+          ],
+        });
+      }
+
+      const { ok, ended, track } = await skipCurrent(player);
+      const title = truncate(track?.title || "the current track", MAX_TITLE_LENGTH);
+
+      if (!ok) {
+        return ctx.sendMessage({
+          embeds: [
+            await errorEmbed(
+              guildId,
+              "Audio System",
+              "**Warning:** The next track could not be started, Master. Please retry.",
+            ),
+          ],
+        });
+      }
+
       return ctx.sendMessage({
         embeds: [
-          {
-            color: 0xff4757,
-            description:
-              "**Warning:** No audio playback system detected, Master.",
-          },
+          await successEmbed(
+            guildId,
+            "Track Skipped",
+            ended
+              ? `**Confirmed.** Skipped **${title}**. The queue is empty, so the audio session has been concluded, Master.`
+              : `**Confirmed.** Skipped **${title}**, Master.`,
+          ),
+        ],
+      });
+    } catch (error) {
+      client.logger.error("[Music:skip] Error:", error);
+      return ctx.sendMessage({
+        embeds: [
+          await errorEmbed(
+            guildId,
+            "Audio System",
+            "**Alert:** An anomaly occurred while skipping the track, Master.",
+          ),
         ],
       });
     }
-
-    const currentTrack = player.current;
-    await player.skip();
-
-    return ctx.sendMessage({
-      embeds: [
-        {
-          color: 0x00ced1,
-          description: `**Confirmed:** Skipped **${currentTrack?.title || "the current track"}**, Master.`,
-        },
-      ],
-    });
   }
 }

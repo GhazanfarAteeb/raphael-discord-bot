@@ -1,168 +1,147 @@
 import { AttachmentBuilder, EmbedBuilder } from 'discord.js';
 import { createCanvas, loadImage } from '@napi-rs/canvas';
 import '../../utils/fonts.js';
-import { getPrefix } from '../../utils/helpers.js';
+import { getPrefix, escapeMarkdown, truncate } from '../../utils/helpers.js';
+import { COLORS, errorEmbed, infoEmbed, warningEmbed } from '../../utils/embeds.js';
+import { getRandomFooter } from '../../utils/raphael.js';
 
-const memeTemplates = {
-  // Meme templates with overlay positions
-  spongebob: {
-    name: 'Spongebob Chicken',
-    url: 'https://i.imgur.com/QvHMEfj.png',
-    avatar: { x: 300, y: 120, size: 150 }
-  },
-  slap: {
-    name: 'Slap',
-    url: 'https://i.imgur.com/QvHMEfj.png', // You'll need to replace these with actual meme template URLs
-    avatar: { x: 200, y: 100, size: 120 }
-  },
-  drake: {
-    name: 'Drake',
-    url: 'https://i.imgur.com/QvHMEfj.png',
-    avatar: { x: 150, y: 150, size: 180 }
-  },
-  distracted: {
-    name: 'Distracted Boyfriend',
-    url: 'https://i.imgur.com/QvHMEfj.png',
-    avatar: { x: 250, y: 80, size: 100 }
-  },
-  emergencymeeting: {
-    name: 'Emergency Meeting',
-    url: 'https://i.imgur.com/QvHMEfj.png',
-    avatar: { x: 220, y: 140, size: 130 }
-  },
-  headpat: {
-    name: 'Head Pat',
-    url: 'https://i.imgur.com/QvHMEfj.png',
-    avatar: { x: 180, y: 100, size: 110 }
-  },
-  tradeoffer: {
-    name: 'Trade Offer',
-    url: 'https://i.imgur.com/QvHMEfj.png',
-    avatar: { x: 200, y: 90, size: 120 }
-  },
-  waddle: {
-    name: 'Waddle',
-    url: 'https://i.imgur.com/QvHMEfj.png',
-    avatar: { x: 190, y: 110, size: 115 }
-  },
-  communism: {
-    name: 'Our Comrade',
-    url: 'https://i.imgur.com/QvHMEfj.png',
-    avatar: { x: 210, y: 95, size: 125 }
-  },
-  eject: {
-    name: 'Among Us Eject',
-    url: 'https://i.imgur.com/QvHMEfj.png',
-    avatar: { x: 175, y: 85, size: 105 }
-  }
+// There are no meme template images: the command draws a caption card (the avatar on a
+// gradient, captioned with the meme's name). Each entry is only the caption text.
+const memeCaptions = {
+  spongebob: 'Spongebob Chicken',
+  slap: 'Slap',
+  drake: 'Drake',
+  distracted: 'Distracted Boyfriend',
+  emergencymeeting: 'Emergency Meeting',
+  headpat: 'Head Pat',
+  tradeoffer: 'Trade Offer',
+  waddle: 'Waddle',
+  communism: 'Our Comrade',
+  eject: 'Among Us Eject'
 };
+
+const CANVAS_SIZE = 600;
+const AVATAR_RADIUS = 150;
+// Keep captions inside the card with a margin on both sides
+const TEXT_MAX_WIDTH = CANVAS_SIZE - 40;
+
+const captionList = () => Object.keys(memeCaptions).map(key => `\`${key}\``).join(', ');
 
 export default {
   name: 'meme',
-  description: 'Generate memes with user avatars',
-  usage: 'meme <template> [@user]',
+  description: 'Generate a captioned meme card from a user avatar',
+  usage: 'meme <caption> [@user]',
   aliases: ['memegen', 'makememe'],
   category: 'utility',
   cooldown: 5,
 
   execute: async (message, args) => {
-    if (!args.length) {
-      const prefix = await getPrefix(message.guild.id);
-      const templateList = Object.keys(memeTemplates).join(', ');
-      return message.reply(
-        `🎨 **Meme Generator**\n\n` +
-        `**Available templates:**\n${templateList}\n\n` +
-        `**Usage:** \`${prefix}meme <template> [@user]\`\n` +
-        `**Example:** \`${prefix}meme spongebob @user\` or \`${prefix}meme drake\` (uses your avatar)`
-      );
-    }
-
-    const template = args[0].toLowerCase();
-    
-    if (!memeTemplates[template]) {
-      const templateList = Object.keys(memeTemplates).join(', ');
-      return message.reply(`❌ Unknown template: **${template}**\n\n**Available templates:**\n${templateList}`);
-    }
-
-    const targetUser = message.mentions.users.first() || message.author;
-    const memeData = memeTemplates[template];
+    const guildId = message.guild.id;
 
     try {
-      const msg = await message.reply('🎨 Generating meme...');
+      if (!args.length) {
+        const prefix = await getPrefix(guildId);
+        return message.reply({
+          embeds: [await infoEmbed(
+            guildId,
+            'Meme Card Generator',
+            '**Analysis:** I render the chosen caption over the avatar on a generated card, Master. ' +
+            'The original meme artwork is not used.\n\n' +
+            `**Available captions:**\n${captionList()}\n\n` +
+            `**Usage:** \`${prefix}meme <caption> [@user]\`\n` +
+            `**Example:** \`${prefix}meme spongebob @user\` or \`${prefix}meme drake\` (uses your avatar)`
+          )]
+        });
+      }
 
-      // For now, we'll use a simpler implementation with just avatar overlay
-      // You can add actual meme template images later
-      const canvas = createCanvas(600, 600);
+      const key = args[0].toLowerCase();
+
+      if (!Object.hasOwn(memeCaptions, key)) {
+        return message.reply({
+          embeds: [await warningEmbed(
+            guildId,
+            'Unknown Caption',
+            `No caption named \`${truncate(key.replace(/`/g, ''), 100)}\` exists, Master.\n\n**Available captions:**\n${captionList()}`
+          )]
+        });
+      }
+
+      const targetUser = message.mentions.users.first() || message.author;
+      const caption = memeCaptions[key];
+
+      await message.channel.sendTyping().catch(() => {});
+
+      const canvas = createCanvas(CANVAS_SIZE, CANVAS_SIZE);
       const ctx = canvas.getContext('2d');
 
       // Background
-      const gradient = ctx.createLinearGradient(0, 0, 600, 600);
+      const gradient = ctx.createLinearGradient(0, 0, CANVAS_SIZE, CANVAS_SIZE);
       gradient.addColorStop(0, '#667eea');
       gradient.addColorStop(1, '#764ba2');
       ctx.fillStyle = gradient;
-      ctx.fillRect(0, 0, 600, 600);
+      ctx.fillRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
 
-      // Load user avatar
-      const avatarURL = targetUser.displayAvatarURL({ extension: 'png', size: 512 });
+      // Load user avatar (static frame, so animated avatars decode too)
+      const avatarURL = targetUser.displayAvatarURL({ extension: 'png', size: 512, forceStatic: true });
       const avatar = await loadImage(avatarURL);
 
       // Draw circular avatar
-      const centerX = 300;
-      const centerY = 300;
-      const radius = 150;
+      const center = CANVAS_SIZE / 2;
 
       ctx.save();
       ctx.beginPath();
-      ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
+      ctx.arc(center, center, AVATAR_RADIUS, 0, Math.PI * 2);
       ctx.closePath();
       ctx.clip();
-      ctx.drawImage(avatar, centerX - radius, centerY - radius, radius * 2, radius * 2);
+      ctx.drawImage(avatar, center - AVATAR_RADIUS, center - AVATAR_RADIUS, AVATAR_RADIUS * 2, AVATAR_RADIUS * 2);
       ctx.restore();
 
       // Border
       ctx.strokeStyle = '#ffffff';
       ctx.lineWidth = 8;
       ctx.beginPath();
-      ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
+      ctx.arc(center, center, AVATAR_RADIUS, 0, Math.PI * 2);
       ctx.stroke();
 
-      // Meme text
+      // Caption text (maxWidth squeezes long captions/usernames instead of clipping them)
       ctx.fillStyle = '#ffffff';
       ctx.font = 'bold 40px Arial';
       ctx.textAlign = 'center';
       ctx.strokeStyle = '#000000';
       ctx.lineWidth = 3;
-      
-      const memeText = memeData.name.toUpperCase();
-      ctx.strokeText(memeText, 300, 80);
-      ctx.fillText(memeText, 300, 80);
+
+      const topText = caption.toUpperCase();
+      ctx.strokeText(topText, center, 80, TEXT_MAX_WIDTH);
+      ctx.fillText(topText, center, 80, TEXT_MAX_WIDTH);
 
       // Bottom text
       ctx.font = 'bold 30px Arial';
       const bottomText = targetUser.username.toUpperCase();
-      ctx.strokeText(bottomText, 300, 550);
-      ctx.fillText(bottomText, 300, 550);
+      ctx.strokeText(bottomText, center, 550, TEXT_MAX_WIDTH);
+      ctx.fillText(bottomText, center, 550, TEXT_MAX_WIDTH);
 
-      const attachment = new AttachmentBuilder(canvas.toBuffer('image/png'), {
-        name: `${template}-meme.png`
-      });
+      const fileName = `${key}-meme.png`;
+      const attachment = new AttachmentBuilder(canvas.toBuffer('image/png'), { name: fileName });
 
       const embed = new EmbedBuilder()
-        .setColor('#764ba2')
-        .setTitle(`🎭 ${memeData.name} Meme`)
-        .setDescription(`Featuring: **${targetUser.username}**`)
-        .setImage(`attachment://${template}-meme.png`)
-        .setFooter({
-          text: `Requested by ${message.author.tag}`,
-          iconURL: message.author.displayAvatarURL({ dynamic: true })
-        })
+        .setColor(COLORS.RAPHAEL)
+        .setTitle(`『 ${caption} 』`)
+        .setDescription(`**Analysis:** Meme card rendered, Master.\n› Featuring: **${escapeMarkdown(targetUser.username)}**`)
+        .setImage(`attachment://${fileName}`)
+        .setFooter({ text: getRandomFooter() })
         .setTimestamp();
 
-      await msg.edit({ content: null, embeds: [embed], files: [attachment] });
+      return message.reply({ embeds: [embed], files: [attachment] });
 
     } catch (error) {
       console.error('Meme generation error:', error);
-      return message.reply('❌ Failed to generate meme. Please try again later!');
+      try {
+        await message.reply({
+          embeds: [await errorEmbed(guildId, 'Generation Failed', 'The meme card could not be generated, Master. Please try again later.')]
+        });
+      } catch {
+        // Reply failed too (message deleted or no permission); nothing more to do
+      }
     }
   }
 };

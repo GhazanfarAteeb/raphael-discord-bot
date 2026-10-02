@@ -9,8 +9,23 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  MessageFlags,
 } from "discord.js";
 import { getRandomFooter } from "../../utils/raphael.js";
+import { COLORS, errorEmbed, warningEmbed } from "../../utils/embeds.js";
+import {
+  formatQueueDuration,
+  formatTrackDuration,
+  safeUrl,
+  trackLink,
+} from "../../music/format.js";
+
+const PAGE_SIZE = 10;
+const COLLECTOR_TIMEOUT_MS = 120000;
+const NOW_PLAYING_TITLE_LENGTH = 50;
+const QUEUE_TITLE_LENGTH = 40;
+// Field values are capped at 1024 characters; leave room for the "...and N more" note
+const QUEUE_FIELD_BUDGET = 980;
 
 export default class Queue extends Command {
   constructor(client) {
@@ -49,232 +64,180 @@ export default class Queue extends Command {
   }
 
   async run(client, ctx, args) {
-    const player = client.moonlink?.players.get(ctx.guild.id);
+    const guildId = ctx.guild.id;
 
-    if (!player) {
+    try {
+      const player = client.moonlink?.players.get(guildId);
+
+      if (!player || player.destroyed) {
+        return ctx.sendMessage({
+          embeds: [
+            await errorEmbed(
+              guildId,
+              "Audio Queue",
+              "**Warning:** No audio playback system detected, Master.",
+            ),
+          ],
+        });
+      }
+
+      // Check if nothing is playing
+      if (!player.current && player.queue.isEmpty) {
+        return ctx.sendMessage({
+          embeds: [
+            await warningEmbed(
+              guildId,
+              "Audio Queue",
+              "**Notice:** The audio queue is vacant, Master. Use `play` to add tracks.",
+            ),
+          ],
+        });
+      }
+
+      // The queue can change while the pages are open, so every render reads it afresh
+      const pageCount = () => Math.max(1, Math.ceil(player.queue.size / PAGE_SIZE));
+      const clampPage = (value) => Math.min(Math.max(1, value), pageCount());
+
+      let currentPage = clampPage(parseInt(args[0], 10) || 1);
+
+      const message = await ctx.sendMessage({
+        embeds: [this.buildEmbed(player, currentPage, pageCount())],
+        components: pageCount() > 1 ? [this.buildButtons(currentPage, pageCount())] : [],
+      });
+
+      // If only one page, no need for collector
+      if (pageCount() <= 1 || !message?.createMessageComponentCollector) return;
+
+      const collector = message.createMessageComponentCollector({
+        time: COLLECTOR_TIMEOUT_MS,
+      });
+
+      collector.on("collect", async (interaction) => {
+        try {
+          if (interaction.user.id !== ctx.author.id) {
+            return await interaction.reply({
+              content: "**Notice:** These controls belong to the member who requested the queue, Master.",
+              flags: MessageFlags.Ephemeral,
+            });
+          }
+
+          switch (interaction.customId) {
+            case "queue_first":
+              currentPage = 1;
+              break;
+            case "queue_prev":
+              currentPage -= 1;
+              break;
+            case "queue_next":
+              currentPage += 1;
+              break;
+            case "queue_last":
+              currentPage = pageCount();
+              break;
+          }
+          currentPage = clampPage(currentPage);
+
+          await interaction.update({
+            embeds: [this.buildEmbed(player, currentPage, pageCount())],
+            components: [this.buildButtons(currentPage, pageCount())],
+          });
+        } catch (error) {
+          client.logger.error("[Music:queue] Page change failed:", error);
+        }
+      });
+
+      collector.on("end", async () => {
+        // Disable all buttons when collector ends
+        await message
+          .edit({ components: [this.buildButtons(currentPage, pageCount(), true)] })
+          .catch(() => {});
+      });
+    } catch (error) {
+      client.logger.error("[Music:queue] Error:", error);
       return ctx.sendMessage({
         embeds: [
-          {
-            color: 0xff4757,
-            description:
-              "**Warning:** No audio playback system detected, Master.",
-          },
+          await errorEmbed(
+            guildId,
+            "Audio Queue",
+            "**Alert:** An anomaly occurred while retrieving the queue, Master.",
+          ),
         ],
       });
     }
+  }
 
+  buildEmbed(player, currentPage, totalPages) {
     const current = player.current;
     const queue = player.queue.tracks || [];
+    const startIndex = (currentPage - 1) * PAGE_SIZE;
 
-    // Check if nothing is playing
-    if (!current && queue.length === 0) {
-      return ctx.sendMessage({
-        embeds: [
-          {
-            color: 0xffd700,
-            description:
-              "**Notice:** The audio queue is vacant, Master. Use `play` to add tracks.",
-          },
-        ],
-      });
+    const embed = new EmbedBuilder()
+      .setColor(COLORS.RAPHAEL)
+      .setTitle("『 Audio Queue 』")
+      .setThumbnail(safeUrl(current?.thumbnail));
+
+    // Now playing - truncate title if too long
+    if (current) {
+      embed.setDescription(
+        `**▸ Currently Processing:**\n${trackLink(current, NOW_PLAYING_TITLE_LENGTH)} \`[${formatTrackDuration(current)}]\`\nRequested by: ${current.requester?.toString() || "Unknown"}`,
+      );
     }
 
-    // Pagination
-    let page = parseInt(args[0]) || 1;
-    const pageSize = 10;
-    const totalPages = Math.ceil(player.queue.size / pageSize) || 1;
+    // Queue list - kept within the 1024-character field limit
+    let queueList = "";
+    const queueSlice = queue.slice(startIndex, startIndex + PAGE_SIZE);
+    for (let i = 0; i < queueSlice.length; i++) {
+      const track = queueSlice[i];
+      const line = `**${startIndex + i + 1}.** ${trackLink(track, QUEUE_TITLE_LENGTH)} \`[${formatTrackDuration(track)}]\`\n`;
 
-    if (page < 1) page = 1;
-    if (page > totalPages) page = totalPages;
-
-    const generateEmbed = (currentPage) => {
-      const startIndex = (currentPage - 1) * pageSize;
-      const endIndex = startIndex + pageSize;
-
-      // Format duration
-      const formatDuration = (ms) => {
-        if (!ms || isNaN(ms)) return "Live";
-        const seconds = Math.floor((ms / 1000) % 60);
-        const minutes = Math.floor((ms / (1000 * 60)) % 60);
-        const hours = Math.floor(ms / (1000 * 60 * 60));
-
-        if (hours > 0) {
-          return `${hours}:${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;
-        }
-        return `${minutes}:${seconds.toString().padStart(2, "0")}`;
-      };
-
-      const embed = new EmbedBuilder()
-        .setColor("#00CED1")
-        .setTitle("『 Audio Queue 』")
-        .setThumbnail(current?.thumbnail || null);
-
-      // Now playing - truncate title if too long
-      if (current) {
-        const nowPlayingTitle =
-          current.title.length > 50
-            ? current.title.substring(0, 47) + "..."
-            : current.title;
-        embed.setDescription(
-          `**▸ Currently Processing:**\n[${nowPlayingTitle}](${current.uri}) \`[${formatDuration(current.duration)}]\`\nRequested by: ${current.requester?.toString() || "Unknown"}`,
-        );
+      if ((queueList + line).length > QUEUE_FIELD_BUDGET) {
+        queueList += `*...and ${queueSlice.length - i} more on this page*`;
+        break;
       }
+      queueList += line;
+    }
 
-      // Queue list - with character limit handling
-      if (queue.length > 0) {
-        const queueSlice = queue.slice(startIndex, endIndex);
-        let queueList = "";
-
-        for (let i = 0; i < queueSlice.length; i++) {
-          const track = queueSlice[i];
-          const position = startIndex + i + 1;
-          // Truncate long titles
-          const title =
-            track.title.length > 40
-              ? track.title.substring(0, 37) + "..."
-              : track.title;
-          const line = `**${position}.** ${title} \`[${formatDuration(track.duration)}]\`\n`;
-
-          // Check if adding this line would exceed 1000 chars (leave some buffer)
-          if ((queueList + line).length > 1000) {
-            queueList += `*...and ${queueSlice.length - i} more tracks*`;
-            break;
-          }
-          queueList += line;
-        }
-
-        embed.addFields({
-          name: `Up Next (${player.queue.size} track${player.queue.size !== 1 ? "s" : ""})`,
-          value: queueList.trim() || "No tracks in queue",
-        });
-      } else {
-        embed.addFields({
-          name: "Up Next",
-          value: "No tracks in queue",
-        });
-      }
-
-      // Calculate total queue duration
-      const totalDuration = queue.reduce(
-        (acc, track) => acc + (track.duration || 0),
-        0,
-      );
-
-      embed.setFooter({
-        text: `Page ${currentPage}/${totalPages} • ${player.queue.size} tracks • Total: ${formatDuration(totalDuration)}`,
-      });
-
-      embed.setTimestamp();
-
-      return embed;
-    };
-
-    const generateButtons = (currentPage) => {
-      return new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId("queue_first")
-          .setEmoji("⏮️")
-          .setStyle(ButtonStyle.Secondary)
-          .setDisabled(currentPage === 1),
-        new ButtonBuilder()
-          .setCustomId("queue_prev")
-          .setEmoji("◀️")
-          .setStyle(ButtonStyle.Primary)
-          .setDisabled(currentPage === 1),
-        new ButtonBuilder()
-          .setCustomId("queue_page")
-          .setLabel(`${currentPage}/${totalPages}`)
-          .setStyle(ButtonStyle.Secondary)
-          .setDisabled(true),
-        new ButtonBuilder()
-          .setCustomId("queue_next")
-          .setEmoji("▶️")
-          .setStyle(ButtonStyle.Primary)
-          .setDisabled(currentPage === totalPages),
-        new ButtonBuilder()
-          .setCustomId("queue_last")
-          .setEmoji("⏭️")
-          .setStyle(ButtonStyle.Secondary)
-          .setDisabled(currentPage === totalPages),
-      );
-    };
-
-    const embed = generateEmbed(page);
-    const components = totalPages > 1 ? [generateButtons(page)] : [];
-
-    const message = await ctx.sendMessage({
-      embeds: [embed],
-      components,
+    const size = player.queue.size;
+    embed.addFields({
+      name: size > 0 ? `▸ Up Next (${size} track${size !== 1 ? "s" : ""})` : "▸ Up Next",
+      value: queueList.trim() || "No tracks in queue",
     });
 
-    // If only one page, no need for collector
-    if (totalPages <= 1) return;
-
-    // Create button collector
-    const collector = message.createMessageComponentCollector({
-      filter: (interaction) => interaction.user.id === ctx.author.id,
-      time: 120000, // 2 minutes
+    embed.setFooter({
+      text: `Page ${currentPage}/${totalPages} • ${size} track${size !== 1 ? "s" : ""} • Total: ${formatQueueDuration(queue)} • ${getRandomFooter()}`,
     });
+    embed.setTimestamp();
 
-    let currentPage = page;
+    return embed;
+  }
 
-    collector.on("collect", async (interaction) => {
-      switch (interaction.customId) {
-        case "queue_first":
-          currentPage = 1;
-          break;
-        case "queue_prev":
-          currentPage = Math.max(1, currentPage - 1);
-          break;
-        case "queue_next":
-          currentPage = Math.min(totalPages, currentPage + 1);
-          break;
-        case "queue_last":
-          currentPage = totalPages;
-          break;
-      }
-
-      await interaction.update({
-        embeds: [generateEmbed(currentPage)],
-        components: [generateButtons(currentPage)],
-      });
-    });
-
-    collector.on("end", async () => {
-      // Disable all buttons when collector ends
-      const disabledRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId("queue_first")
-          .setEmoji("⏮️")
-          .setStyle(ButtonStyle.Secondary)
-          .setDisabled(true),
-        new ButtonBuilder()
-          .setCustomId("queue_prev")
-          .setEmoji("◀️")
-          .setStyle(ButtonStyle.Secondary)
-          .setDisabled(true),
-        new ButtonBuilder()
-          .setCustomId("queue_page")
-          .setLabel(`${currentPage}/${totalPages}`)
-          .setStyle(ButtonStyle.Secondary)
-          .setDisabled(true),
-        new ButtonBuilder()
-          .setCustomId("queue_next")
-          .setEmoji("▶️")
-          .setStyle(ButtonStyle.Secondary)
-          .setDisabled(true),
-        new ButtonBuilder()
-          .setCustomId("queue_last")
-          .setEmoji("⏭️")
-          .setStyle(ButtonStyle.Secondary)
-          .setDisabled(true),
-      );
-
-      try {
-        await message.edit({ components: [disabledRow] });
-      } catch (e) {
-        // Message may have been deleted
-      }
-    });
+  buildButtons(currentPage, totalPages, disableAll = false) {
+    return new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId("queue_first")
+        .setLabel("First")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(disableAll || currentPage === 1),
+      new ButtonBuilder()
+        .setCustomId("queue_prev")
+        .setLabel("Previous")
+        .setStyle(ButtonStyle.Primary)
+        .setDisabled(disableAll || currentPage === 1),
+      new ButtonBuilder()
+        .setCustomId("queue_page")
+        .setLabel(`${currentPage}/${totalPages}`)
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(true),
+      new ButtonBuilder()
+        .setCustomId("queue_next")
+        .setLabel("Next")
+        .setStyle(ButtonStyle.Primary)
+        .setDisabled(disableAll || currentPage === totalPages),
+      new ButtonBuilder()
+        .setCustomId("queue_last")
+        .setLabel("Last")
+        .setStyle(ButtonStyle.Secondary)
+        .setDisabled(disableAll || currentPage === totalPages),
+    );
   }
 }

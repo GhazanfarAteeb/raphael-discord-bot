@@ -1,7 +1,267 @@
 import { PermissionFlagsBits } from 'discord.js';
-import EmbedTemplate from '../../models/EmbedTemplate.js';
+import EmbedTemplate, { EMBED_LIMITS, clipText, isHttpUrl } from '../../models/EmbedTemplate.js';
 import { errorEmbed, successEmbed } from '../../utils/embeds.js';
 import { getPrefix } from '../../utils/helpers.js';
+
+const PROPERTY_LIST = 'title, description, color, content, image, thumbnail, author, authorIcon, footer, footerIcon, addfield, removefield, timestamp, url, category, setdesc';
+const VALID_CATEGORIES = ['welcome', 'announcement', 'rules', 'info', 'custom'];
+const HEX_COLOR = /^#?([0-9A-F]{6})$/i;
+const USER_KEYWORDS = ['useravatar', 'user'];
+const USER_NAME_KEYWORDS = ['username', 'user'];
+const BOT_KEYWORDS = ['botavatar', 'bot'];
+const INLINE_FLAGS = ['inline', 'true'];
+const FIELD_FLAGS = [...INLINE_FLAGS, 'false'];
+// The template's own summary, shown in `embed list`
+const TEMPLATE_DESCRIPTION_LENGTH = 200;
+const DISPLAY_NAME_LENGTH = 64;
+
+// Error text when a value is longer than Discord accepts, otherwise null
+function lengthError(label, value, max) {
+    return value.length > max
+        ? `The ${label} is ${value.length} characters long, Master. Discord accepts at most ${max}.`
+        : null;
+}
+
+const cleared = (title, text) => ({ cleared: { title, text } });
+const failed = (error) => ({ error });
+
+// Applies one property change to the template in memory.
+// Returns { error } to reject it, { cleared } when a part was removed, or { note } / {} when updated.
+function applyProperty(template, property, value, attachmentUrl, prefix) {
+    const keyword = value.toLowerCase();
+
+    switch (property) {
+        case 'title': {
+            if (!value) return failed('Please provide a title, Master.');
+            const tooLong = lengthError('title', value, EMBED_LIMITS.TITLE);
+            if (tooLong) return failed(tooLong);
+            template.set('embed.title', value);
+            return {};
+        }
+
+        case 'description':
+        case 'desc': {
+            if (!value) return failed('Please provide a description, Master.');
+            const tooLong = lengthError('description', value, EMBED_LIMITS.DESCRIPTION);
+            if (tooLong) return failed(tooLong);
+            template.set('embed.description', value);
+            return {};
+        }
+
+        case 'color':
+        case 'colour': {
+            if (!value) return failed('Please provide a hex color (e.g. #FF0000), Master.');
+            const match = HEX_COLOR.exec(value);
+            if (!match) return failed('Invalid hex color, Master. Use the format #FF0000.');
+            template.set('embed.color', `#${match[1].toUpperCase()}`);
+            return {};
+        }
+
+        case 'content':
+        case 'message': {
+            if (!value) {
+                template.content = null;
+                return cleared('Content Removed', 'The message content has been cleared, Master.');
+            }
+            const tooLong = lengthError('message content', value, EMBED_LIMITS.CONTENT);
+            if (tooLong) return failed(tooLong);
+            template.content = value;
+            return {};
+        }
+
+        case 'image': {
+            // An attached image counts as the value, so it is not mistaken for a removal
+            const imageUrl = attachmentUrl || value;
+            if (!imageUrl) {
+                template.set('embed.image', null);
+                return cleared('Image Removed', 'The large image has been removed, Master.');
+            }
+            if (!isHttpUrl(imageUrl)) return failed('Please provide a valid image URL (http or https) or attach an image, Master.');
+            template.set('embed.image', { url: imageUrl });
+            return {};
+        }
+
+        case 'thumbnail':
+        case 'thumb': {
+            if (!value && !attachmentUrl) {
+                template.set('embed.thumbnail', null);
+                return cleared('Thumbnail Removed', 'The thumbnail has been removed, Master.');
+            }
+            if (USER_KEYWORDS.includes(keyword)) {
+                template.set('embed.thumbnail', { useUserAvatar: true });
+                return {};
+            }
+            const thumbUrl = attachmentUrl || value;
+            if (!isHttpUrl(thumbUrl)) return failed('Please provide a valid image URL (http or https), attach an image, or use "userAvatar", Master.');
+            template.set('embed.thumbnail', { url: thumbUrl, useUserAvatar: false });
+            return {};
+        }
+
+        case 'author':
+        case 'authorname': {
+            if (!value) {
+                template.set('embed.author', null);
+                return cleared('Author Removed', 'The author section has been removed, Master.');
+            }
+            if (USER_NAME_KEYWORDS.includes(keyword)) {
+                template.set('embed.author.useUserName', true);
+                template.set('embed.author.name', null);
+                return {};
+            }
+            const tooLong = lengthError('author name', value, EMBED_LIMITS.AUTHOR_NAME);
+            if (tooLong) return failed(tooLong);
+            template.set('embed.author.name', value);
+            template.set('embed.author.useUserName', false);
+            return {};
+        }
+
+        case 'authoricon':
+        case 'authorimage': {
+            if (!value && !attachmentUrl) return failed('Please provide a URL, attach an image, or use "userAvatar", Master.');
+
+            if (USER_KEYWORDS.includes(keyword)) {
+                template.set('embed.author.useUserAvatar', true);
+                template.set('embed.author.iconUrl', null);
+            } else {
+                const iconUrl = attachmentUrl || value;
+                if (!isHttpUrl(iconUrl)) return failed('Please provide a valid image URL (http or https), attach an image, or use "userAvatar", Master.');
+                template.set('embed.author.iconUrl', iconUrl);
+                template.set('embed.author.useUserAvatar', false);
+            }
+
+            const hasName = template.embed.author?.name || template.embed.author?.useUserName;
+            return hasName ? {} : { note: `The icon appears once an author name is set with \`${prefix}embedset ${template.name} author <text>\`.` };
+        }
+
+        case 'footer':
+        case 'footertext': {
+            if (!value) {
+                template.set('embed.footer', null);
+                return cleared('Footer Removed', 'The footer has been removed, Master.');
+            }
+            const tooLong = lengthError('footer', value, EMBED_LIMITS.FOOTER_TEXT);
+            if (tooLong) return failed(tooLong);
+            template.set('embed.footer.text', value);
+            return {};
+        }
+
+        case 'footericon':
+        case 'footerimage': {
+            if (!value && !attachmentUrl) return failed('Please provide a URL, attach an image, or use "userAvatar" or "botAvatar", Master.');
+
+            if (USER_KEYWORDS.includes(keyword)) {
+                template.set('embed.footer.useUserAvatar', true);
+                template.set('embed.footer.useBotAvatar', false);
+                template.set('embed.footer.iconUrl', null);
+            } else if (BOT_KEYWORDS.includes(keyword)) {
+                template.set('embed.footer.useBotAvatar', true);
+                template.set('embed.footer.useUserAvatar', false);
+                template.set('embed.footer.iconUrl', null);
+            } else {
+                const iconUrl = attachmentUrl || value;
+                if (!isHttpUrl(iconUrl)) return failed('Please provide a valid image URL (http or https), attach an image, or use "userAvatar" or "botAvatar", Master.');
+                template.set('embed.footer.iconUrl', iconUrl);
+                template.set('embed.footer.useUserAvatar', false);
+                template.set('embed.footer.useBotAvatar', false);
+            }
+
+            return template.embed.footer?.text
+                ? {}
+                : { note: `The icon appears once footer text is set with \`${prefix}embedset ${template.name} footer <text>\`.` };
+        }
+
+        case 'addfield':
+        case 'field': {
+            const usage = `Usage: \`${prefix}embedset <name> addfield <field name> | <field value> [| inline]\``;
+            if (!value) return failed(usage);
+
+            const parts = value.split('|');
+            // A trailing inline flag is an option; any other "|" belongs to the value
+            const flag = parts.length > 2 ? parts[parts.length - 1].trim().toLowerCase() : null;
+            const hasFlag = FIELD_FLAGS.includes(flag);
+            const fieldName = parts[0].trim();
+            const fieldValue = parts.slice(1, hasFlag ? -1 : undefined).join('|').trim();
+
+            if (!fieldName || !fieldValue) {
+                return failed(`A field needs both a name and a value, Master.\n${usage}`);
+            }
+
+            const tooLong = lengthError('field name', fieldName, EMBED_LIMITS.FIELD_NAME)
+                || lengthError('field value', fieldValue, EMBED_LIMITS.FIELD_VALUE);
+            if (tooLong) return failed(tooLong);
+
+            if (!Array.isArray(template.embed.fields)) template.set('embed.fields', []);
+
+            if (template.embed.fields.length >= EMBED_LIMITS.FIELDS) {
+                return failed(`This embed already holds the maximum of ${EMBED_LIMITS.FIELDS} fields, Master. Remove one with \`${prefix}embedset ${template.name} removefield <number>\` first.`);
+            }
+
+            template.embed.fields.push({
+                name: fieldName,
+                value: fieldValue,
+                inline: hasFlag && INLINE_FLAGS.includes(flag)
+            });
+            return {};
+        }
+
+        case 'removefield':
+        case 'deletefield': {
+            const fields = template.embed.fields || [];
+            if (fields.length === 0) return failed('This embed has no fields to remove, Master.');
+
+            const fieldIndex = Number.parseInt(value, 10) - 1;
+            if (Number.isNaN(fieldIndex) || fieldIndex < 0 || fieldIndex >= fields.length) {
+                return failed(`Invalid field number, Master. Choose a number from 1 to ${fields.length}.`);
+            }
+
+            fields.splice(fieldIndex, 1);
+            return {};
+        }
+
+        case 'timestamp': {
+            if (['on', 'true', 'yes'].includes(keyword)) {
+                template.set('embed.timestamp', true);
+            } else if (['off', 'false', 'no'].includes(keyword)) {
+                template.set('embed.timestamp', false);
+            } else {
+                return failed('Use on/off, true/false, or yes/no, Master.');
+            }
+            return {};
+        }
+
+        case 'url': {
+            if (!value) {
+                template.set('embed.url', null);
+                return cleared('URL Removed', 'The title link has been removed, Master.');
+            }
+            if (!isHttpUrl(value)) return failed('Please provide a valid URL beginning with http:// or https://, Master.');
+            template.set('embed.url', value);
+            return template.embed.title
+                ? {}
+                : { note: `The link applies once a title is set with \`${prefix}embedset ${template.name} title <text>\`.` };
+        }
+
+        case 'category': {
+            if (!VALID_CATEGORIES.includes(keyword)) {
+                return failed(`Invalid category, Master. Use: ${VALID_CATEGORIES.join(', ')}`);
+            }
+            template.category = keyword;
+            return {};
+        }
+
+        // The template's own description (shown in `embed list`); `description` sets the embed's
+        case 'setdesc': {
+            if (!value) return failed('Please provide a description for this embed template, Master.');
+            const tooLong = lengthError('template description', value, TEMPLATE_DESCRIPTION_LENGTH);
+            if (tooLong) return failed(tooLong);
+            template.description = value;
+            return {};
+        }
+
+        default:
+            return failed(`Unknown property: \`${clipText(property, DISPLAY_NAME_LENGTH)}\`\n\nAvailable: ${PROPERTY_LIST}`);
+    }
+}
 
 export default {
     name: 'embedset',
@@ -9,255 +269,70 @@ export default {
     usage: 'embedset <name> <property> <value>',
     category: 'utility',
     permissions: [PermissionFlagsBits.ManageMessages],
-    
+
     execute: async (message, args) => {
         const guildId = message.guild.id;
-        const embedName = args[0];
-        const property = args[1]?.toLowerCase();
-        const value = args.slice(2).join(' ');
-        const prefix = await getPrefix(guildId);
-        
-        if (!embedName || !property) {
-            return message.reply({
-                embeds: [await errorEmbed(guildId, `Usage: \`${prefix}embedset <name> <property> <value>\`\n\nProperties: title, description, color, content, image, thumbnail, author, authorIcon, footer, footerIcon, addfield, removefield, timestamp`)]
-            });
-        }
-        
-        const template = await EmbedTemplate.findOne({ guildId, name: embedName });
-        
-        if (!template) {
-            return message.reply({
-                embeds: [await errorEmbed(guildId, `Embed "${embedName}" not found! Create it first with \`${prefix}embed create ${embedName}\``)]
-            });
-        }
-        
-        // Initialize embed object if it doesn't exist
-        if (!template.embed) template.embed = {};
-        
-        switch (property) {
-            case 'title':
-                if (!value) return message.reply({ embeds: [await errorEmbed(guildId, 'Please provide a title!')] });
-                template.embed.title = value;
-                break;
-                
-            case 'description':
-            case 'desc':
-                if (!value) return message.reply({ embeds: [await errorEmbed(guildId, 'Please provide a description!')] });
-                template.embed.description = value;
-                break;
-                
-            case 'color':
-            case 'colour':
-                if (!value) return message.reply({ embeds: [await errorEmbed(guildId, 'Please provide a hex color (e.g., #FF0000)!')] });
-                // Validate hex color
-                if (!/^#[0-9A-F]{6}$/i.test(value)) {
-                    return message.reply({ embeds: [await errorEmbed(guildId, 'Invalid hex color! Use format: #FF0000')] });
-                }
-                template.embed.color = value;
-                break;
-                
-            case 'content':
-            case 'message':
-                if (!value) {
-                    template.content = null;
-                    await template.save();
-                    return message.reply({ embeds: [await successEmbed(guildId, '✅ Content Removed', 'Message content has been cleared')] });
-                }
-                template.content = value;
-                break;
-                
-            case 'image':
-                if (!value) {
-                    template.embed.image = null;
-                    await template.save();
-                    return message.reply({ embeds: [await successEmbed(guildId, '✅ Image Removed', 'Large image has been removed')] });
-                }
-                // Check if it's a valid URL or attachment
-                const imageUrl = message.attachments.first()?.url || value;
-                if (!imageUrl.startsWith('http')) {
-                    return message.reply({ embeds: [await errorEmbed(guildId, 'Please provide a valid image URL or attach an image!')] });
-                }
-                template.embed.image = { url: imageUrl };
-                break;
-                
-            case 'thumbnail':
-            case 'thumb':
-                if (!value) {
-                    template.embed.thumbnail = null;
-                    await template.save();
-                    return message.reply({ embeds: [await successEmbed(guildId, '✅ Thumbnail Removed', 'Thumbnail has been removed')] });
-                }
-                
-                if (value.toLowerCase() === 'useravatar' || value.toLowerCase() === 'user') {
-                    template.embed.thumbnail = { useUserAvatar: true };
-                } else {
-                    const thumbUrl = message.attachments.first()?.url || value;
-                    if (!thumbUrl.startsWith('http')) {
-                        return message.reply({ embeds: [await errorEmbed(guildId, 'Please provide a valid image URL, attach an image, or use "userAvatar"!')] });
-                    }
-                    template.embed.thumbnail = { url: thumbUrl };
-                }
-                break;
-                
-            case 'author':
-            case 'authorname':
-                if (!value) {
-                    template.embed.author = null;
-                    await template.save();
-                    return message.reply({ embeds: [await successEmbed(guildId, '✅ Author Removed', 'Author section has been removed')] });
-                }
-                
-                if (value.toLowerCase() === 'username' || value.toLowerCase() === 'user') {
-                    if (!template.embed.author) template.embed.author = {};
-                    template.embed.author.useUserName = true;
-                    template.embed.author.name = null;
-                } else {
-                    if (!template.embed.author) template.embed.author = {};
-                    template.embed.author.name = value;
-                    template.embed.author.useUserName = false;
-                }
-                break;
-                
-            case 'authoricon':
-            case 'authorimage':
-                if (!value) return message.reply({ embeds: [await errorEmbed(guildId, 'Please provide a URL or "userAvatar"!')] });
-                
-                if (!template.embed.author) template.embed.author = {};
-                
-                if (value.toLowerCase() === 'useravatar' || value.toLowerCase() === 'user') {
-                    template.embed.author.useUserAvatar = true;
-                    template.embed.author.iconUrl = null;
-                } else {
-                    const iconUrl = message.attachments.first()?.url || value;
-                    if (!iconUrl.startsWith('http')) {
-                        return message.reply({ embeds: [await errorEmbed(guildId, 'Please provide a valid image URL or "userAvatar"!')] });
-                    }
-                    template.embed.author.iconUrl = iconUrl;
-                    template.embed.author.useUserAvatar = false;
-                }
-                break;
-                
-            case 'footer':
-            case 'footertext':
-                if (!value) {
-                    template.embed.footer = null;
-                    await template.save();
-                    return message.reply({ embeds: [await successEmbed(guildId, '✅ Footer Removed', 'Footer has been removed')] });
-                }
-                if (!template.embed.footer) template.embed.footer = {};
-                template.embed.footer.text = value;
-                break;
-                
-            case 'footericon':
-            case 'footerimage':
-                if (!value) return message.reply({ embeds: [await errorEmbed(guildId, 'Please provide a URL, "userAvatar", or "botAvatar"!')] });
-                
-                if (!template.embed.footer) template.embed.footer = {};
-                
-                if (value.toLowerCase() === 'useravatar' || value.toLowerCase() === 'user') {
-                    template.embed.footer.useUserAvatar = true;
-                    template.embed.footer.useBotAvatar = false;
-                    template.embed.footer.iconUrl = null;
-                } else if (value.toLowerCase() === 'botavatar' || value.toLowerCase() === 'bot') {
-                    template.embed.footer.useBotAvatar = true;
-                    template.embed.footer.useUserAvatar = false;
-                    template.embed.footer.iconUrl = null;
-                } else {
-                    const iconUrl = message.attachments.first()?.url || value;
-                    if (!iconUrl.startsWith('http')) {
-                        return message.reply({ embeds: [await errorEmbed(guildId, 'Please provide a valid image URL, "userAvatar", or "botAvatar"!')] });
-                    }
-                    template.embed.footer.iconUrl = iconUrl;
-                    template.embed.footer.useUserAvatar = false;
-                    template.embed.footer.useBotAvatar = false;
-                }
-                break;
-                
-            case 'addfield':
-            case 'field':
-                if (!value) return message.reply({ embeds: [await errorEmbed(guildId, `Usage: \`${prefix}embedset <name> addfield <name> | <value> [inline]\``)] });
-                
-                const parts = value.split('|');
-                if (parts.length < 2) {
-                    return message.reply({ embeds: [await errorEmbed(guildId, `Usage: \`${prefix}embedset <name> addfield <name> | <value> [inline]\``)] });
-                }
-                
-                const fieldName = parts[0].trim();
-                const fieldValue = parts[1].trim();
-                const inline = parts[2]?.trim().toLowerCase() === 'inline' || parts[2]?.trim().toLowerCase() === 'true';
-                
-                if (!template.embed.fields) template.embed.fields = [];
-                
-                if (template.embed.fields.length >= 25) {
-                    return message.reply({ embeds: [await errorEmbed(guildId, 'Maximum 25 fields allowed per embed!')] });
-                }
-                
-                template.embed.fields.push({
-                    name: fieldName,
-                    value: fieldValue,
-                    inline: inline
-                });
-                break;
-                
-            case 'removefield':
-            case 'deletefield':
-                const fieldIndex = parseInt(value) - 1;
-                
-                if (isNaN(fieldIndex) || !template.embed.fields || fieldIndex < 0 || fieldIndex >= template.embed.fields.length) {
-                    return message.reply({ embeds: [await errorEmbed(guildId, 'Invalid field number!')] });
-                }
-                
-                template.embed.fields.splice(fieldIndex, 1);
-                break;
-                
-            case 'timestamp':
-                const timestampValue = value.toLowerCase();
-                if (timestampValue === 'on' || timestampValue === 'true' || timestampValue === 'yes') {
-                    template.embed.timestamp = true;
-                } else if (timestampValue === 'off' || timestampValue === 'false' || timestampValue === 'no') {
-                    template.embed.timestamp = false;
-                } else {
-                    return message.reply({ embeds: [await errorEmbed(guildId, 'Use: on/off, true/false, or yes/no')] });
-                }
-                break;
-                
-            case 'url':
-                if (!value) {
-                    template.embed.url = null;
-                    await template.save();
-                    return message.reply({ embeds: [await successEmbed(guildId, '✅ URL Removed', 'Title URL has been removed')] });
-                }
-                
-                if (!value.startsWith('http')) {
-                    return message.reply({ embeds: [await errorEmbed(guildId, 'Please provide a valid URL!')] });
-                }
-                template.embed.url = value;
-                break;
-                
-            case 'category':
-                const validCategories = ['welcome', 'announcement', 'rules', 'info', 'custom'];
-                if (!validCategories.includes(value.toLowerCase())) {
-                    return message.reply({ embeds: [await errorEmbed(guildId, `Invalid category! Use: ${validCategories.join(', ')}`)] });
-                }
-                template.category = value.toLowerCase();
-                break;
-                
-            case 'description':
-            case 'setdesc':
-                if (!value) return message.reply({ embeds: [await errorEmbed(guildId, 'Please provide a description for this embed template!')] });
-                template.description = value;
-                break;
-                
-            default:
+
+        try {
+            const embedName = args[0];
+            const property = args[1]?.toLowerCase();
+            const value = args.slice(2).join(' ').trim();
+            const attachmentUrl = message.attachments.first()?.url || null;
+            const prefix = await getPrefix(guildId);
+
+            if (!embedName || !property) {
                 return message.reply({
-                    embeds: [await errorEmbed(guildId, `Unknown property: ${property}\n\nAvailable: title, description, color, content, image, thumbnail, author, authorIcon, footer, footerIcon, addfield, removefield, timestamp, url, category`)]
+                    embeds: [await errorEmbed(guildId, `Usage: \`${prefix}embedset <name> <property> <value>\`\n\nProperties: ${PROPERTY_LIST}`)]
                 });
+            }
+
+            const template = await EmbedTemplate.findOne({ guildId, name: embedName });
+            const displayName = clipText(embedName, DISPLAY_NAME_LENGTH);
+
+            if (!template) {
+                return message.reply({
+                    embeds: [await errorEmbed(guildId, `Embed "${displayName}" was not found, Master. Create it first with \`${prefix}embed create ${embedName}\`.`)]
+                });
+            }
+
+            const lengthBefore = template.getTextLength();
+            const result = applyProperty(template, property, value, attachmentUrl, prefix);
+
+            if (result.error) {
+                return message.reply({ embeds: [await errorEmbed(guildId, result.error)] });
+            }
+
+            // Discord also caps the embed as a whole; changes that shrink an oversized template stay allowed
+            const lengthAfter = template.getTextLength();
+            if (lengthAfter > EMBED_LIMITS.TOTAL && lengthAfter > lengthBefore) {
+                return message.reply({
+                    embeds: [await errorEmbed(guildId, 'Embed Too Long',
+                        `This change would bring the embed to ${lengthAfter} characters, Master. Discord accepts at most ${EMBED_LIMITS.TOTAL} across the title, description, author, footer and fields.`)]
+                });
+            }
+
+            await template.save();
+
+            if (result.cleared) {
+                return message.reply({
+                    embeds: [await successEmbed(guildId, result.cleared.title, result.cleared.text)]
+                });
+            }
+
+            return message.reply({
+                embeds: [await successEmbed(guildId, 'Embed Updated',
+                    `Property **${property}** of template "${displayName}" has been updated, Master.` +
+                    `${result.note ? `\n${result.note}` : ''}\n\nPreview it with \`${prefix}embed preview ${embedName}\`.`)]
+            });
+        } catch (error) {
+            console.error('[EmbedSet] Error:', error);
+            try {
+                return await message.reply({
+                    embeds: [await errorEmbed(guildId, 'The embed could not be updated, Master. Please try again.')]
+                });
+            } catch {
+                return null;
+            }
         }
-        
-        await template.save();
-        
-        return message.reply({
-            embeds: [await successEmbed(guildId, '✅ Embed Updated', `Updated **${property}** for embed "${embedName}"\n\nUse \`${prefix}embed preview ${embedName}\` to see changes`)]
-        });
     }
 };

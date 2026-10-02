@@ -4,12 +4,17 @@
  */
 
 import Event from "../../structures/Event.js";
+import { EmbedBuilder } from "discord.js";
+import { COLORS } from "../../utils/embeds.js";
+import { getRandomFooter } from "../../utils/raphael.js";
 import {
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
-  EmbedBuilder,
-} from "discord.js";
+  buildControlRow,
+  formatTrackDuration,
+  safeUrl,
+  truncate,
+  DISCORD_LIMITS,
+} from "../../music/format.js";
+import { cancelAutoLeave, clearNowPlaying } from "../../music/RiffyManager.js";
 
 class MusicTrackStart extends Event {
   constructor(client, file) {
@@ -20,81 +25,53 @@ class MusicTrackStart extends Event {
 
   async run(player, track) {
     try {
+      // Playback resumed: the queue-end countdown no longer applies
+      cancelAutoLeave(player.guildId, "queueEnd");
+      // A new playback may report its own errors (see trackError.js)
+      player.lastErrorTrack = null;
+
       const channel = this.client.channels.cache.get(player.textChannelId);
       if (!channel) return;
 
-      // Create control buttons
-      const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId("music_disconnect")
-          .setStyle(ButtonStyle.Secondary)
-          .setEmoji("⏹️"),
-        new ButtonBuilder()
-          .setCustomId("music_pause")
-          .setStyle(ButtonStyle.Secondary)
-          .setEmoji("⏸️"),
-        new ButtonBuilder()
-          .setCustomId("music_skip")
-          .setStyle(ButtonStyle.Secondary)
-          .setEmoji("⏭️"),
-        new ButtonBuilder()
-          .setCustomId("music_shuffle")
-          .setStyle(ButtonStyle.Secondary)
-          .setEmoji("🔀"),
-        new ButtonBuilder()
-          .setCustomId("music_loop")
-          .setStyle(ButtonStyle.Secondary)
-          .setEmoji("🔁"),
-      );
-
-      // Format duration
-      const formatDuration = (ms) => {
-        const seconds = Math.floor((ms / 1000) % 60);
-        const minutes = Math.floor((ms / (1000 * 60)) % 60);
-        const hours = Math.floor(ms / (1000 * 60 * 60));
-
-        if (hours > 0) {
-          return `${hours}:${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;
-        }
-        return `${minutes}:${seconds.toString().padStart(2, "0")}`;
-      };
-
-      // Create embed
       const embed = new EmbedBuilder()
-        .setColor("#00CED1")
+        .setColor(COLORS.RAPHAEL)
         .setAuthor({ name: "『 Audio Playback Initiated 』" })
-        .setTitle(track.title)
-        .setURL(track.uri)
-        .setThumbnail(track.thumbnail || null)
+        .setTitle(truncate(track.title || "Unknown Track", DISCORD_LIMITS.TITLE))
+        .setURL(safeUrl(track.uri))
+        .setThumbnail(safeUrl(track.thumbnail))
         .addFields(
           {
             name: "▸ Duration",
-            value: formatDuration(track.duration),
+            value: formatTrackDuration(track),
             inline: true,
           },
-          { name: "▸ Author", value: track.author || "Unknown", inline: true },
+          {
+            name: "▸ Author",
+            value: truncate(track.author || "Unknown", DISCORD_LIMITS.FIELD_VALUE),
+            inline: true,
+          },
           {
             name: "▸ Requested By",
             value: track.requester?.toString() || "Unknown",
             inline: true,
           },
         )
+        .setFooter({ text: getRandomFooter() })
         .setTimestamp();
 
-      // Delete previous message if exists
-      if (player.message) {
-        try {
-          await player.message.delete();
-        } catch (e) {
-          // Message already deleted
-        }
-      }
+      // Remove the previous card (if trackEnd has not already) before posting the new one
+      await clearNowPlaying(player);
 
-      // Send new message
       const msg = await channel.send({
         embeds: [embed],
-        components: [row],
+        components: [buildControlRow(player)],
       });
+
+      // The player may have been destroyed while the message was being sent
+      if (player.destroyed) {
+        await msg.delete().catch(() => {});
+        return;
+      }
 
       // Store message reference in player
       player.message = msg;

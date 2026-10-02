@@ -43,11 +43,27 @@ reminderSchema.statics.getDueReminders = async function () {
   });
 };
 
-// Static method to get user reminders
+// Static method to get user reminders (pass guildId to limit them to one server)
 reminderSchema.statics.getUserReminders = async function (userId, guildId = null) {
   const query = { userId, completed: false };
   if (guildId) query.guildId = guildId;
   return await this.find(query).sort({ remindAt: 1 });
+};
+
+// Static method to delete one pending reminder, only if it belongs to this user in this server
+reminderSchema.statics.deleteUserReminder = async function (userId, guildId, reminderId) {
+  if (!mongoose.isObjectIdOrHexString(reminderId)) return null;
+  return await this.findOneAndDelete({ _id: reminderId, userId, guildId, completed: false });
+};
+
+// Static method to atomically claim a due reminder for delivery.
+// Returns null if it was already claimed, so overlapping checks never deliver it twice.
+reminderSchema.statics.claimReminder = async function (reminderId) {
+  return await this.findOneAndUpdate(
+    { _id: reminderId, completed: false },
+    { $set: { completed: true } },
+    { new: true }
+  );
 };
 
 // Static method to create reminder

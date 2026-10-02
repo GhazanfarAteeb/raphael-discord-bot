@@ -4,7 +4,17 @@
  */
 
 import Event from "../../structures/Event.js";
-import { ActionRowBuilder, ButtonBuilder, ButtonStyle } from "discord.js";
+import { MessageFlags } from "discord.js";
+import { buildControlRow, truncate } from "../../music/format.js";
+import { clearNowPlaying, skipCurrent } from "../../music/RiffyManager.js";
+
+const LOOP_CYCLE = { off: "track", track: "queue", queue: "off" };
+const LOOP_MESSAGES = {
+  off: "**Confirmed.** Repeat mode disabled, Master.",
+  track: "**Confirmed.** Now repeating the current track, Master.",
+  queue: "**Confirmed.** Now repeating the entire queue, Master.",
+};
+const MAX_TITLE_LENGTH = 200;
 
 class MusicButtonHandler extends Event {
   constructor(client, file) {
@@ -14,45 +24,39 @@ class MusicButtonHandler extends Event {
   }
 
   async run(interaction) {
-    // Only handle button interactions
-    if (!interaction.isButton()) return;
-
-    // Only handle music buttons
-    if (!interaction.customId.startsWith("music_")) return;
-
-    const player = this.client.moonlink?.players.get(interaction.guildId);
-
-    // Check if player exists
-    if (!player) {
-      return interaction.reply({
-        content: "**Warning:** No active audio session detected, Master.",
-        ephemeral: true,
-      });
-    }
-
-    // Check if user is in voice channel
-    const memberChannel = interaction.member?.voice?.channelId;
-    const clientChannel = interaction.guild?.members?.me?.voice?.channelId;
-
-    if (!memberChannel) {
-      return interaction.reply({
-        content:
-          "**Warning:** Voice channel presence required for this function, Master.",
-        ephemeral: true,
-      });
-    }
-
-    if (clientChannel && memberChannel !== clientChannel) {
-      return interaction.reply({
-        content:
-          "**Warning:** Voice channel synchronization required, Master. Please join my current channel.",
-        ephemeral: true,
-      });
-    }
-
-    await interaction.deferUpdate();
+    // Only handle music control buttons
+    if (!interaction.isButton() || !interaction.customId.startsWith("music_")) return;
 
     try {
+      const player = this.client.moonlink?.players.get(interaction.guildId);
+
+      if (!player || player.destroyed) {
+        return await this.notify(
+          interaction,
+          "**Warning:** No active audio session detected, Master.",
+        );
+      }
+
+      // Check if user is in voice channel
+      const memberChannel = interaction.member?.voice?.channelId;
+      const clientChannel = interaction.guild?.members?.me?.voice?.channelId;
+
+      if (!memberChannel) {
+        return await this.notify(
+          interaction,
+          "**Warning:** Voice channel presence required for this function, Master.",
+        );
+      }
+
+      if (clientChannel && memberChannel !== clientChannel) {
+        return await this.notify(
+          interaction,
+          "**Warning:** Voice channel synchronization required, Master. Please join my current channel.",
+        );
+      }
+
+      await interaction.deferUpdate();
+
       switch (interaction.customId) {
         case "music_pause":
           await this.handlePause(interaction, player);
@@ -75,156 +79,96 @@ class MusicButtonHandler extends Event {
       }
     } catch (error) {
       this.client.logger.error("Error handling music button:", error);
-      await interaction.followUp({
-        content:
-          "**Error:** Processing failure detected. Please retry, Master.",
-        ephemeral: true,
-      });
+      await this.notify(
+        interaction,
+        "**Error:** Processing failure detected. Please retry, Master.",
+      );
     }
+  }
+
+  /**
+   * Ephemeral notice that works whether or not the interaction was already acknowledged.
+   */
+  async notify(interaction, content) {
+    const payload = { content, flags: MessageFlags.Ephemeral };
+    try {
+      if (interaction.deferred || interaction.replied) {
+        await interaction.followUp(payload);
+      } else {
+        await interaction.reply(payload);
+      }
+    } catch (error) {
+      this.client.logger.error("Failed to send music button notice:", error);
+    }
+  }
+
+  /**
+   * Redraws the control buttons from the player's actual state.
+   */
+  async refreshControls(interaction, player) {
+    await interaction.message
+      .edit({ components: [buildControlRow(player)] })
+      .catch(() => {});
   }
 
   async handlePause(interaction, player) {
     await player.pause();
-
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId("music_disconnect")
-        .setStyle(ButtonStyle.Secondary)
-        .setEmoji("⏹️"),
-      new ButtonBuilder()
-        .setCustomId("music_play")
-        .setStyle(ButtonStyle.Success)
-        .setEmoji("▶️"),
-      new ButtonBuilder()
-        .setCustomId("music_skip")
-        .setStyle(ButtonStyle.Secondary)
-        .setEmoji("⏭️"),
-      new ButtonBuilder()
-        .setCustomId("music_shuffle")
-        .setStyle(ButtonStyle.Secondary)
-        .setEmoji("🔀"),
-      new ButtonBuilder()
-        .setCustomId("music_loop")
-        .setStyle(ButtonStyle.Secondary)
-        .setEmoji("🔁"),
-    );
-
-    await interaction.message.edit({ components: [row] });
+    await this.refreshControls(interaction, player);
   }
 
   async handleResume(interaction, player) {
     await player.resume();
-
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId("music_disconnect")
-        .setStyle(ButtonStyle.Secondary)
-        .setEmoji("⏹️"),
-      new ButtonBuilder()
-        .setCustomId("music_pause")
-        .setStyle(ButtonStyle.Secondary)
-        .setEmoji("⏸️"),
-      new ButtonBuilder()
-        .setCustomId("music_skip")
-        .setStyle(ButtonStyle.Secondary)
-        .setEmoji("⏭️"),
-      new ButtonBuilder()
-        .setCustomId("music_shuffle")
-        .setStyle(ButtonStyle.Secondary)
-        .setEmoji("🔀"),
-      new ButtonBuilder()
-        .setCustomId("music_loop")
-        .setStyle(ButtonStyle.Secondary)
-        .setEmoji("🔁"),
-    );
-
-    await interaction.message.edit({ components: [row] });
+    await this.refreshControls(interaction, player);
   }
 
   async handleSkip(interaction, player) {
-    await player.skip();
+    const { ok, ended, track } = await skipCurrent(player);
+    const title = truncate(track?.title || "the current track", MAX_TITLE_LENGTH);
 
-    await interaction.followUp({
-      content: "Skipped the current track.",
-      ephemeral: true,
-    });
+    if (!ok) {
+      return this.notify(
+        interaction,
+        "**Warning:** The next track could not be started, Master. Please retry.",
+      );
+    }
+
+    await this.notify(
+      interaction,
+      ended
+        ? `**Confirmed.** Skipped **${title}**. The queue is empty, so the audio session has been concluded, Master.`
+        : `**Confirmed.** Skipped **${title}**, Master.`,
+    );
   }
 
   async handleDisconnect(interaction, player) {
-    player.destroy();
-
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId("music_disconnect")
-        .setStyle(ButtonStyle.Danger)
-        .setLabel("Disconnected")
-        .setEmoji("⏹️")
-        .setDisabled(true),
-      new ButtonBuilder()
-        .setCustomId("music_pause")
-        .setStyle(ButtonStyle.Secondary)
-        .setEmoji("⏸️")
-        .setDisabled(true),
-      new ButtonBuilder()
-        .setCustomId("music_skip")
-        .setStyle(ButtonStyle.Secondary)
-        .setEmoji("⏭️")
-        .setDisabled(true),
-      new ButtonBuilder()
-        .setCustomId("music_shuffle")
-        .setStyle(ButtonStyle.Secondary)
-        .setEmoji("🔀")
-        .setDisabled(true),
-      new ButtonBuilder()
-        .setCustomId("music_loop")
-        .setStyle(ButtonStyle.Secondary)
-        .setEmoji("🔁")
-        .setDisabled(true),
-    );
-
-    await interaction.message.edit({ components: [row] });
+    await clearNowPlaying(player);
+    await player.destroy("Stop button");
   }
 
   async handleShuffle(interaction, player) {
     if (player.queue.size < 2) {
-      return interaction.followUp({
-        content:
-          "**Notice:** Insufficient queue entries for randomization, Master.",
-        ephemeral: true,
-      });
+      return this.notify(
+        interaction,
+        "**Notice:** Insufficient queue entries for randomization, Master.",
+      );
     }
 
     // Use moonlink's built-in queue shuffle
     player.queue.shuffle();
 
-    await interaction.followUp({
-      content: "Queue shuffled.",
-      ephemeral: true,
-    });
+    await this.notify(
+      interaction,
+      `**Confirmed.** Queue randomized. **${player.queue.size}** tracks reordered, Master.`,
+    );
   }
 
   async handleLoop(interaction, player) {
-    // Toggle loop modes: none/off -> track -> queue -> none
-    const currentLoop = player.loop;
-    if (!currentLoop || currentLoop === "none" || currentLoop === "off") {
-      player.setLoop("track");
-      await interaction.followUp({
-        content: "Looping current track.",
-        ephemeral: true,
-      });
-    } else if (currentLoop === "track") {
-      player.setLoop("queue");
-      await interaction.followUp({
-        content: "Looping entire queue.",
-        ephemeral: true,
-      });
-    } else {
-      player.setLoop("none");
-      await interaction.followUp({
-        content: "Loop disabled.",
-        ephemeral: true,
-      });
-    }
+    // Cycle off -> track -> queue -> off (moonlink's PlayerLoop values)
+    const next = LOOP_CYCLE[player.loop] ?? "track";
+    player.setLoop(next);
+
+    await this.refreshControls(interaction, player);
+    await this.notify(interaction, LOOP_MESSAGES[next]);
   }
 }
 

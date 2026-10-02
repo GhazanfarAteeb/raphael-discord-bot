@@ -24,6 +24,11 @@ const tempVoiceSchema = new mongoose.Schema({
     type: Boolean,
     default: false
   },
+  // Set from the interface's Status button; without this path strict mode dropped it
+  customStatus: {
+    type: String,
+    default: null
+  },
   createdAt: {
     type: Date,
     default: Date.now

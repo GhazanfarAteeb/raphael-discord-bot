@@ -4,6 +4,7 @@
  */
 
 import Command from "../../structures/Command.js";
+import { errorEmbed, successEmbed, warningEmbed } from "../../utils/embeds.js";
 
 export default class Shuffle extends Command {
   constructor(client) {
@@ -35,42 +36,36 @@ export default class Shuffle extends Command {
   }
 
   async run(client, ctx, args) {
-    const player = client.moonlink?.players.get(ctx.guild.id);
+    const guildId = ctx.guild.id;
+    const fail = async (description) =>
+      ctx.sendMessage({ embeds: [await errorEmbed(guildId, "Audio System", description)] });
+    const notice = async (description) =>
+      ctx.sendMessage({ embeds: [await warningEmbed(guildId, "Audio System", description)] });
+    const confirm = async (description) =>
+      ctx.sendMessage({ embeds: [await successEmbed(guildId, "Audio System", description)] });
 
-    if (!player) {
-      return ctx.sendMessage({
-        embeds: [
-          {
-            color: 0xff4757,
-            description:
-              "**Warning:** No active audio session detected, Master.",
-          },
-        ],
-      });
+    try {
+      const player = client.moonlink?.players.get(guildId);
+
+      if (!player || player.destroyed) {
+        return await fail("**Warning:** No active audio session detected, Master.");
+      }
+
+      if (player.queue.size < 2) {
+        return await notice(
+          "**Notice:** Insufficient tracks for randomization. Minimum of 2 required, Master.",
+        );
+      }
+
+      // Use moonlink's built-in queue shuffle
+      player.queue.shuffle();
+
+      return await confirm(
+        `**Confirmed.** Queue randomization complete. **${player.queue.size}** tracks reordered, Master.`,
+      );
+    } catch (error) {
+      client.logger.error("[Music:shuffle] Error:", error);
+      return fail("**Alert:** An anomaly occurred while shuffling the queue, Master.");
     }
-
-    if (player.queue.size < 2) {
-      return ctx.sendMessage({
-        embeds: [
-          {
-            color: 0xffd700,
-            description:
-              "**Notice:** Insufficient tracks for randomization. Minimum of 2 required, Master.",
-          },
-        ],
-      });
-    }
-
-    // Use moonlink's built-in queue shuffle
-    player.queue.shuffle();
-
-    return ctx.sendMessage({
-      embeds: [
-        {
-          color: 0x00ced1,
-          description: `**Confirmed:** Queue randomization complete. **${player.queue.size}** tracks reordered, Master.`,
-        },
-      ],
-    });
   }
 }

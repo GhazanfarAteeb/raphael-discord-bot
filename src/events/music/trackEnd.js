@@ -4,6 +4,7 @@
  */
 
 import Event from '../../structures/Event.js';
+import { clearNowPlaying } from '../../music/RiffyManager.js';
 
 class MusicTrackEnd extends Event {
     constructor(client, file) {
@@ -12,19 +13,14 @@ class MusicTrackEnd extends Event {
         });
     }
 
-    async run(player, track) {
+    // reason: moonlink TrackEndReason ("finished", "loadFailed", "stopped", "cleanup")
+    async run(player, track, reason) {
         try {
-            // Delete the now playing message
-            if (player.message) {
-                try {
-                    await player.message.delete();
-                    player.message = null;
-                } catch (e) {
-                    // Message already deleted
-                }
-            }
+            // clearNowPlaying detaches the message before the delete is awaited, so the
+            // next track's card stored meanwhile by trackStart is left untouched.
+            await clearNowPlaying(player);
         } catch (error) {
-            this.client.logger.error('Error in musicTrackEnd event:', error);
+            this.client.logger.error(`Error in musicTrackEnd event (reason: ${reason}):`, error);
         }
     }
 }

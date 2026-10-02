@@ -1,8 +1,26 @@
-import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
+import { ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, MessageFlags, escapeMarkdown } from 'discord.js';
 import Level from '../../models/Level.js';
+import Economy from '../../models/Economy.js';
+import Member from '../../models/Member.js';
 import Guild from '../../models/Guild.js';
-import { infoEmbed, GLYPHS } from '../../utils/embeds.js';
+import { createEmbed, errorEmbed, GLYPHS } from '../../utils/embeds.js';
 import { getRandomFooter } from '../../utils/raphael.js';
+
+const PER_PAGE = 10;
+const COLLECTOR_TIME_MS = 120000; // 2 minutes
+const RANK_GLYPHS = ['◆', '◈', '◇'];
+// Only a custom guild emoji is shown next to the currency; unicode defaults stay out of bot text
+const CUSTOM_EMOJI = /^<a?:\w{2,32}:\d{17,20}>$/;
+
+const TYPE_ALIASES = {
+  coins: 'coins',
+  level: 'level',
+  lvl: 'level',
+  messages: 'messages',
+  xp: 'xp',
+  rep: 'rep',
+  reputation: 'rep'
+};
 
 export default {
   name: 'leaderboard',
@@ -15,229 +33,282 @@ export default {
   async execute(message, args) {
     const guildId = message.guild.id;
 
-    // Determine leaderboard type
-    const validTypes = ['coins', 'level', 'lvl', 'messages', 'xp', 'rep', 'reputation'];
-    let type = 'level'; // default to level
-    let page = 1;
-
-    if (args[0] && validTypes.includes(args[0].toLowerCase())) {
-      type = args[0].toLowerCase();
-      // Normalize type
-      if (type === 'lvl') type = 'level';
-      if (type === 'reputation') type = 'rep';
-      page = parseInt(args[1]) || 1;
-    } else {
-      page = parseInt(args[0]) || 1;
-    }
-
-    const perPage = 10;
-
     try {
-      let leaderboard;
-      let title;
-      let typeLabel;
+      // Determine leaderboard type
+      let type = 'level'; // default to level
+      let page = 1;
+
+      const requestedType = TYPE_ALIASES[args[0]?.toLowerCase()];
+      if (requestedType) {
+        type = requestedType;
+        page = parseInt(args[1]) || 1;
+      } else {
+        page = parseInt(args[0]) || 1;
+      }
 
       // Get guild config for coin settings
       const guildConfig = await Guild.getGuild(guildId);
-      const coinEmoji = guildConfig.economy?.coinEmoji || '💰';
-      const coinName = guildConfig.economy?.coinName || 'coins';
+      const coinEmoji = guildConfig?.economy?.coinEmoji || '';
+      const coinName = guildConfig?.economy?.coinName || 'coins';
+      const coinIcon = CUSTOM_EMOJI.test(coinEmoji) ? `${coinEmoji} ` : '';
 
-      // Get appropriate leaderboard based on type
-      if (type === 'coins') {
-        const Economy = (await import('../../models/Economy.js')).default;
-        leaderboard = await Economy.find({ guildId, coins: { $gt: 0 } })
-          .sort({ coins: -1 })
-          .limit(perPage * 10)
-          .lean();
-        title = `${coinEmoji} ${coinName.charAt(0).toUpperCase() + coinName.slice(1)} Leaderboard`;
-        typeLabel = 'coins';
-      } else if (type === 'rep') {
-        const Economy = (await import('../../models/Economy.js')).default;
-        leaderboard = await Economy.find({ guildId, reputation: { $gt: 0 } })
-          .sort({ reputation: -1 })
-          .limit(perPage * 10)
-          .lean();
-        title = '⭐ Reputation Leaderboard';
-        typeLabel = 'rep';
-      } else if (type === 'messages') {
-        const Economy = (await import('../../models/Economy.js')).default;
-        leaderboard = await Economy.find({ guildId, 'stats.messagesCount': { $gt: 0 } })
-          .sort({ 'stats.messagesCount': -1 })
-          .limit(perPage * 10)
-          .lean();
-        title = '💬 Messages Leaderboard';
-        typeLabel = 'messages';
-      } else if (type === 'level') {
-        // Level-based leaderboard (sorted by level first, then XP)
-        leaderboard = await Level.find({ guildId, level: { $gt: 0 } })
-          .sort({ level: -1, xp: -1 })
-          .limit(perPage * 10)
-          .lean();
-        title = '🏆 Level Leaderboard';
-        typeLabel = 'level';
-      } else {
-        // xp (default) - sorted by totalXP
-        leaderboard = await Level.getLeaderboard(guildId, perPage * 10);
-        title = '✨ XP Leaderboard';
-        typeLabel = 'xp';
-      }
+      const board = getBoard(type, coinName, coinIcon);
+      const context = { message, guildId, type, board };
 
-      const totalEntries = leaderboard.length;
+      const view = await buildView(context, page);
 
-      if (!leaderboard.length) {
-        const embed = await infoEmbed(guildId, title,
-          'No one is on the leaderboard yet! Start chatting to earn XP and levels.'
-        );
-
+      if (!view.total) {
         // Still show disabled pagination buttons
-        const row = createPaginationRow(1, 1, type, true);
-        return message.reply({ embeds: [embed], components: [row] });
+        return message.reply({ embeds: [view.embed], components: [createPaginationRow(1, 1, type, true)] });
       }
 
-      // Calculate pages
-      const maxPage = Math.ceil(leaderboard.length / perPage);
-      const currentPage = Math.max(1, Math.min(page, maxPage));
-      const start = (currentPage - 1) * perPage;
-      const end = start + perPage;
+      let currentPage = view.page;
+      let maxPage = view.maxPage;
 
-      // Create leaderboard embed
-      const embed = await createLeaderboardEmbed(
-        message, leaderboard, start, end, type, title,
-        currentPage, maxPage, totalEntries, coinEmoji, coinName, guildConfig
-      );
-
-      // Create pagination buttons (always show, disabled if only 1 page)
-      const row = createPaginationRow(currentPage, maxPage, type);
-
-      const reply = await message.reply({ embeds: [embed], components: [row] });
+      const reply = await message.reply({
+        embeds: [view.embed],
+        components: [createPaginationRow(currentPage, maxPage, type)]
+      });
 
       // Create collector for pagination
       const collector = reply.createMessageComponentCollector({
+        componentType: ComponentType.Button,
         filter: i => i.user.id === message.author.id,
-        time: 120000 // 2 minutes
+        time: COLLECTOR_TIME_MS
       });
 
-      collector.on('collect', async (i) => {
+      collector.on('ignore', async (i) => {
         try {
-          // Parse custom_id format: lb_action_type_currentPage
-          const parts = i.customId.split('_');
-          const action = parts[1]; // first, prev, page, next, last
-          const btnType = parts[2];
-          const btnCurrentPage = parseInt(parts[3]);
-          // Ensure the button type matches the current leaderboard type
-          if (parts[0] === 'lb' && action !== 'page') {
-            // Defer the update first to prevent timeout
-            await i.deferUpdate();
-
-            let targetPage = btnCurrentPage;
-            
-            if (action === 'first') targetPage = 1;
-            else if (action === 'prev') targetPage = Math.max(1, btnCurrentPage - 1);
-            else if (action === 'next') targetPage = Math.min(maxPage, btnCurrentPage + 1);
-            else if (action === 'last') targetPage = maxPage;
-
-            const newStart = (targetPage - 1) * perPage;
-            const newEnd = newStart + perPage;
-
-            const newEmbed = await createLeaderboardEmbed(
-              message, leaderboard, newStart, newEnd, type, title,
-              targetPage, maxPage, totalEntries, coinEmoji, coinName, guildConfig
-            );
-
-            const newRow = createPaginationRow(targetPage, maxPage, type);
-
-            await i.editReply({ embeds: [newEmbed], components: [newRow] });
-          }
+          await i.reply({
+            content: '**Notice:** These controls respond only to the member who requested this leaderboard, Master.',
+            flags: MessageFlags.Ephemeral
+          });
         } catch (error) {
-          console.error('Error handling leaderboard pagination:', error);
+          console.error('[Leaderboard] Failed to answer a foreign button press:', error);
         }
       });
 
+      // Page changes run one at a time so rapid presses cannot race each other
+      let pending = Promise.resolve();
+
+      collector.on('collect', async (i) => {
+        try {
+          await i.deferUpdate();
+        } catch (error) {
+          console.error('[Leaderboard] Failed to acknowledge pagination:', error);
+          return;
+        }
+
+        pending = pending.then(async () => {
+          try {
+            const action = i.customId.split('_')[1]; // first, prev, page, next, last
+            let targetPage = currentPage;
+
+            if (action === 'first') targetPage = 1;
+            else if (action === 'prev') targetPage = currentPage - 1;
+            else if (action === 'next') targetPage = currentPage + 1;
+            else if (action === 'last') targetPage = Number.MAX_SAFE_INTEGER; // clamped to the live page count
+            else return;
+
+            const next = await buildView(context, targetPage);
+            currentPage = next.page;
+            maxPage = next.maxPage;
+
+            await i.editReply({
+              embeds: [next.embed],
+              components: [createPaginationRow(currentPage, maxPage, type, !next.total)]
+            });
+          } catch (error) {
+            console.error('[Leaderboard] Error handling pagination:', error);
+            try {
+              await i.followUp({
+                embeds: [await errorEmbed(guildId, 'Page Unavailable', 'The requested page could not be retrieved, Master. Please try again.')],
+                flags: MessageFlags.Ephemeral
+              });
+            } catch (followUpError) {
+              console.error('[Leaderboard] Failed to report pagination error:', followUpError);
+            }
+          }
+        });
+      });
+
       collector.on('end', async () => {
-        // Disable all buttons when collector ends
-        const disabledRow = createPaginationRow(currentPage, maxPage, type, true);
-        await reply.edit({ components: [disabledRow] }).catch(() => { });
+        try {
+          // Disable all buttons when collector ends, on the page last shown
+          await pending;
+          await reply.edit({ components: [createPaginationRow(currentPage, maxPage, type, true)] });
+        } catch {
+          // Message may have been deleted
+        }
       });
 
     } catch (error) {
-      console.error('Error fetching leaderboard:', error);
-      const { errorEmbed } = await import('../../utils/embeds.js');
-      return message.reply({
-        embeds: [await errorEmbed(guildId, 'Leaderboard Error', 'Failed to fetch leaderboard. Please try again later.')]
-      });
+      console.error('[Leaderboard] Error fetching leaderboard:', error);
+      try {
+        return await message.reply({
+          embeds: [await errorEmbed(guildId, 'Leaderboard Error', 'The leaderboard could not be retrieved, Master. Please try again later.')]
+        });
+      } catch (replyError) {
+        console.error('[Leaderboard] Failed to send error reply:', replyError);
+      }
     }
   }
 };
 
-// Create leaderboard embed
-async function createLeaderboardEmbed(message, leaderboard, start, end, type, title, currentPage, maxPage, totalEntries, coinEmoji, coinName, guildConfig) {
-  const medals = ['🥇', '🥈', '🥉'];
-  let leaderboardText = '';
+// Leaderboard definitions. sortFields are all descending; userId breaks ties so that pages
+// are stable and a member's rank matches the position they are listed at.
+function getBoard(type, coinName, coinIcon) {
+  const coinLabel = coinName.charAt(0).toUpperCase() + coinName.slice(1);
 
-  for (let i = start; i < Math.min(end, leaderboard.length); i++) {
-    const user = leaderboard[i];
-    const position = i + 1;
-    const medal = position <= 3 ? medals[position - 1] : `#${position}`;
-
-    try {
-      const member = await message.guild.members.fetch(user.userId).catch(() => null);
-      const username = member ? member.user.username : user.username || 'Unknown User';
-
-      leaderboardText += `${medal} **${username}**\n`;
-
-      // Display different stats based on type
-      if (type === 'coins') {
-        leaderboardText += `${GLYPHS.ARROW_RIGHT} ${(user.coins || 0).toLocaleString()} ${coinEmoji}\n\n`;
-      } else if (type === 'rep') {
-        leaderboardText += `${GLYPHS.ARROW_RIGHT} ${(user.reputation || 0).toLocaleString()} ⭐ reputation\n\n`;
-      } else if (type === 'messages') {
-        leaderboardText += `${GLYPHS.ARROW_RIGHT} ${(user.stats?.messagesCount || 0).toLocaleString()} messages\n\n`;
-      } else if (type === 'level') {
-        leaderboardText += `${GLYPHS.ARROW_RIGHT} Level **${user.level || 0}** • ${(user.xp || 0).toLocaleString()} XP\n\n`;
-      } else {
-        // xp
-        leaderboardText += `${GLYPHS.ARROW_RIGHT} ${(user.totalXP || 0).toLocaleString()} ✨ XP • Level ${user.level || 0}\n\n`;
-      }
-    } catch (error) {
-      console.error('Error fetching member:', error);
+  const boards = {
+    coins: {
+      model: Economy,
+      title: `${coinLabel} Leaderboard`,
+      sortFields: ['coins'],
+      select: 'userId coins',
+      format: (row) => `${(row.coins || 0).toLocaleString()} ${coinIcon}${coinName}`
+    },
+    rep: {
+      model: Economy,
+      title: 'Reputation Leaderboard',
+      sortFields: ['reputation'],
+      select: 'userId reputation',
+      format: (row) => `${(row.reputation || 0).toLocaleString()} reputation`
+    },
+    // Message totals are tracked on Member (statsMessageTracker); Economy.stats.messagesCount is never incremented
+    messages: {
+      model: Member,
+      title: 'Messages Leaderboard',
+      sortFields: ['stats.messagesCount'],
+      select: 'userId username displayName stats.messagesCount',
+      format: (row) => `${(row.stats?.messagesCount || 0).toLocaleString()} messages`
+    },
+    level: {
+      model: Level,
+      title: 'Level Leaderboard',
+      sortFields: ['level', 'xp'],
+      select: 'userId username level xp',
+      format: (row) => `Level **${row.level || 0}** • ${(row.xp || 0).toLocaleString()} XP`
+    },
+    xp: {
+      model: Level,
+      title: 'XP Leaderboard',
+      sortFields: ['totalXP', 'level'],
+      select: 'userId username totalXP level',
+      format: (row) => `${(row.totalXP || 0).toLocaleString()} XP • Level ${row.level || 0}`
     }
+  };
+
+  const board = boards[type] || boards.level;
+  const [primaryField] = board.sortFields;
+
+  return {
+    ...board,
+    filter: (guildId) => ({ guildId, [primaryField]: { $gt: 0 } }),
+    sort: Object.fromEntries([...board.sortFields.map(field => [field, -1]), ['userId', 1]])
+  };
+}
+
+// Read a dotted path such as "stats.messagesCount" from a lean document
+function readPath(doc, path) {
+  return path.split('.').reduce((value, key) => (value == null ? undefined : value[key]), doc);
+}
+
+// Requester's 1-based position under the same ordering as the pages, or null when unranked
+async function getRequesterRank(board, guildId, userId) {
+  const doc = await board.model.findOne({ guildId, userId }).select(board.sortFields.join(' ')).lean();
+  if (!doc) return null;
+
+  const values = board.sortFields.map(field => readPath(doc, field) ?? 0);
+  if (!(values[0] > 0)) return null;
+
+  // Entries ahead: a higher value on some sort field with all earlier fields equal,
+  // or all fields equal and a smaller userId (the tie-breaker)
+  const ahead = board.sortFields.map((field, index) => {
+    const clause = {};
+    for (let j = 0; j < index; j++) clause[board.sortFields[j]] = values[j];
+    clause[field] = { $gt: values[index] };
+    return clause;
+  });
+  const tie = { userId: { $lt: userId } };
+  board.sortFields.forEach((field, j) => { tie[field] = values[j]; });
+  ahead.push(tie);
+
+  const count = await board.model.countDocuments({ ...board.filter(guildId), $or: ahead });
+  return count + 1;
+}
+
+async function resolveNames(guild, rows) {
+  return Promise.all(rows.map(async (row) => {
+    const member = guild.members.cache.get(row.userId)
+      ?? await guild.members.fetch(row.userId).catch(() => null);
+    const name = member?.user.username || row.username || row.displayName || 'Unknown User';
+    return escapeMarkdown(name);
+  }));
+}
+
+// Count, fetch one page and the requester's rank, then build the embed
+async function buildView({ message, guildId, board }, requestedPage) {
+  const filter = board.filter(guildId);
+  const total = await board.model.countDocuments(filter);
+  const maxPage = Math.max(1, Math.ceil(total / PER_PAGE));
+  const page = Math.max(1, Math.min(requestedPage, maxPage));
+
+  const [rows, rank] = await Promise.all([
+    total
+      ? board.model.find(filter).sort(board.sort).skip((page - 1) * PER_PAGE).limit(PER_PAGE).select(board.select).lean()
+      : [],
+    getRequesterRank(board, guildId, message.author.id)
+  ]);
+
+  const names = await resolveNames(message.guild, rows);
+
+  const lines = rows.map((row, index) => {
+    const position = (page - 1) * PER_PAGE + index + 1;
+    const marker = position <= RANK_GLYPHS.length ? RANK_GLYPHS[position - 1] : GLYPHS.DOT;
+    return `${marker} **#${position}** — **${names[index]}**\n${GLYPHS.ARROW_RIGHT} ${board.format(row)}`;
+  });
+
+  const embed = await createEmbed(guildId, 'info');
+  embed
+    .setTitle(`『 ${board.title} 』`)
+    .setThumbnail(message.guild.iconURL())
+    .setFooter({ text: `Page ${page}/${maxPage} • ${getRandomFooter()}` });
+
+  if (!total) {
+    embed.setDescription('**Analysis:** No one has been ranked on this leaderboard yet, Master. Continued activity will populate it.');
+    return { embed, page, maxPage, total };
   }
 
-  // Find user's position
-  const userPosition = leaderboard.findIndex(u => u.userId === message.author.id) + 1;
+  embed
+    .setDescription(lines.join('\n\n') || 'No data available.')
+    .addFields({
+      name: `${GLYPHS.ARROW_RIGHT} Your Position`,
+      value: rank
+        ? `#${rank.toLocaleString()} of ${total.toLocaleString()} ranked entries`
+        : `Not yet ranked • ${total.toLocaleString()} ranked entries`
+    });
 
-  const embed = new EmbedBuilder()
-    .setTitle(title)
-    .setDescription(leaderboardText || 'No data available.')
-    .setColor(guildConfig?.embedStyle?.color || '#667eea')
-    .setThumbnail(message.guild.iconURL({ dynamic: true }))
-    .setFooter({
-      text: `Page ${currentPage}/${maxPage}${userPosition ? ` • Your Rank: #${userPosition}` : ''} • ${totalEntries} total entries`
-    })
-    .setTimestamp();
-
-  return embed;
+  return { embed, page, maxPage, total };
 }
 
 // Create pagination buttons row
 function createPaginationRow(currentPage, maxPage, type, forceDisabled = false) {
-  const firstDisabled = forceDisabled || currentPage <= 1;
-  const prevDisabled = forceDisabled || currentPage <= 1;
-  const nextDisabled = forceDisabled || currentPage >= maxPage;
-  const lastDisabled = forceDisabled || currentPage >= maxPage;
+  const atStart = forceDisabled || currentPage <= 1;
+  const atEnd = forceDisabled || currentPage >= maxPage;
 
   // Use unique identifiers for each button action to avoid duplicate custom_id
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`lb_first_${type}_${currentPage}`)
-      .setEmoji('⏮️')
+      .setLabel('First')
       .setStyle(ButtonStyle.Secondary)
-      .setDisabled(firstDisabled),
+      .setDisabled(atStart),
     new ButtonBuilder()
       .setCustomId(`lb_prev_${type}_${currentPage}`)
-      .setEmoji('◀️')
+      .setLabel('Previous')
       .setStyle(ButtonStyle.Primary)
-      .setDisabled(prevDisabled),
+      .setDisabled(atStart),
     new ButtonBuilder()
       .setCustomId(`lb_page_${type}_${currentPage}`)
       .setLabel(`${currentPage}/${maxPage}`)
@@ -245,13 +316,13 @@ function createPaginationRow(currentPage, maxPage, type, forceDisabled = false) 
       .setDisabled(true),
     new ButtonBuilder()
       .setCustomId(`lb_next_${type}_${currentPage}`)
-      .setEmoji('▶️')
+      .setLabel('Next')
       .setStyle(ButtonStyle.Primary)
-      .setDisabled(nextDisabled),
+      .setDisabled(atEnd),
     new ButtonBuilder()
       .setCustomId(`lb_last_${type}_${currentPage}`)
-      .setEmoji('⏭️')
+      .setLabel('Last')
       .setStyle(ButtonStyle.Secondary)
-      .setDisabled(lastDisabled)
+      .setDisabled(atEnd)
   );
 }

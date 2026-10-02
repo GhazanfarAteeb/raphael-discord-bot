@@ -10,6 +10,105 @@ import logger from "../utils/logger.js";
 const require = createRequire(import.meta.url);
 const { Manager, Connectors } = require("moonlink.js");
 
+// moonlink's search.defaultPlatform takes its own platform keys; a raw search
+// prefix such as "ytmsearch" is not one of them and silently falls back to
+// "ytsearch" (plain YouTube). Map the prefixes the config documents to keys.
+const SEARCH_PLATFORM_KEYS = {
+  ytsearch: "youtube",
+  ytmsearch: "youtubemusic",
+  scsearch: "soundcloud",
+};
+
+// Pending auto-leave countdowns: guildId -> Map(kind -> Timeout)
+const autoLeaveTimers = new Map();
+
+/**
+ * Deletes the player's now-playing message (the one with live control buttons).
+ * The reference is cleared first, so concurrent callers never delete it twice
+ * or wipe a newer message stored by trackStart.
+ */
+export async function clearNowPlaying(player) {
+  const message = player?.message;
+  if (!message) return;
+  player.message = null;
+  await message.delete().catch(() => {});
+}
+
+/**
+ * Cancels pending auto-leave countdowns for a guild (one kind, or all of them).
+ */
+export function cancelAutoLeave(guildId, kind) {
+  const timers = autoLeaveTimers.get(guildId);
+  if (!timers) return;
+  for (const [timerKind, timer] of timers) {
+    if (kind && timerKind !== kind) continue;
+    clearTimeout(timer);
+    timers.delete(timerKind);
+  }
+  if (timers.size === 0) autoLeaveTimers.delete(guildId);
+}
+
+/**
+ * Destroys the guild's player after `delay` ms unless `shouldLeave(player)` says
+ * otherwise when the countdown ends. A countdown of the same kind that is already
+ * running is kept (unrelated events must not keep resetting it).
+ * `onLeave(player)` runs after the player has been destroyed.
+ */
+export function scheduleAutoLeave(client, guildId, kind, delay, shouldLeave, onLeave) {
+  let timers = autoLeaveTimers.get(guildId);
+  if (timers?.has(kind)) return false;
+  if (!timers) {
+    timers = new Map();
+    autoLeaveTimers.set(guildId, timers);
+  }
+
+  const timer = setTimeout(async () => {
+    const pending = autoLeaveTimers.get(guildId);
+    if (pending?.get(kind) === timer) {
+      pending.delete(kind);
+      if (pending.size === 0) autoLeaveTimers.delete(guildId);
+    }
+
+    const player = client.moonlink?.players.get(guildId);
+    if (!player || player.destroyed) return;
+
+    try {
+      if (!(await shouldLeave(player))) return;
+      await clearNowPlaying(player);
+      await player.destroy(`Auto-leave: ${kind}`);
+      if (onLeave) await onLeave(player);
+    } catch (error) {
+      logger.error(`[MOONLINK] Auto-leave (${kind}) failed for guild ${guildId}`, error);
+    }
+  }, delay);
+  timer.unref?.();
+  timers.set(kind, timer);
+  return true;
+}
+
+/**
+ * Skips the current track. When nothing follows, moonlink's skip() only stops the
+ * player (TrackEnd "stopped" bypasses its queue-end handling), leaving the bot idle
+ * in the channel indefinitely, so the session is ended instead.
+ * Resolves to { ok, ended, track } where track is the skipped track.
+ */
+export async function skipCurrent(player) {
+  const track = player.current;
+
+  // Queue loop: moonlink re-queues the current track only when it finishes
+  // naturally, so a skipped track would otherwise drop out of the loop.
+  if (player.loop === "queue" && track) player.queue.add(track);
+
+  if (player.queue.isEmpty && !player.autoPlay) {
+    await clearNowPlaying(player);
+    await player.destroy("Skipped the final track");
+    return { ok: true, ended: true, track };
+  }
+
+  const ok = await player.skip();
+  return { ok, ended: false, track };
+}
+
 class MoonlinkManager {
   constructor(client) {
     this.client = client;
@@ -22,6 +121,11 @@ class MoonlinkManager {
   initialize() {
     logger.info("Initializing Moonlink Music Manager...");
 
+    const searchPlatform = musicConfig.defaultSearchPlatform ?? "ytmsearch";
+    const autoLeave = musicConfig.autoLeave ?? {};
+
+    // moonlink merges these option groups shallowly: each object passed here
+    // replaces its default entirely, so every field is spelled out.
     this.moonlink = new Manager({
       nodes: musicConfig.nodes.map((n) => ({
         host: n.host,
@@ -36,7 +140,23 @@ class MoonlinkManager {
       })),
       options: {
         search: {
-          defaultPlatform: musicConfig.defaultSearchPlatform ?? "ytmsearch",
+          defaultPlatform: SEARCH_PLATFORM_KEYS[searchPlatform] ?? searchPlatform,
+          resultLimit: 10,
+        },
+        defaultPlayer: {
+          volume: musicConfig.defaultVolume ?? 100,
+          autoPlay: false,
+          // Queue-end leaving is handled (with a grace period) by the musicQueueEnd event
+          autoLeave: false,
+          selfDeaf: true,
+          selfMute: false,
+          loop: "off",
+          historySize: 10,
+        },
+        // Destroy players that sit idle, paused or stopped for the auto-leave timeout
+        playerDestruction: {
+          autoDestroyOnIdle: autoLeave.enabled !== false,
+          idleTimeout: autoLeave.timeout ?? 300000,
         },
         autoResume: false,
         resume: false,
@@ -116,12 +236,22 @@ class MoonlinkManager {
       );
     });
 
+    // Every destroy path (stop, auto-leave, idle timeout, failed voice recovery)
+    // ends here: drop pending countdowns and the now-playing card's live buttons.
+    this.moonlink.on("playerDestroy", (player, reason) => {
+      logger.info(
+        `[MOONLINK] Player destroyed for guild ${player.guildId}: ${reason ?? "no reason given"}`,
+      );
+      cancelAutoLeave(player.guildId);
+      clearNowPlaying(player).catch(() => {});
+    });
+
     this.moonlink.on("trackStart", (player, track) => {
       this.client.emit("musicTrackStart", player, track);
     });
 
-    this.moonlink.on("trackEnd", (player, track) => {
-      this.client.emit("musicTrackEnd", player, track);
+    this.moonlink.on("trackEnd", (player, track, reason) => {
+      this.client.emit("musicTrackEnd", player, track, reason);
     });
 
     // moonlink emits "trackException" (not "trackError")
@@ -132,8 +262,8 @@ class MoonlinkManager {
       });
     });
 
-    this.moonlink.on("queueEnd", (player) => {
-      this.client.emit("musicQueueEnd", player);
+    this.moonlink.on("queueEnd", (player, lastTrack) => {
+      this.client.emit("musicQueueEnd", player, lastTrack);
     });
   }
 }
