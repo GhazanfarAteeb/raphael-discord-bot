@@ -1,10 +1,45 @@
 import { EmbedBuilder } from 'discord.js';
 import Economy from '../../models/Economy.js';
 import Guild from '../../models/Guild.js';
-import { ROULETTE_MIN, ROULETTE_MAX } from '../../utils/gameConfig.js';
-import { errorEmbed } from '../../utils/embeds.js';
-import { getPrefix } from '../../utils/helpers.js';
+import { ROULETTE_MIN, ROULETTE_MAX, ROULETTE_PAYOUTS, DEFAULT_COIN_NAME } from '../../utils/gameConfig.js';
+import { errorEmbed, COLORS } from '../../utils/embeds.js';
+import { getPrefix, formatNumber } from '../../utils/helpers.js';
 import { getRandomFooter } from '../../utils/raphael.js';
+
+// Single-zero wheel: 0 is green, the rest split evenly between red and black
+const RED_NUMBERS = new Set([1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36]);
+const MAX_NUMBER = 36;
+const COLOR_NAMES = { red: 'Red', black: 'Black', green: 'Green' };
+
+function getColor(number) {
+    if (number === 0) return 'green';
+    return RED_NUMBERS.has(number) ? 'red' : 'black';
+}
+
+// Parses the wager target: red/black (color bet), green (straight bet on 0) or a number 0-36
+function parseBet(input) {
+    if (input === 'red' || input === 'black') return { type: 'color', color: input };
+    if (input === 'green') return { type: 'straight', number: 0 };
+    if (/^\d+$/.test(input ?? '')) {
+        const number = parseInt(input, 10);
+        if (number <= MAX_NUMBER) return { type: 'straight', number };
+    }
+    return null;
+}
+
+function describeBet(bet) {
+    if (bet.type === 'color') return COLOR_NAMES[bet.color];
+    return bet.number === 0 ? 'Green (0)' : `Number ${bet.number}`;
+}
+
+function wagerGuide(prefix) {
+    return `**Color Wagers:** red or black (pays ${ROULETTE_PAYOUTS.color}x)\n` +
+        `**Green:** 0 only (pays ${ROULETTE_PAYOUTS.straight}x)\n` +
+        `**Number Wagers:** 0-${MAX_NUMBER} (pays ${ROULETTE_PAYOUTS.straight}x)\n\n` +
+        `**Examples:**\n` +
+        `\`${prefix}roulette 100 red\`\n` +
+        `\`${prefix}roulette 50 17\``;
+}
 
 export default {
     name: 'roulette',
@@ -13,160 +48,116 @@ export default {
     category: 'economy',
     aliases: ['roul', 'wheel'],
     cooldown: 5,
-    
+
     execute: async (message, args) => {
         const userId = message.author.id;
         const guildId = message.guild.id;
-        
+
         try {
             const amount = parseInt(args[0]);
-            const bet = args[1]?.toLowerCase();
-            
+            const betInput = args[1]?.toLowerCase();
+
             if (!amount || isNaN(amount)) {
                 const prefix = await getPrefix(guildId);
                 return message.reply({
-                    embeds: [await errorEmbed(guildId, 'Probability Analysis', 
-                        `**Notice:** Please provide a valid wager, Master.\n\n` +
+                    embeds: [await errorEmbed(guildId, 'Probability Analysis',
+                        `Please provide a valid wager, Master.\n\n` +
                         `**Syntax:** \`${prefix}roulette <amount> <bet>\`\n` +
-                        `**Color Wagers:** red, black, green (2x multiplier)\n` +
-                        `**Number Wagers:** 0-36 (35x multiplier)\n\n` +
-                        `**Examples:**\n` +
-                        `\`${prefix}roulette 100 red\`\n` +
-                        `\`${prefix}roulette 50 17\``
+                        wagerGuide(prefix)
                     )]
                 });
             }
-            
-            if (!bet) {
+
+            if (!betInput) {
                 const prefix = await getPrefix(guildId);
                 return message.reply({
                     embeds: [await errorEmbed(guildId, 'Selection Required',
-                        `**Notice:** Please specify your prediction, Master.\n\n` +
-                        `**Color Wagers:** red, black, green (2x multiplier)\n` +
-                        `**Number Wagers:** 0-36 (35x multiplier)\n\n` +
-                        `**Examples:**\n` +
-                        `\`${prefix}roulette 100 red\`\n` +
-                        `\`${prefix}roulette 50 17\``
+                        `Please specify your prediction, Master.\n\n` + wagerGuide(prefix)
                     )]
                 });
             }
-            
+
+            const bet = parseBet(betInput);
+            if (!bet) {
+                const prefix = await getPrefix(guildId);
+                return message.reply({
+                    embeds: [await errorEmbed(guildId, 'Invalid Selection',
+                        `Unrecognized wager parameter, Master.\n\n` + wagerGuide(prefix)
+                    )]
+                });
+            }
+
             if (amount < ROULETTE_MIN) {
                 return message.reply({
-                    embeds: [await errorEmbed(guildId, 'Wager Threshold', `**Warning:** Minimum wager is **${ROULETTE_MIN}** coins, Master.`)]
+                    embeds: [await errorEmbed(guildId, 'Wager Threshold', `Minimum wager is **${formatNumber(ROULETTE_MIN)}** coins, Master.`)]
                 });
             }
-            
+
             if (amount > ROULETTE_MAX) {
                 return message.reply({
-                    embeds: [await errorEmbed(guildId, 'Wager Exceeded', `**Warning:** Maximum wager is **${ROULETTE_MAX}** coins, Master.`)]
+                    embeds: [await errorEmbed(guildId, 'Wager Exceeded', `Maximum wager is **${formatNumber(ROULETTE_MAX)}** coins, Master.`)]
                 });
             }
-            
+
             const guildConfig = await Guild.getGuild(guildId);
             const economy = await Economy.getEconomy(userId, guildId);
-            const coinEmoji = guildConfig.economy?.coinEmoji || '💰';
-            const coinName = guildConfig.economy?.coinName || 'coins';
-            
+            const coinName = guildConfig.economy?.coinName || DEFAULT_COIN_NAME;
+
             if (economy.coins < amount) {
                 return message.reply({
                     embeds: [await errorEmbed(guildId, 'Resource Deficit',
-                        `**Warning:** Insufficient ${coinEmoji} ${coinName}, Master.\n\n` +
-                        `**Current Balance:** ${economy.coins} ${coinEmoji}\n` +
-                        `**Wager Amount:** ${amount} ${coinEmoji}`
+                        `Insufficient ${coinName}, Master.\n\n` +
+                        `▸ **Current Balance:** ${formatNumber(economy.coins)} ${coinName}\n` +
+                        `▸ **Wager Amount:** ${formatNumber(amount)} ${coinName}`
                     )]
                 });
             }
-            
-            // Define roulette wheel
-            const redNumbers = [1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36];
-            const blackNumbers = [2, 4, 6, 8, 10, 11, 13, 15, 17, 20, 22, 24, 26, 28, 29, 31, 33, 35];
-            const greenNumbers = [0];
-            
+
             // Spin the wheel
-            const result = Math.floor(Math.random() * 37); // 0-36
-            
-            let resultColor;
-            if (greenNumbers.includes(result)) resultColor = 'green';
-            else if (redNumbers.includes(result)) resultColor = 'red';
-            else resultColor = 'black';
-            
-            const colorEmojis = {
-                red: '🔴',
-                black: '⚫',
-                green: '🟢'
-            };
-            
-            // Determine if bet won
-            let won = false;
-            let multiplier = 0;
-            let betType = '';
-            
-            // Check if bet is a color
-            if (['red', 'black', 'green'].includes(bet)) {
-                betType = 'color';
-                if (bet === resultColor) {
-                    won = true;
-                    multiplier = 2; // 2x for color bets
-                }
-            } 
-            // Check if bet is a number
-            else {
-                const betNumber = parseInt(bet);
-                if (!isNaN(betNumber) && betNumber >= 0 && betNumber <= 36) {
-                    betType = 'number';
-                    if (betNumber === result) {
-                        won = true;
-                        multiplier = 35; // 35x for number bets
-                    }
-                } else {
-                    return message.reply({
-                        embeds: [await errorEmbed(guildId, 'Invalid Selection',
-                            `**Warning:** Unrecognized wager parameter, Master.\n\n` +
-                            `**Colors:** red, black, green\n` +
-                            `**Numbers:** 0-36`
-                        )]
-                    });
-                }
-            }
-            
-            const winnings = won ? amount * multiplier : 0;
-            const netGain = won ? winnings - amount : -amount;
-            
-            // Update balance
+            const result = Math.floor(Math.random() * (MAX_NUMBER + 1)); // 0-36
+            const resultColor = getColor(result);
+
+            const won = bet.type === 'color' ? bet.color === resultColor : bet.number === result;
+            const multiplier = won ? ROULETTE_PAYOUTS[bet.type] : 0;
+            const winnings = amount * multiplier;
+            const netGain = winnings - amount;
+
+            // Stats first, so the single save inside addCoins/removeCoins records them too
             if (won) {
-                await economy.addCoins(netGain, `Roulette win (${multiplier}x)`);
                 economy.gamblingWins = (economy.gamblingWins || 0) + 1;
             } else {
-                await economy.removeCoins(amount, 'Roulette loss');
                 economy.gamblingLosses = (economy.gamblingLosses || 0) + 1;
             }
             economy.gamblingTotal = (economy.gamblingTotal || 0) + amount;
-            await economy.save();
-            
+
+            if (won) {
+                await economy.addCoins(netGain, `Roulette win (${multiplier}x)`);
+            } else {
+                await economy.removeCoins(amount, 'Roulette loss');
+            }
+
             const embed = new EmbedBuilder()
                 .setTitle('『 Probability Wheel 』')
                 .setDescription(
-                    `**Your Prediction:** ${betType === 'color' ? bet.toUpperCase() : `Number ${bet}`}\n` +
-                    `**Result:** ${colorEmojis[resultColor]} **${resultColor.toUpperCase()} ${result}**\n\n` +
-                    `**${won ? '◉ PREDICTION CORRECT' : '○ PREDICTION FAILED'}**\n\n` +
-                    (won 
-                        ? `**Multiplier:** ${multiplier}x\n**Winnings:** +${winnings} ${coinEmoji}\n**Net Profit:** +${netGain} ${coinEmoji}`
-                        : `**Loss:** -${amount} ${coinEmoji}`) +
-                    `\n\n**Updated Balance:** ${economy.coins} ${coinEmoji}`
+                    `▸ **Your Prediction:** ${describeBet(bet)}\n` +
+                    `▸ **Result:** **${COLOR_NAMES[resultColor]} ${result}**\n\n` +
+                    (won
+                        ? `◉ **PREDICTION CORRECT**\n\n▸ **Multiplier:** ${multiplier}x\n▸ **Winnings:** +${formatNumber(winnings)} ${coinName}\n▸ **Net Profit:** +${formatNumber(netGain)} ${coinName}`
+                        : `◆ **PREDICTION FAILED**\n\n▸ **Loss:** -${formatNumber(amount)} ${coinName}`)
                 )
-                .setColor(won ? '#00FF7F' : '#FF4757')
+                .addFields({ name: '▸ Updated Balance', value: `**${formatNumber(economy.coins)}** ${coinName}` })
+                .setColor(won ? COLORS.RAPHAEL_SUCCESS : COLORS.RAPHAEL_ERROR)
                 .setThumbnail(message.author.displayAvatarURL({ extension: 'png' }))
                 .setFooter({ text: `${getRandomFooter()} | Record: ${economy.gamblingWins || 0}W / ${economy.gamblingLosses || 0}L` })
                 .setTimestamp();
-            
+
             await message.reply({ embeds: [embed] });
-            
+
         } catch (error) {
-            console.error('Error in roulette command:', error);
+            console.error('[Roulette] Error:', error);
             return message.reply({
-                embeds: [await errorEmbed(guildId, '**Warning:** Probability calculation failed, Master. Please retry.')]
-            });
+                embeds: [await errorEmbed(guildId, 'System Error', 'Probability calculation failed, Master. Please retry.')]
+            }).catch(() => {});
         }
     }
 };

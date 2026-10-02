@@ -1,9 +1,166 @@
-import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType } from 'discord.js';
-import { successEmbed, errorEmbed, infoEmbed, GLYPHS } from '../../utils/embeds.js';
+import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, MessageFlags } from 'discord.js';
+import { errorEmbed, COLORS } from '../../utils/embeds.js';
 import { getPrefix } from '../../utils/helpers.js';
 import { getRandomFooter } from '../../utils/raphael.js';
 
+// The opponent has this long to answer a challenge
+const CHALLENGE_TIMEOUT = 30_000;
+// A game ends when nobody moves for this long
+const MOVE_TIMEOUT = 60_000;
+// Label for an empty cell (button labels cannot be blank)
+const EMPTY_LABEL = '•';
+const WIN_PATTERNS = [
+  [0, 1, 2], [3, 4, 5], [6, 7, 8], // Rows
+  [0, 3, 6], [1, 4, 7], [2, 5, 8], // Columns
+  [0, 4, 8], [2, 4, 6]             // Diagonals
+];
+
+// Every player in a challenge or game, keyed `${guildId}-${userId}`. Both players are
+// registered when the challenge is issued and released however it ends.
 const activeGames = new Map();
+
+const playerKey = (guildId, userId) => `${guildId}-${userId}`;
+
+function checkWinner(board) {
+  for (const [a, b, c] of WIN_PATTERNS) {
+    if (board[a] && board[a] === board[b] && board[b] === board[c]) {
+      return board[a];
+    }
+  }
+  return null;
+}
+
+function boardRows(game, allDisabled = false) {
+  const rows = [];
+  for (let i = 0; i < 3; i++) {
+    const row = new ActionRowBuilder();
+    for (let j = 0; j < 3; j++) {
+      const index = i * 3 + j;
+      const cell = game.board[index];
+      row.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`ttt_cell_${index}`)
+          .setLabel(cell ?? EMPTY_LABEL)
+          .setStyle(cell === 'X' ? ButtonStyle.Primary : cell === 'O' ? ButtonStyle.Danger : ButtonStyle.Secondary)
+          .setDisabled(allDisabled || cell !== null)
+      );
+    }
+    rows.push(row);
+  }
+  return rows;
+}
+
+function matchLine(game) {
+  return `**${game.players.X.username}** (X) vs **${game.players.O.username}** (O)`;
+}
+
+function turnEmbed(game) {
+  const currentPlayer = game.players[game.currentTurn];
+  return new EmbedBuilder()
+    .setColor(COLORS.RAPHAEL)
+    .setTitle('『 Strategic Challenge 』')
+    .setDescription(`${matchLine(game)}\n\n▸ **Awaiting ${currentPlayer.username}'s move (${game.currentTurn})...**`)
+    .setFooter({ text: `${getRandomFooter()} | ${MOVE_TIMEOUT / 1000} seconds per move` });
+}
+
+function endEmbed(game, color, title, text) {
+  return new EmbedBuilder()
+    .setColor(color)
+    .setTitle(`『 ${title} 』`)
+    .setDescription(`${matchLine(game)}\n\n${text}`)
+    .setFooter({ text: getRandomFooter() });
+}
+
+function replyPrivately(interaction, content) {
+  return interaction.reply({ content, flags: MessageFlags.Ephemeral }).catch(() => {});
+}
+
+// Plays the accepted game on `gameMsg`, which already shows the empty board
+function runGame(gameMsg, game, release) {
+  const collector = gameMsg.createMessageComponentCollector({
+    componentType: ComponentType.Button,
+    idle: MOVE_TIMEOUT
+  });
+  const isPlayer = (userId) => userId === game.players.X.id || userId === game.players.O.id;
+
+  collector.on('collect', async (interaction) => {
+    try {
+      if (!isPlayer(interaction.user.id)) {
+        return replyPrivately(interaction,
+          `This match is between ${game.players.X.username} and ${game.players.O.username}, Master.`);
+      }
+      if (game.over) return interaction.deferUpdate().catch(() => {});
+
+      const currentPlayer = game.players[game.currentTurn];
+      if (interaction.user.id !== currentPlayer.id) {
+        return replyPrivately(interaction, `It is ${currentPlayer.username}'s turn, Master.`);
+      }
+
+      const cellIndex = Number(interaction.customId.slice('ttt_cell_'.length));
+      if (!Number.isInteger(cellIndex) || cellIndex < 0 || cellIndex > 8) {
+        return interaction.deferUpdate().catch(() => {});
+      }
+      if (game.board[cellIndex] !== null) {
+        return replyPrivately(interaction, 'That position is already occupied, Master. Select an empty one.');
+      }
+
+      // All state changes happen before the first await, so a second click can't act on a stale turn
+      const mark = game.currentTurn;
+      game.board[cellIndex] = mark;
+      game.moves++;
+
+      const winner = checkWinner(game.board);
+      if (winner) {
+        game.over = true;
+        collector.stop('win');
+        const winnerPlayer = game.players[winner];
+        const loserPlayer = game.players[winner === 'X' ? 'O' : 'X'];
+        return await interaction.update({
+          embeds: [endEmbed(game, COLORS.RAPHAEL_SUCCESS, 'Game Over',
+            `◉ **${winnerPlayer.username}** (${winner}) wins, Master.\n\nBetter luck next time, ${loserPlayer.username}.`)],
+          components: boardRows(game, true)
+        });
+      }
+
+      if (game.moves === game.board.length) {
+        game.over = true;
+        collector.stop('draw');
+        return await interaction.update({
+          embeds: [endEmbed(game, COLORS.RAPHAEL_WARNING, 'Draw', '◈ Neither side prevailed. The grid is full, Master.')],
+          components: boardRows(game, true)
+        });
+      }
+
+      game.currentTurn = mark === 'X' ? 'O' : 'X';
+      await interaction.update({ embeds: [turnEmbed(game)], components: boardRows(game) });
+    } catch (error) {
+      console.error('[TicTacToe] Error handling move:', error);
+      const reply = {
+        embeds: [await errorEmbed(gameMsg.guildId, 'Game Error', 'That move could not be processed, Master. Please try again.')],
+        flags: MessageFlags.Ephemeral
+      };
+      await (interaction.replied || interaction.deferred ? interaction.followUp(reply) : interaction.reply(reply)).catch(() => {});
+    }
+  });
+
+  // Win, draw, idle or message deleted: the players are free either way
+  collector.on('end', async (_collected, reason) => {
+    release(game);
+    if (game.over) return;
+    game.over = true;
+    if (reason !== 'idle') return;
+    try {
+      const idlePlayer = game.players[game.currentTurn];
+      await gameMsg.edit({
+        embeds: [endEmbed(game, COLORS.RAPHAEL_ERROR, 'Game Timed Out',
+          `◆ ${idlePlayer.username} did not move within ${MOVE_TIMEOUT / 1000} seconds. The game has been cancelled, Master.`)],
+        components: boardRows(game, true)
+      });
+    } catch (error) {
+      // Message deleted or no longer editable
+    }
+  });
+}
 
 export default {
   name: 'tictactoe',
@@ -17,295 +174,148 @@ export default {
     const guildId = message.guild.id;
     const challenger = message.author;
     const opponent = message.mentions.users.first();
+    const keys = opponent ? [playerKey(guildId, challenger.id), playerKey(guildId, opponent.id)] : [];
+    let reserved = false;
 
-    // Check if opponent is mentioned
-    if (!opponent) {
-      const prefix = await getPrefix(guildId);
-      const embed = await errorEmbed(guildId, 'Opponent Required',
-        `**Notice:** Please specify an opponent, Master.\n\n**Syntax:** \`${prefix}tictactoe @user\``
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    // Can't play against yourself
-    if (opponent.id === challenger.id) {
-      const embed = await errorEmbed(guildId, 'Invalid Opponent',
-        `**Warning:** Self-challenge is not permitted, Master.`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    // Can't play against bots
-    if (opponent.bot) {
-      const embed = await errorEmbed(guildId, 'Invalid Opponent',
-        `**Warning:** Automated systems cannot participate in games, Master.`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    // Check if either player is in a game
-    const gameKey = `${guildId}-${challenger.id}`;
-    const opponentGameKey = `${guildId}-${opponent.id}`;
-
-    if (activeGames.has(gameKey) || activeGames.has(opponentGameKey)) {
-      const embed = await errorEmbed(guildId, 'Session Active',
-        `**Notice:** One of you is already in an active game session, Master.`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    // Create challenge embed
-    const challengeEmbed = new EmbedBuilder()
-      .setColor('#00CED1')
-      .setTitle('『 Strategic Challenge 』')
-      .setDescription(
-        `${challenger} has initiated a Tic Tac Toe challenge against ${opponent}.\n\n` +
-        `${opponent}, do you accept this challenge?`
-      )
-      .setFooter({ text: `${getRandomFooter()} | Expires in 30 seconds` });
-
-    const acceptRow = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId('ttt_accept')
-        .setLabel('Accept')
-        .setStyle(ButtonStyle.Success)
-        .setEmoji('✅'),
-      new ButtonBuilder()
-        .setCustomId('ttt_decline')
-        .setLabel('Decline')
-        .setStyle(ButtonStyle.Danger)
-        .setEmoji('❌')
-    );
-
-    const challengeMsg = await message.reply({
-      content: `${opponent}`,
-      embeds: [challengeEmbed],
-      components: [acceptRow]
-    });
-
-    // Wait for response
-    try {
-      const response = await challengeMsg.awaitMessageComponent({
-        filter: i => i.user.id === opponent.id,
-        componentType: ComponentType.Button,
-        time: 30000
-      });
-
-      if (response.customId === 'ttt_decline') {
-        const declineEmbed = new EmbedBuilder()
-          .setColor('#FF4757')
-          .setTitle('『 Challenge Declined 』')
-          .setDescription(`**Notice:** ${opponent} has declined the challenge.`)
-          .setFooter({ text: getRandomFooter() });
-
-        return response.update({ embeds: [declineEmbed], components: [] });
+    // Frees both players, but only if they are still registered to this game
+    const release = (game) => {
+      for (const key of keys) {
+        if (activeGames.get(key) === game) activeGames.delete(key);
       }
-
-      // Start the game
-      await response.deferUpdate();
-      await this.startGame(challengeMsg, challenger, opponent, guildId);
-
-    } catch (error) {
-      const expiredEmbed = new EmbedBuilder()
-        .setColor('#FEE75C')
-        .setTitle('⏰ Challenge Expired')
-        .setDescription(`${opponent} didn't respond in time.`);
-
-      return challengeMsg.edit({ embeds: [expiredEmbed], components: [] });
-    }
-  },
-
-  async startGame(gameMsg, player1, player2, guildId) {
-    // Player 1 is X, Player 2 is O
-    const game = {
-      board: ['⬜', '⬜', '⬜', '⬜', '⬜', '⬜', '⬜', '⬜', '⬜'],
-      players: {
-        X: player1,
-        O: player2
-      },
-      currentTurn: 'X',
-      moves: 0
     };
 
-    const gameKey = `${guildId}-${player1.id}`;
-    activeGames.set(gameKey, game);
-
-    await this.updateGameMessage(gameMsg, game, guildId);
-    await this.handleMoves(gameMsg, game, guildId, gameKey);
-  },
-
-  async updateGameMessage(gameMsg, game, guildId) {
-    const currentPlayer = game.players[game.currentTurn];
-    const symbol = game.currentTurn === 'X' ? '❌' : '⭕';
-
-    const embed = new EmbedBuilder()
-      .setColor('#00CED1')
-      .setTitle('『 Strategic Challenge 』')
-      .setDescription(
-        `**${game.players.X.username}** (❌) vs **${game.players.O.username}** (⭕)\n\n` +
-        `${symbol} **Awaiting ${currentPlayer.username}'s move...**`
-      )
-      .setFooter({ text: 'Select a position to make your move.' });
-
-    const rows = [];
-    for (let i = 0; i < 3; i++) {
-      const row = new ActionRowBuilder();
-      for (let j = 0; j < 3; j++) {
-        const index = i * 3 + j;
-        const cell = game.board[index];
-
-        const button = new ButtonBuilder()
-          .setCustomId(`ttt_${index}`)
-          // Use Secondary (grey) for better visibility of X and O emojis
-          .setStyle(ButtonStyle.Secondary)
-          .setDisabled(cell !== '⬜');
-
-        // Use emojis for game pieces
-        if (cell === '⬜') {
-          button.setEmoji('⬜');
-        } else if (cell === 'X') {
-          button.setEmoji('❌');
-        } else {
-          button.setEmoji('⭕');
-        }
-
-        row.addComponents(button);
-      }
-      rows.push(row);
-    }
-
-    await gameMsg.edit({ embeds: [embed], components: rows });
-  },
-
-  async handleMoves(gameMsg, game, guildId, gameKey) {
-    const collector = gameMsg.createMessageComponentCollector({
-      componentType: ComponentType.Button,
-      time: 120000
-    });
-
-    collector.on('collect', async (interaction) => {
-      const currentPlayer = game.players[game.currentTurn];
-
-      // Check if it's the correct player's turn
-      if (interaction.user.id !== currentPlayer.id) {
-        return interaction.reply({
-          content: `**Notice:** It is not your turn, Master.`,
-          ephemeral: true
+    try {
+      // Check if opponent is mentioned
+      if (!opponent) {
+        const prefix = await getPrefix(guildId);
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Opponent Required', `Please specify an opponent, Master.\n\n**Syntax:** \`${prefix}tictactoe @user\``)]
         });
       }
 
-      // Get the cell index
-      const cellIndex = parseInt(interaction.customId.split('_')[1]);
-
-      // Make the move
-      game.board[cellIndex] = game.currentTurn;
-      game.moves++;
-
-      // Check for winner
-      const winner = this.checkWinner(game.board);
-
-      if (winner) {
-        collector.stop('winner');
-        activeGames.delete(gameKey);
-
-        const winnerPlayer = game.players[winner];
-        const loserPlayer = winner === 'X' ? game.players.O : game.players.X;
-
-        const winEmbed = new EmbedBuilder()
-          .setColor('#57F287')
-          .setTitle('🏆 Game Over!')
-          .setDescription(
-            `**${winnerPlayer.username}** ${winner === 'X' ? '❌' : '⭕'} wins!\n\n` +
-            this.renderBoard(game.board) + `\n\n` +
-            `Better luck next time, ${loserPlayer.username}!`
-          );
-
-        await this.disableButtons(gameMsg, game);
-        return interaction.update({ embeds: [winEmbed], components: [] });
+      // Can't play against yourself
+      if (opponent.id === challenger.id) {
+        return message.reply({ embeds: [await errorEmbed(guildId, 'Invalid Opponent', 'Self-challenge is not permitted, Master.')] });
       }
 
-      // Check for draw
-      if (game.moves === 9) {
-        collector.stop('draw');
-        activeGames.delete(gameKey);
-
-        const drawEmbed = new EmbedBuilder()
-          .setColor('#FEE75C')
-          .setTitle('🤝 It\'s a Draw!')
-          .setDescription(
-            `Nobody wins this time!\n\n` +
-            this.renderBoard(game.board)
-          );
-
-        return interaction.update({ embeds: [drawEmbed], components: [] });
+      // Can't play against bots
+      if (opponent.bot) {
+        return message.reply({ embeds: [await errorEmbed(guildId, 'Invalid Opponent', 'Automated systems cannot participate in games, Master.')] });
       }
 
-      // Switch turns
-      game.currentTurn = game.currentTurn === 'X' ? 'O' : 'X';
-
-      await interaction.deferUpdate();
-      await this.updateGameMessage(gameMsg, game, guildId);
-    });
-
-    collector.on('end', async (collected, reason) => {
-      if (reason === 'time') {
-        activeGames.delete(gameKey);
-
-        const timeoutEmbed = new EmbedBuilder()
-          .setColor('#ED4245')
-          .setTitle('⏰ Game Timed Out')
-          .setDescription('The game was cancelled due to inactivity.');
-
-        await gameMsg.edit({ embeds: [timeoutEmbed], components: [] });
+      // Check and register both players with no await in between, so two challenges at once can't both pass
+      if (keys.some(key => activeGames.has(key))) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Session Active', 'One of you is already in an active game session or challenge, Master.')]
+        });
       }
-    });
-  },
 
-  checkWinner(board) {
-    const winPatterns = [
-      [0, 1, 2], [3, 4, 5], [6, 7, 8], // Rows
-      [0, 3, 6], [1, 4, 7], [2, 5, 8], // Columns
-      [0, 4, 8], [2, 4, 6]             // Diagonals
-    ];
+      const game = {
+        board: Array(9).fill(null),
+        players: { X: challenger, O: opponent },
+        currentTurn: 'X',
+        moves: 0,
+        over: false
+      };
+      for (const key of keys) activeGames.set(key, game);
+      reserved = true;
 
-    for (const pattern of winPatterns) {
-      const [a, b, c] = pattern;
-      if (board[a] !== '⬜' && board[a] === board[b] && board[b] === board[c]) {
-        return board[a];
-      }
+      // Create challenge embed
+      const challengeEmbed = new EmbedBuilder()
+        .setColor(COLORS.RAPHAEL)
+        .setTitle('『 Strategic Challenge 』')
+        .setDescription(
+          `${challenger} has initiated a Tic Tac Toe challenge against ${opponent}.\n\n` +
+          `${opponent}, do you accept this challenge?`
+        )
+        .setFooter({ text: `${getRandomFooter()} | Expires in ${CHALLENGE_TIMEOUT / 1000} seconds` });
+
+      const challengeRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('ttt_accept').setLabel('Accept').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId('ttt_decline').setLabel('Decline').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId('ttt_withdraw').setLabel('Withdraw').setStyle(ButtonStyle.Secondary)
+      );
+
+      const gameMsg = await message.reply({
+        content: `${opponent}`,
+        embeds: [challengeEmbed],
+        components: [challengeRow]
+      });
+
+      const challengeCollector = gameMsg.createMessageComponentCollector({
+        componentType: ComponentType.Button,
+        time: CHALLENGE_TIMEOUT
+      });
+      let answered = false;
+
+      challengeCollector.on('collect', async (interaction) => {
+        const isChallenger = interaction.user.id === challenger.id;
+        const isOpponent = interaction.user.id === opponent.id;
+
+        if (interaction.customId === 'ttt_withdraw' && !isChallenger) {
+          return replyPrivately(interaction, `Only ${challenger.username} can withdraw this challenge, Master.`);
+        }
+        if (interaction.customId !== 'ttt_withdraw' && !isOpponent) {
+          return replyPrivately(interaction, `This challenge is addressed to ${opponent.username}, Master.`);
+        }
+        if (answered) return interaction.deferUpdate().catch(() => {});
+        answered = true;
+
+        try {
+          if (interaction.customId === 'ttt_withdraw') {
+            challengeCollector.stop('withdrawn');
+            return await interaction.update({
+              content: null,
+              embeds: [endEmbed(game, COLORS.RAPHAEL_WARNING, 'Challenge Withdrawn', `**Notice:** ${challenger} has withdrawn the challenge.`)],
+              components: []
+            });
+          }
+
+          if (interaction.customId === 'ttt_decline') {
+            challengeCollector.stop('declined');
+            return await interaction.update({
+              content: null,
+              embeds: [endEmbed(game, COLORS.RAPHAEL_ERROR, 'Challenge Declined', `**Notice:** ${opponent} has declined the challenge.`)],
+              components: []
+            });
+          }
+
+          // Accepted: the same message becomes the board
+          challengeCollector.stop('accepted');
+          await interaction.update({ content: null, embeds: [turnEmbed(game)], components: boardRows(game) });
+          runGame(gameMsg, game, release);
+        } catch (error) {
+          console.error('[TicTacToe] Error answering challenge:', error);
+          game.over = true;
+          release(game);
+          const embed = await errorEmbed(guildId, 'Game Error', interaction.customId === 'ttt_accept'
+            ? 'The game could not be started, Master. Please issue a new challenge.'
+            : 'The challenge could not be updated, Master.');
+          await gameMsg.edit({ content: null, embeds: [embed], components: [] }).catch(() => {});
+        }
+      });
+
+      challengeCollector.on('end', async (_collected, reason) => {
+        if (reason === 'accepted') return;
+        release(game);
+        if (reason !== 'time') return; // declined/withdrawn already updated; message deleted needs nothing
+        try {
+          await gameMsg.edit({
+            content: null,
+            embeds: [endEmbed(game, COLORS.RAPHAEL_WARNING, 'Challenge Expired', `**Notice:** ${opponent} did not respond in time.`)],
+            components: []
+          });
+        } catch (error) {
+          // Message deleted or no longer editable
+        }
+      });
+
+    } catch (error) {
+      console.error('[TicTacToe] Error:', error);
+      if (reserved) release(activeGames.get(keys[0]));
+      return message.reply({
+        embeds: [await errorEmbed(guildId, 'Game Error', 'The challenge could not be issued, Master. Please try again.')]
+      }).catch(() => {});
     }
-
-    return null;
-  },
-
-  renderBoard(board) {
-    const symbols = board.map(cell => {
-      if (cell === 'X') return '❌';
-      if (cell === 'O') return '⭕';
-      return '⬜';
-    });
-
-    return `${symbols[0]}${symbols[1]}${symbols[2]}\n${symbols[3]}${symbols[4]}${symbols[5]}\n${symbols[6]}${symbols[7]}${symbols[8]}`;
-  },
-
-  async disableButtons(gameMsg, game) {
-    const rows = [];
-    for (let i = 0; i < 3; i++) {
-      const row = new ActionRowBuilder();
-      for (let j = 0; j < 3; j++) {
-        const index = i * 3 + j;
-        const cell = game.board[index];
-
-        row.addComponents(
-          new ButtonBuilder()
-            .setCustomId(`ttt_${index}`)
-            .setEmoji(cell === '⬜' ? '⬜' : (cell === 'X' ? '❌' : '⭕'))
-            .setStyle(ButtonStyle.Secondary)
-            .setDisabled(true)
-        );
-      }
-      rows.push(row);
-    }
-    return rows;
   }
 };

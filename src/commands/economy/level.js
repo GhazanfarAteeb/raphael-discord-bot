@@ -3,6 +3,7 @@ import Level from '../../models/Level.js';
 import Economy from '../../models/Economy.js';
 import Guild from '../../models/Guild.js';
 import { errorEmbed } from '../../utils/embeds.js';
+import { formatNumber } from '../../utils/helpers.js';
 import { createCanvas, loadImage } from '@napi-rs/canvas';
 import '../../utils/fonts.js';
 import { getBackground } from '../../utils/shopItems.js';
@@ -32,28 +33,14 @@ export default {
     try {
       await message.channel.sendTyping();
 
-      // Get level data
-      let levelData = await Level.findOne({
-        userId: targetUser.id,
-        guildId: message.guild.id
-      });
-
-      if (!levelData) {
-        // Create default level data if doesn't exist
-        levelData = await Level.create({
-          userId: targetUser.id,
-          guildId: message.guild.id,
-          username: targetUser.username,
-          level: 0,
-          xp: 0,
-          totalXP: 0,
-          messageCount: 0,
-          dailyXP: 0
-        });
-      }
+      // Read-only: viewing a card never creates Level/Economy documents (members or bots);
+      // unsaved model instances supply the schema defaults when there is no data yet
+      const levelData = await Level.findOne({ userId: targetUser.id, guildId });
+      const level = levelData ?? new Level({ userId: targetUser.id, guildId });
 
       // Get economy for profile settings (background)
-      const economy = await Economy.getEconomy(targetUser.id, guildId);
+      const economy = (await Economy.findOne({ userId: targetUser.id, guildId }))
+        ?? new Economy({ userId: targetUser.id, guildId });
 
       // Get guild config for fallback background
       const guildConfig = await Guild.getGuild(guildId);
@@ -99,9 +86,10 @@ export default {
       // Use fallback if no image
       const bgImage = background?.image || fallbackBg?.image || '';
 
-      // Get rank
-      const leaderboard = await Level.getLeaderboard(guildId, 1000);
-      const rank = leaderboard.findIndex(u => u.userId === targetUser.id) + 1 || 1;
+      // Rank by total XP; members without level data are unranked
+      const rankText = levelData
+        ? `Rank #${(await Level.countDocuments({ guildId, totalXP: { $gt: levelData.totalXP || 0 } })) + 1}`
+        : 'Rank —';
 
       // Create rank card
       const canvas = createCanvas(900, 300);
@@ -184,14 +172,14 @@ export default {
       // Rank and Level
       ctx.font = 'bold 24px "Poppins Bold", Arial';
       ctx.fillStyle = '#b9bbbe';
-      ctx.fillText(`Rank #${rank}`, 230, 130);
-      ctx.fillText(`Level ${levelData.level}`, 230, 165);
+      ctx.fillText(rankText, 230, 130);
+      ctx.fillText(`Level ${level.level}`, 230, 165);
 
       // XP Progress
-      const xpForNext = levelData.xpForNextLevel ? levelData.xpForNextLevel() : Math.floor(100 + (levelData.level * 50) + Math.pow(levelData.level, 1.5) * 25);
+      const xpForNext = level.xpForNextLevel();
       ctx.font = '20px "Poppins", Arial';
       ctx.fillStyle = '#b9bbbe';
-      ctx.fillText(`${levelData.xp} / ${xpForNext} XP`, 230, 200);
+      ctx.fillText(`${formatNumber(level.xp)} / ${formatNumber(xpForNext)} XP`, 230, 200);
 
       // Progress bar background
       ctx.fillStyle = '#40444b';
@@ -200,7 +188,7 @@ export default {
       ctx.fill();
 
       // Progress bar fill with gradient
-      const progress = Math.min(levelData.xp / xpForNext, 1);
+      const progress = Math.min(level.xp / xpForNext, 1);
       if (progress > 0) {
         const progressGradient = ctx.createLinearGradient(230, 0, 850, 0);
         progressGradient.addColorStop(0, '#667eea');
@@ -214,9 +202,9 @@ export default {
       // Stats at bottom
       ctx.font = '18px "Poppins", Arial';
       ctx.fillStyle = '#72767d';
-      ctx.fillText(`Messages: ${levelData.messageCount || 0}`, 230, 280);
-      ctx.fillText(`Total XP: ${levelData.totalXP || 0}`, 450, 280);
-      ctx.fillText(`Daily XP: ${levelData.dailyXP || 0}`, 670, 280);
+      ctx.fillText(`Messages: ${formatNumber(level.messageCount || 0)}`, 230, 280);
+      ctx.fillText(`Total XP: ${formatNumber(level.totalXP || 0)}`, 450, 280);
+      ctx.fillText(`Daily XP: ${formatNumber(level.dailyXP || 0)}`, 670, 280);
 
       // Create attachment
       const attachment = new AttachmentBuilder(canvas.toBuffer('image/png'), {
@@ -226,10 +214,10 @@ export default {
       await message.reply({ files: [attachment] });
 
     } catch (error) {
-      console.error('Error creating rank card:', error);
+      console.error('[Level] Error creating rank card:', error);
       return message.reply({
-        embeds: [await errorEmbed(guildId, 'Failed to create rank card. Please try again later.')]
-      });
+        embeds: [await errorEmbed(guildId, 'Rank Card Error', 'The rank card could not be generated, Master. Please try again later.')]
+      }).catch(() => {});
     }
   }
 };

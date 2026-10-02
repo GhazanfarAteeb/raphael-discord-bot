@@ -1,10 +1,13 @@
 import { EmbedBuilder } from 'discord.js';
 import Economy from '../../models/Economy.js';
 import Guild from '../../models/Guild.js';
-import { SLOTS_MIN, SLOTS_MAX, SLOTS_EMOJIS } from '../../utils/gameConfig.js';
-import { errorEmbed } from '../../utils/embeds.js';
-import { getPrefix } from '../../utils/helpers.js';
+import { SLOTS_MIN, SLOTS_MAX, SLOTS_EMOJIS, DEFAULT_COIN_NAME } from '../../utils/gameConfig.js';
+import { errorEmbed, COLORS } from '../../utils/embeds.js';
+import { getPrefix, formatNumber } from '../../utils/helpers.js';
 import { getRandomFooter } from '../../utils/raphael.js';
+
+// The reel symbols (SLOTS_EMOJIS) are the game itself, so they are the one place emoji are drawn
+const spinReel = () => SLOTS_EMOJIS[Math.floor(Math.random() * SLOTS_EMOJIS.length)];
 
 export default {
     name: 'slots',
@@ -13,65 +16,60 @@ export default {
     category: 'economy',
     aliases: ['slot', 'slotmachine'],
     cooldown: 5,
-    
+
     execute: async (message, args) => {
         const userId = message.author.id;
         const guildId = message.guild.id;
-        
+
         try {
             const amount = parseInt(args[0]);
-            
+
             if (!amount || isNaN(amount)) {
                 const prefix = await getPrefix(guildId);
                 return message.reply({
                     embeds: [await errorEmbed(guildId, 'Invalid Parameters',
-                        `**Notice:** A valid wager amount is required, Master.\n\n` +
+                        `A valid wager amount is required, Master.\n\n` +
                         `▸ Syntax: \`${prefix}slots <amount>\`\n` +
                         `▸ Example: \`${prefix}slots 100\``
                     )]
                 });
             }
-            
+
             if (amount < SLOTS_MIN) {
                 return message.reply({
-                    embeds: [await errorEmbed(guildId, 'Wager Rejected',
-                        `**Notice:** Minimum wager is **${SLOTS_MIN}** coins, Master.`
-                    )]
+                    embeds: [await errorEmbed(guildId, 'Wager Rejected', `Minimum wager is **${formatNumber(SLOTS_MIN)}** coins, Master.`)]
                 });
             }
-            
+
             if (amount > SLOTS_MAX) {
                 return message.reply({
-                    embeds: [await errorEmbed(guildId, 'Wager Rejected',
-                        `**Notice:** Maximum wager is **${SLOTS_MAX}** coins, Master.`
-                    )]
+                    embeds: [await errorEmbed(guildId, 'Wager Rejected', `Maximum wager is **${formatNumber(SLOTS_MAX)}** coins, Master.`)]
                 });
             }
-            
+
             const guildConfig = await Guild.getGuild(guildId);
             const economy = await Economy.getEconomy(userId, guildId);
-            const coinEmoji = guildConfig.economy?.coinEmoji || '💰';
-            const coinName = guildConfig.economy?.coinName || 'coins';
-            
+            const coinName = guildConfig.economy?.coinName || DEFAULT_COIN_NAME;
+
             if (economy.coins < amount) {
                 return message.reply({
                     embeds: [await errorEmbed(guildId, 'Insufficient Resources',
-                        `**Warning:** Your current balance is insufficient, Master.\n\n` +
-                        `▸ **Available Funds:** ${economy.coins} ${coinEmoji} ${coinName}\n` +
-                        `▸ **Required Wager:** ${amount} ${coinEmoji} ${coinName}`
+                        `Your current balance is insufficient, Master.\n\n` +
+                        `▸ **Available Funds:** ${formatNumber(economy.coins)} ${coinName}\n` +
+                        `▸ **Required Wager:** ${formatNumber(amount)} ${coinName}`
                     )]
                 });
             }
-            
+
             // Spin the slots
-            const slot1 = SLOTS_EMOJIS[Math.floor(Math.random() * SLOTS_EMOJIS.length)];
-            const slot2 = SLOTS_EMOJIS[Math.floor(Math.random() * SLOTS_EMOJIS.length)];
-            const slot3 = SLOTS_EMOJIS[Math.floor(Math.random() * SLOTS_EMOJIS.length)];
-            
+            const slot1 = spinReel();
+            const slot2 = spinReel();
+            const slot3 = spinReel();
+
             // Calculate winnings
             let multiplier = 0;
             let result = '';
-            
+
             if (slot1 === slot2 && slot2 === slot3) {
                 // All three match - JACKPOT!
                 if (slot1 === '7️⃣') {
@@ -90,51 +88,52 @@ export default {
                 result = '◈ **PARTIAL MATCH** — Two symbols aligned.';
             } else {
                 // No match - loss
-                result = '○ **NO CORRELATION** — Sequence mismatch detected.';
+                result = '◆ **NO CORRELATION** — Sequence mismatch detected.';
             }
-            
+
             const won = multiplier > 0;
             const winnings = won ? amount * multiplier : 0;
             const netGain = won ? winnings - amount : -amount;
-            
-            // Update balance
+
+            // Stats first, so the single save inside addCoins/removeCoins records them too
             if (won) {
-                await economy.addCoins(netGain, `Slots win (${multiplier}x)`);
                 economy.gamblingWins = (economy.gamblingWins || 0) + 1;
             } else {
-                await economy.removeCoins(amount, 'Slots loss');
                 economy.gamblingLosses = (economy.gamblingLosses || 0) + 1;
             }
             economy.gamblingTotal = (economy.gamblingTotal || 0) + amount;
-            await economy.save();
-            
+
+            if (won) {
+                await economy.addCoins(netGain, `Slots win (${multiplier}x)`);
+            } else {
+                await economy.removeCoins(amount, 'Slots loss');
+            }
+
             const embed = new EmbedBuilder()
                 .setTitle('『 Probability Engine 』')
                 .setDescription(
-                    `**Notice:** Initiating random sequence generator...\n\n` +
+                    `Initiating random sequence generator...\n\n` +
                     `**╔═══════╗**\n` +
                     `**║** ${slot1} **│** ${slot2} **│** ${slot3} **║**\n` +
                     `**╚═══════╝**\n\n` +
                     result + '\n\n' +
-                    (won 
-                        ? `▸ **Multiplier Applied:** ${multiplier}x\n▸ **Resources Gained:** +${winnings} ${coinEmoji}\n▸ **Net Profit:** +${netGain} ${coinEmoji}\n\n*Fortune favors you, Master.*`
-                        : `▸ **Resources Lost:** -${amount} ${coinEmoji}\n\n*Perhaps a different approach is advisable, Master.*`) +
-                    `\n\n**Current Balance:** ${economy.coins} ${coinEmoji} ${coinName}`
+                    (won
+                        ? `▸ **Multiplier Applied:** ${multiplier}x\n▸ **Resources Gained:** +${formatNumber(winnings)} ${coinName}\n▸ **Net Profit:** +${formatNumber(netGain)} ${coinName}\n\n*Fortune favors you, Master.*`
+                        : `▸ **Resources Lost:** -${formatNumber(amount)} ${coinName}\n\n*Perhaps a different approach is advisable, Master.*`)
                 )
-                .setColor(won ? '#00FF7F' : '#FF4757')
+                .addFields({ name: '▸ Updated Balance', value: `**${formatNumber(economy.coins)}** ${coinName}` })
+                .setColor(won ? COLORS.RAPHAEL_SUCCESS : COLORS.RAPHAEL_ERROR)
                 .setThumbnail(message.author.displayAvatarURL({ extension: 'png' }))
                 .setFooter({ text: `${getRandomFooter()} | W:${economy.gamblingWins || 0} L:${economy.gamblingLosses || 0}` })
                 .setTimestamp();
-            
+
             await message.reply({ embeds: [embed] });
-            
+
         } catch (error) {
-            console.error('Error in slots command:', error);
+            console.error('[Slots] Error:', error);
             return message.reply({
-                embeds: [await errorEmbed(guildId, 'System Error',
-                    `**Warning:** An anomaly occurred during probability calculation, Master.`
-                )]
-            });
+                embeds: [await errorEmbed(guildId, 'System Error', 'An anomaly occurred during probability calculation, Master.')]
+            }).catch(() => {});
         }
     }
 };

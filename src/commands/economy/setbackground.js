@@ -1,7 +1,10 @@
 import { EmbedBuilder } from 'discord.js';
 import Economy from '../../models/Economy.js';
+import Guild from '../../models/Guild.js';
 import { getBackground } from '../../utils/shopItems.js';
+import { errorEmbed, COLORS } from '../../utils/embeds.js';
 import { getPrefix } from '../../utils/helpers.js';
+import { getRandomFooter } from '../../utils/raphael.js';
 
 export default {
   name: 'setbackground',
@@ -15,46 +18,56 @@ export default {
     const userId = message.author.id;
     const guildId = message.guild.id;
 
-    if (!args[0]) {
-      const prefix = await getPrefix(guildId);
-      return message.reply(`**Error:** Please specify a background. Use \`${prefix}inventory backgrounds\` to view owned backgrounds, Master.`);
-    }
-
     try {
+      const prefix = await getPrefix(guildId);
+
+      if (!args[0]) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Background Required',
+            `Please specify a background, Master. Use \`${prefix}inventory backgrounds\` to view the ones you own.`)]
+        });
+      }
+
       const economy = await Economy.getEconomy(userId, guildId);
 
       const bgQuery = args.join(' ').toLowerCase();
 
       // Find background in inventory
       const ownedBg = economy.inventory.backgrounds.find(bg =>
-        bg.id.toLowerCase() === bgQuery || bg.name.toLowerCase() === bgQuery
+        bg.id?.toLowerCase() === bgQuery || bg.name?.toLowerCase() === bgQuery
       );
 
       if (!ownedBg) {
-        const prefix = await getPrefix(guildId);
-        return message.reply(`**Error:** You do not own this background. Use \`${prefix}inventory backgrounds\` to view your collection or \`${prefix}shop\` to acquire new ones, Master.`);
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Background Not Owned',
+            `You do not own this background, Master. Use \`${prefix}inventory backgrounds\` to view your collection or \`${prefix}shop\` to acquire new ones.`)]
+        });
       }
 
-      // Get background data
-      const bgData = getBackground(ownedBg.id);
+      // Preview image: built-in backgrounds first, then the server's shop items
+      const guildConfig = await Guild.getGuild(guildId);
+      const shopItem = (guildConfig.customShopItems || []).find(item => item.id === ownedBg.id);
+      const imageUrl = getBackground(ownedBg.id)?.image || shopItem?.image || null;
 
       // Set background
       economy.profile.background = ownedBg.id;
       await economy.save();
 
       const embed = new EmbedBuilder()
-        .setColor('#00FF7F')
+        .setColor(COLORS.RAPHAEL_SUCCESS)
         .setTitle('『 Background Updated 』')
         .setDescription(`**Confirmed:** Profile background set to **${ownedBg.name}**, Master.`)
-        .setImage(bgData?.image || null)
-        .setFooter({ text: 'Use !profile to preview changes.' })
+        .setImage(imageUrl)
+        .setFooter({ text: `${getRandomFooter()} | Use ${prefix}profile to preview changes` })
         .setTimestamp();
 
-      message.reply({ embeds: [embed] });
+      await message.reply({ embeds: [embed] });
 
     } catch (error) {
-      console.error('Set background command error:', error);
-      message.reply('**Error:** An anomaly occurred while setting your background, Master.');
+      console.error('[SetBackground] Error:', error);
+      return message.reply({
+        embeds: [await errorEmbed(guildId, 'Background Error', 'An anomaly occurred while setting your background, Master.')]
+      }).catch(() => {});
     }
   }
 };

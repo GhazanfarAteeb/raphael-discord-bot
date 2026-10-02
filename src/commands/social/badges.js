@@ -1,6 +1,11 @@
 import { EmbedBuilder } from 'discord.js';
 import Social from '../../models/Social.js';
-import { getPrefix } from '../../utils/helpers.js';
+import { errorEmbed, infoEmbed, COLORS } from '../../utils/embeds.js';
+import { getRandomFooter } from '../../utils/raphael.js';
+
+// Discord's embed description limit
+const MAX_DESCRIPTION = 4096;
+const LOCKED_PREVIEW_COUNT = 5;
 
 export default {
   name: 'badges',
@@ -13,44 +18,55 @@ export default {
   async execute(message, args, client) {
     const guildId = message.guild.id;
     const targetUser = message.mentions.users.first() || message.author;
-    const prefix = await getPrefix(guildId);
+    const isSelf = targetUser.id === message.author.id;
 
     try {
-      const social = await Social.getSocial(targetUser.id, guildId);
-
-      const badges = social.badges || [];
+      // Read-only: viewing badges never creates a social profile
+      const social = await Social.findOne({ odId: targetUser.id, guildId }).lean();
+      const badges = social?.badges || [];
 
       if (badges.length === 0) {
-        if (targetUser.id === message.author.id) {
-          return message.reply(`**Notice:** No achievements detected in your profile, Master.\n\nAchievements are earned through activity, bonds, and progression.`);
-        }
-        return message.reply(`**Notice:** **${targetUser.username}** has not acquired any achievements yet.`);
+        return message.reply({
+          embeds: [await infoEmbed(guildId, 'No Achievements', isSelf
+            ? '**Notice:** No achievements detected in your profile, Master.\n\nAchievements are earned through activity, bonds, and progression.'
+            : `**Notice:** **${targetUser.username}** has not acquired any achievements yet.`)]
+        });
       }
 
-      const badgeList = badges.map(b => {
-        const date = new Date(b.earnedAt).toLocaleDateString();
-        return `${b.emoji} **${b.name}**\n└ *${b.description}* (${date})`;
-      }).join('\n\n');
+      // Badge emoji are stored data, not shown: each entry uses a glyph instead
+      const entries = badges.map(b => {
+        const earned = b.earnedAt ? `<t:${Math.floor(new Date(b.earnedAt).getTime() / 1000)}:D>` : 'Unknown date';
+        return `◈ **${b.name}**\n› *${b.description || 'No description recorded'}* (${earned})`;
+      });
+
+      const shown = [];
+      let length = 0;
+      for (const entry of entries) {
+        if (length + entry.length + 2 > MAX_DESCRIPTION - 40) break;
+        shown.push(entry);
+        length += entry.length + 2;
+      }
+      const hidden = entries.length - shown.length;
 
       const embed = new EmbedBuilder()
-        .setColor(social.profile?.color || '#00CED1')
+        .setColor(COLORS.RAPHAEL)
         .setTitle(`『 ${targetUser.username}'s Achievements 』`)
-        .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
-        .setDescription(badgeList)
-        .setFooter({ text: `${badges.length} achievement${badges.length !== 1 ? 's' : ''} acquired • Analysis complete.` });
+        .setThumbnail(targetUser.displayAvatarURL())
+        .setDescription(shown.join('\n\n') + (hidden > 0 ? `\n\n*...and ${hidden} more*` : ''))
+        .setFooter({ text: `${getRandomFooter()} | ${badges.length} achievement${badges.length !== 1 ? 's' : ''} acquired` });
 
       // Show available badges they don't have
-      if (targetUser.id === message.author.id) {
-        const availableBadges = Object.values(Social.BADGES)
+      if (isSelf) {
+        const lockedBadges = Object.values(Social.BADGES)
           .filter(b => !badges.some(earned => earned.id === b.id))
-          .slice(0, 5)
-          .map(b => `${b.emoji} ${b.name}`)
-          .join(', ');
+          .slice(0, LOCKED_PREVIEW_COUNT)
+          .map(b => b.name)
+          .join(' • ');
 
-        if (availableBadges) {
+        if (lockedBadges) {
           embed.addFields({
             name: '◈ Locked Achievements',
-            value: availableBadges
+            value: lockedBadges
           });
         }
       }
@@ -58,8 +74,10 @@ export default {
       await message.reply({ embeds: [embed] });
 
     } catch (error) {
-      console.error('Badges command error:', error);
-      return message.reply('**Error:** An anomaly occurred while retrieving achievement data, Master.');
+      console.error('[Badges] Error:', error);
+      return message.reply({
+        embeds: [await errorEmbed(guildId, 'Retrieval Error', 'An anomaly occurred while retrieving achievement data, Master.')]
+      }).catch(() => {});
     }
   }
 };

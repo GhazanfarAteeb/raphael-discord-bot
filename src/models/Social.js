@@ -79,13 +79,23 @@ const socialSchema = new mongoose.Schema({
 // Compound index
 socialSchema.index({ odId: 1, guildId: 1 }, { unique: true });
 
-// Static method to get or create social profile
+// Static method to get or create social profile.
+// One atomic upsert, so two first-time commands at once can't both insert (E11000).
+// Only $setOnInsert is sent: an existing document is returned untouched (timestamps are
+// skipped for the query and set by hand on insert, so reads never bump updatedAt).
 socialSchema.statics.getSocial = async function (odId, guildId) {
-  let social = await this.findOne({ odId, guildId });
-  if (!social) {
-    social = await this.create({ odId, guildId });
+  const now = new Date();
+  try {
+    return await this.findOneAndUpdate(
+      { odId, guildId },
+      { $setOnInsert: { createdAt: now, updatedAt: now } },
+      { upsert: true, new: true, setDefaultsOnInsert: true, timestamps: false }
+    );
+  } catch (error) {
+    // Servers that don't retry racing upserts report the loser as a duplicate key: the document exists now
+    if (error?.code === 11000) return this.findOne({ odId, guildId });
+    throw error;
   }
-  return social;
 };
 
 // Check if user is married

@@ -115,8 +115,26 @@ const economySchema = new mongoose.Schema({
 // Compound index
 economySchema.index({ userId: 1, guildId: 1 }, { unique: true });
 
+// A NaN or infinite amount would corrupt the stored balance; negative amounts belong to removeCoins
+function assertCoinAmount(amount) {
+  if (!Number.isFinite(amount) || amount < 0) {
+    throw new Error(`Invalid coin amount: ${amount}`);
+  }
+}
+
+// Cooldown errors carry when the reward becomes available, so commands can render a timestamp
+function cooldownError(message, availableAt) {
+  const error = new Error(message);
+  error.code = 'COOLDOWN';
+  error.availableAt = availableAt;
+  return error;
+}
+
+const toUnix = (date) => Math.floor(date.getTime() / 1000);
+
 // Method to add coins
 economySchema.methods.addCoins = async function (amount, description = 'Earned coins') {
+  assertCoinAmount(amount);
   this.coins += amount;
   this.stats.totalEarned += amount;
 
@@ -139,6 +157,7 @@ economySchema.methods.addCoins = async function (amount, description = 'Earned c
 
 // Method to remove coins
 economySchema.methods.removeCoins = async function (amount, description = 'Spent coins') {
+  assertCoinAmount(amount);
   if (this.coins < amount) {
     throw new Error('Insufficient coins');
   }
@@ -194,11 +213,11 @@ economySchema.methods.checkStreak = function () {
 // Method to claim daily
 economySchema.methods.claimDaily = async function () {
   if (!this.canClaimDaily()) {
-    const now = new Date();
-    const lastClaim = new Date(this.daily.lastClaimed);
-    const diffTime = Math.abs(now - lastClaim);
-    const hoursLeft = 24 - (diffTime / (1000 * 60 * 60));
-    throw new Error(`You already claimed today! Come back in ${Math.ceil(hoursLeft)} hours`);
+    const availableAt = new Date(new Date(this.daily.lastClaimed).getTime() + 24 * 60 * 60 * 1000);
+    throw cooldownError(
+      `Today's allocation has already been claimed, Master. The next one becomes available <t:${toUnix(availableAt)}:R>.`,
+      availableAt
+    );
   }
 
   // Check streak
@@ -247,12 +266,12 @@ economySchema.methods.canClaimTimed = function (commandName, intervalMinutes) {
 economySchema.methods.claimTimed = async function (commandName, intervalMinutes, amount, description) {
   if (!this.canClaimTimed(commandName, intervalMinutes)) {
     const reward = this.timedRewards.find(r => r.commandName === commandName);
-    const now = new Date();
-    const lastClaim = new Date(reward.lastClaimed);
-    const diffMinutes = (now - lastClaim) / (1000 * 60);
-    const minutesLeft = Math.ceil(intervalMinutes - diffMinutes);
+    const availableAt = new Date(new Date(reward.lastClaimed).getTime() + intervalMinutes * 60 * 1000);
 
-    throw new Error(`You can claim this reward again in ${minutesLeft} minute(s)`);
+    throw cooldownError(
+      `This reward has already been claimed, Master. It becomes available again <t:${toUnix(availableAt)}:R>.`,
+      availableAt
+    );
   }
 
   const rewardIndex = this.timedRewards.findIndex(r => r.commandName === commandName);
@@ -273,21 +292,29 @@ economySchema.methods.claimTimed = async function (commandName, intervalMinutes,
   return amount;
 };
 
-// Static method to get or create economy data
+// Static method to get or create economy data.
+// One atomic upsert, so two first-time commands at once can't both insert (E11000).
+// Only $setOnInsert is sent: an existing document is returned untouched (timestamps are
+// skipped for the query and set by hand on insert, so reads never bump updatedAt).
 economySchema.statics.getEconomy = async function (userId, guildId) {
-  let economy = await this.findOne({ userId, guildId });
-
-  if (!economy) {
-    economy = await this.create({
-      userId,
-      guildId,
-      inventory: {
-        backgrounds: [{ id: 'default', name: 'Default' }]
-      }
-    });
+  const now = new Date();
+  try {
+    return await this.findOneAndUpdate(
+      { userId, guildId },
+      {
+        $setOnInsert: {
+          'inventory.backgrounds': [{ id: 'default', name: 'Default', purchasedAt: now }],
+          createdAt: now,
+          updatedAt: now
+        }
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true, timestamps: false }
+    );
+  } catch (error) {
+    // Servers that don't retry racing upserts report the loser as a duplicate key: the document exists now
+    if (error?.code === 11000) return this.findOne({ userId, guildId });
+    throw error;
   }
-
-  return economy;
 };
 
 export default mongoose.model('Economy', economySchema);

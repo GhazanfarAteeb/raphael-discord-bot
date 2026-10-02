@@ -1,8 +1,10 @@
-import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType } from 'discord.js';
-import { successEmbed, errorEmbed, GLYPHS } from '../../utils/embeds.js';
+import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, MessageFlags } from 'discord.js';
+import { errorEmbed, COLORS } from '../../utils/embeds.js';
 import Guild from '../../models/Guild.js';
 import Economy from '../../models/Economy.js';
 import { getRandomFooter } from '../../utils/raphael.js';
+import { getPrefix, formatNumber } from '../../utils/helpers.js';
+import { TRIVIA_REWARD, TRIVIA_REWARD_COOLDOWN, DEFAULT_COIN_NAME } from '../../utils/gameConfig.js';
 
 // Trivia questions by category
 const TRIVIA_QUESTIONS = {
@@ -60,13 +62,185 @@ const TRIVIA_QUESTIONS = {
   ]
 };
 
-const CATEGORY_EMOJIS = {
-  general: '🌍',
-  science: '🔬',
-  gaming: '🎮',
-  movies: '🎬',
-  discord: '💬'
-};
+const CATEGORY_TIMEOUT = 30_000;
+const ANSWER_TIMEOUT = 15_000;
+const ANSWER_LABELS = ['A', 'B', 'C', 'D'];
+const REWARD_COOLDOWN_MS = TRIVIA_REWARD_COOLDOWN * 1000;
+
+// When each member (per server) was last paid. Anyone can keep playing; coins are paid at
+// most once per REWARD_COOLDOWN_MS so the quiz can't be farmed.
+const lastRewardAt = new Map();
+
+const capitalize = (text) => text.charAt(0).toUpperCase() + text.slice(1);
+const randomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+const toUnix = (ms) => Math.floor(ms / 1000);
+
+// Takes the member's reward slot before any await, so two answers at once can't both pay.
+// Returns the claim time, or null while the cooldown runs.
+function claimRewardSlot(key) {
+  const now = Date.now();
+  for (const [entryKey, paidAt] of lastRewardAt) {
+    if (now - paidAt >= REWARD_COOLDOWN_MS) lastRewardAt.delete(entryKey);
+  }
+  if (lastRewardAt.has(key)) return null;
+  lastRewardAt.set(key, now);
+  return now;
+}
+
+async function payReward(user, guildId) {
+  const key = `${guildId}-${user.id}`;
+  const claimedAt = claimRewardSlot(key);
+  if (!claimedAt) {
+    return { paid: false, availableAt: lastRewardAt.get(key) + REWARD_COOLDOWN_MS };
+  }
+
+  try {
+    const amount = randomInt(TRIVIA_REWARD.min, TRIVIA_REWARD.max);
+    const economy = await Economy.getEconomy(user.id, guildId);
+    await economy.addCoins(amount, 'Trivia reward');
+    return { paid: true, amount, balance: economy.coins };
+  } catch (error) {
+    // Nothing was paid: free the slot again
+    if (lastRewardAt.get(key) === claimedAt) lastRewardAt.delete(key);
+    throw error;
+  }
+}
+
+// Picks a question and shuffles its answers, tracking where the correct one ends up
+function createRound(category) {
+  const questions = TRIVIA_QUESTIONS[category];
+  const question = questions[Math.floor(Math.random() * questions.length)];
+  const answers = [...question.answers];
+  const correctAnswer = question.answers[question.correct];
+
+  // Fisher-Yates shuffle
+  for (let i = answers.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [answers[i], answers[j]] = [answers[j], answers[i]];
+  }
+
+  return { category, question: question.question, answers, correctIndex: answers.indexOf(correctAnswer) };
+}
+
+const formatAnswer = (round, index) => `**${ANSWER_LABELS[index]}.** ${round.answers[index]}`;
+
+function questionPayload(round, user) {
+  const embed = new EmbedBuilder()
+    .setColor(COLORS.RAPHAEL)
+    .setTitle(`『 ${capitalize(round.category)} Trivia 』`)
+    .setDescription(
+      `**${round.question}**\n\n` +
+      round.answers.map((_, i) => formatAnswer(round, i)).join('\n')
+    )
+    .setFooter({ text: `Answer within ${ANSWER_TIMEOUT / 1000} seconds • ${user.username}` });
+
+  const row = new ActionRowBuilder().addComponents(
+    round.answers.map((_, i) =>
+      new ButtonBuilder()
+        .setCustomId(`trivia_answer_${i}`)
+        .setLabel(ANSWER_LABELS[i])
+        .setStyle(ButtonStyle.Secondary)
+    )
+  );
+
+  return { embeds: [embed], components: [row] };
+}
+
+function replyPrivately(interaction, content) {
+  return interaction.reply({ content, flags: MessageFlags.Ephemeral }).catch(() => {});
+}
+
+// Builds the result embed for an answer (and pays a correct one)
+async function resultEmbed(round, selected, user, guildId, coinName) {
+  if (selected !== round.correctIndex) {
+    return new EmbedBuilder()
+      .setColor(COLORS.RAPHAEL_ERROR)
+      .setTitle('『 Incorrect Answer 』')
+      .setDescription(
+        `**${round.question}**\n\n` +
+        `▸ **Your Response:** ${formatAnswer(round, selected)}\n` +
+        `▸ **Correct Answer:** ${formatAnswer(round, round.correctIndex)}\n\n` +
+        `Analysis suggests further study, Master.`
+      )
+      .setFooter({ text: `${getRandomFooter()} | ${user.username}` });
+  }
+
+  const reward = await payReward(user, guildId);
+  const embed = new EmbedBuilder()
+    .setColor(COLORS.RAPHAEL_SUCCESS)
+    .setTitle('『 Correct Answer 』')
+    .setFooter({ text: `${getRandomFooter()} | ${user.username}` });
+
+  if (reward.paid) {
+    return embed
+      .setDescription(
+        `**${round.question}**\n\n` +
+        `▸ **Answer:** ${formatAnswer(round, round.correctIndex)}\n\n` +
+        `**Confirmed:** **${formatNumber(reward.amount)}** ${coinName} credited to your account, Master.`
+      )
+      .addFields({ name: '▸ Updated Balance', value: `**${formatNumber(reward.balance)}** ${coinName}` });
+  }
+
+  return embed.setDescription(
+    `**${round.question}**\n\n` +
+    `▸ **Answer:** ${formatAnswer(round, round.correctIndex)}\n\n` +
+    `Knowledge verified, Master. Rewards are limited to one every ${TRIVIA_REWARD_COOLDOWN} seconds; ` +
+    `the next paid answer is available <t:${toUnix(reward.availableAt)}:R>.`
+  );
+}
+
+// Waits for the player's answer on `questionMsg`, which already shows the round
+function awaitAnswer(questionMsg, round, { user, guildId, coinName, prefix }) {
+  const collector = questionMsg.createMessageComponentCollector({
+    componentType: ComponentType.Button,
+    time: ANSWER_TIMEOUT
+  });
+  let answered = false;
+
+  collector.on('collect', async (interaction) => {
+    if (interaction.user.id !== user.id) {
+      return replyPrivately(interaction,
+        `This question belongs to ${user.username}, Master. Start your own round with \`${prefix}trivia\`.`);
+    }
+    if (answered) return interaction.deferUpdate().catch(() => {});
+    answered = true;
+    collector.stop('answered');
+
+    try {
+      await interaction.deferUpdate();
+      const selected = Number(interaction.customId.slice('trivia_answer_'.length));
+      if (!Number.isInteger(selected) || selected < 0 || selected >= round.answers.length) {
+        throw new Error(`Unexpected trivia button: ${interaction.customId}`);
+      }
+
+      const embed = await resultEmbed(round, selected, user, guildId, coinName);
+      await interaction.editReply({ embeds: [embed], components: [] });
+    } catch (error) {
+      console.error('[Trivia] Error processing answer:', error);
+      const embed = await errorEmbed(guildId, 'Assessment Error', 'Your answer could not be processed, Master. Please try again.');
+      await interaction.editReply({ embeds: [embed], components: [] }).catch(() => {});
+    }
+  });
+
+  collector.on('end', async (_collected, reason) => {
+    if (reason !== 'time') return;
+    try {
+      const timeoutEmbed = new EmbedBuilder()
+        .setColor(COLORS.RAPHAEL_WARNING)
+        .setTitle('『 Time Expired 』')
+        .setDescription(
+          `**${round.question}**\n\n` +
+          `▸ **Correct Answer:** ${formatAnswer(round, round.correctIndex)}\n\n` +
+          `Response time exceeded the limit, Master.`
+        )
+        .setFooter({ text: `${getRandomFooter()} | ${user.username}` });
+
+      await questionMsg.edit({ embeds: [timeoutEmbed], components: [] });
+    } catch (error) {
+      // Message deleted or no longer editable
+    }
+  });
+}
 
 export default {
   name: 'trivia',
@@ -78,171 +252,95 @@ export default {
 
   async execute(message, args) {
     const guildId = message.guild.id;
-    const category = args[0]?.toLowerCase();
-    const guildConfig = await Guild.getGuild(guildId);
-    const coinEmoji = guildConfig.economy?.coinEmoji || '💰';
-    const coinName = guildConfig.economy?.coinName || 'coins';
+    const user = message.author;
 
-    // If no category or invalid category, show category selection
-    if (!category || !TRIVIA_QUESTIONS[category]) {
+    try {
+      const guildConfig = await Guild.getGuild(guildId);
+      const context = {
+        user,
+        guildId,
+        coinName: guildConfig.economy?.coinName || DEFAULT_COIN_NAME,
+        prefix: await getPrefix(guildId)
+      };
+
+      // A valid category starts straight away (own keys only, so "constructor" etc. never match)
+      const category = args[0]?.toLowerCase();
+      if (category && Object.hasOwn(TRIVIA_QUESTIONS, category)) {
+        const round = createRound(category);
+        const questionMsg = await message.reply(questionPayload(round, user));
+        return awaitAnswer(questionMsg, round, context);
+      }
+
+      // Otherwise ask for a category; the same message then becomes the question
+      const categories = Object.keys(TRIVIA_QUESTIONS);
       const categoryEmbed = new EmbedBuilder()
-        .setColor('#00CED1')
+        .setColor(COLORS.RAPHAEL)
         .setTitle('『 Knowledge Assessment 』')
         .setDescription(
           '**Answer:** Select a category to begin, Master.\n\n' +
-          Object.entries(CATEGORY_EMOJIS).map(([cat, emoji]) =>
-            `${emoji} **${cat.charAt(0).toUpperCase() + cat.slice(1)}**`
-          ).join('\n') +
-          `\n\n**Reward:** ${coinEmoji} 50-150 ${coinName} per correct response.`
+          categories.map(cat => `▸ **${capitalize(cat)}**`).join('\n') +
+          `\n\n**Reward:** ${formatNumber(TRIVIA_REWARD.min)}-${formatNumber(TRIVIA_REWARD.max)} ${context.coinName} per correct response ` +
+          `(at most one paid answer every ${TRIVIA_REWARD_COOLDOWN} seconds).`
         )
         .setFooter({ text: getRandomFooter() });
 
       const row = new ActionRowBuilder().addComponents(
-        ...Object.entries(CATEGORY_EMOJIS).map(([cat, emoji]) =>
+        categories.map(cat =>
           new ButtonBuilder()
             .setCustomId(`trivia_cat_${cat}`)
-            .setLabel(cat.charAt(0).toUpperCase() + cat.slice(1))
+            .setLabel(capitalize(cat))
             .setStyle(ButtonStyle.Primary)
-            .setEmoji(emoji)
         )
       );
 
-      const catMsg = await message.reply({ embeds: [categoryEmbed], components: [row] });
+      const categoryMsg = await message.reply({ embeds: [categoryEmbed], components: [row] });
 
-      try {
-        const catInteraction = await catMsg.awaitMessageComponent({
-          filter: i => i.user.id === message.author.id,
-          componentType: ComponentType.Button,
-          time: 30000
-        });
+      const collector = categoryMsg.createMessageComponentCollector({
+        componentType: ComponentType.Button,
+        time: CATEGORY_TIMEOUT
+      });
+      let chosen = false;
 
-        const selectedCategory = catInteraction.customId.split('_')[2];
-        await catInteraction.deferUpdate();
-        await this.startTrivia(catMsg, message.author, selectedCategory, guildId, coinEmoji, coinName);
+      collector.on('collect', async (interaction) => {
+        if (interaction.user.id !== user.id) {
+          return replyPrivately(interaction,
+            `This assessment belongs to ${user.username}, Master. Start your own with \`${context.prefix}trivia\`.`);
+        }
+        if (chosen) return interaction.deferUpdate().catch(() => {});
+        chosen = true;
+        collector.stop('selected');
 
-      } catch (error) {
+        try {
+          const selected = interaction.customId.slice('trivia_cat_'.length);
+          if (!Object.hasOwn(TRIVIA_QUESTIONS, selected)) {
+            throw new Error(`Unknown trivia category: ${selected}`);
+          }
+          const round = createRound(selected);
+          await interaction.update(questionPayload(round, user));
+          awaitAnswer(categoryMsg, round, context);
+        } catch (error) {
+          console.error('[Trivia] Error starting round:', error);
+          const embed = await errorEmbed(guildId, 'Assessment Error', 'The question could not be loaded, Master. Please try again.');
+          await categoryMsg.edit({ embeds: [embed], components: [] }).catch(() => {});
+        }
+      });
+
+      collector.on('end', async (_collected, reason) => {
+        if (reason !== 'time') return;
         const timeoutEmbed = new EmbedBuilder()
-          .setColor('#FFD700')
+          .setColor(COLORS.RAPHAEL_WARNING)
           .setTitle('『 Session Expired 』')
           .setDescription('**Notice:** Category selection timed out, Master.')
           .setFooter({ text: getRandomFooter() });
 
-        return catMsg.edit({ embeds: [timeoutEmbed], components: [] });
-      }
-    } else {
-      await this.startTrivia(message, message.author, category, guildId, coinEmoji, coinName);
-    }
-  },
-
-  async startTrivia(msg, user, category, guildId, coinEmoji, coinName) {
-    const questions = TRIVIA_QUESTIONS[category];
-    const question = questions[Math.floor(Math.random() * questions.length)];
-    const emoji = CATEGORY_EMOJIS[category];
-
-    // Shuffle answers for display (but track correct answer)
-    const shuffledAnswers = [...question.answers];
-    const correctAnswer = question.answers[question.correct];
-
-    // Fisher-Yates shuffle
-    for (let i = shuffledAnswers.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [shuffledAnswers[i], shuffledAnswers[j]] = [shuffledAnswers[j], shuffledAnswers[i]];
-    }
-
-    const newCorrectIndex = shuffledAnswers.indexOf(correctAnswer);
-
-    const questionEmbed = new EmbedBuilder()
-      .setColor('#5865F2')
-      .setTitle(`${emoji} ${category.charAt(0).toUpperCase() + category.slice(1)} Trivia`)
-      .setDescription(
-        `**${question.question}**\n\n` +
-        shuffledAnswers.map((a, i) => `${['🅰️', '🅱️', '🇨', '🇩'][i]} ${a}`).join('\n')
-      )
-      .setFooter({ text: `Answer within 15 seconds! • ${user.username}` });
-
-    const buttonRow = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId('trivia_0')
-        .setLabel('A')
-        .setStyle(ButtonStyle.Secondary)
-        .setEmoji('🅰️'),
-      new ButtonBuilder()
-        .setCustomId('trivia_1')
-        .setLabel('B')
-        .setStyle(ButtonStyle.Secondary)
-        .setEmoji('🅱️'),
-      new ButtonBuilder()
-        .setCustomId('trivia_2')
-        .setLabel('C')
-        .setStyle(ButtonStyle.Secondary)
-        .setEmoji('🇨'),
-      new ButtonBuilder()
-        .setCustomId('trivia_3')
-        .setLabel('D')
-        .setStyle(ButtonStyle.Secondary)
-        .setEmoji('🇩')
-    );
-
-    const triviaMsg = msg.channel ?
-      await msg.reply({ embeds: [questionEmbed], components: [buttonRow] }) :
-      await msg.edit({ embeds: [questionEmbed], components: [buttonRow] });
-
-    try {
-      const answerInteraction = await triviaMsg.awaitMessageComponent({
-        filter: i => i.user.id === user.id,
-        componentType: ComponentType.Button,
-        time: 15000
+        await categoryMsg.edit({ embeds: [timeoutEmbed], components: [] }).catch(() => {});
       });
 
-      const selectedAnswer = parseInt(answerInteraction.customId.split('_')[1]);
-      const isCorrect = selectedAnswer === newCorrectIndex;
-
-      if (isCorrect) {
-        // Award coins
-        const reward = Math.floor(Math.random() * 100) + 50; // 50-150 coins
-        const economy = await Economy.getEconomy(user.id, guildId);
-        economy.balance += reward;
-        await economy.save();
-
-        const correctEmbed = new EmbedBuilder()
-          .setColor('#00FF7F')
-          .setTitle('『 Correct Answer 』')
-          .setDescription(
-            `**${question.question}**\n\n` +
-            `**Answer:** ${correctAnswer}\n\n` +
-            `**Confirmed:** ${coinEmoji} **${reward}** ${coinName} credited to your account, Master.`
-          )
-          .setFooter({ text: `${user.username} • Knowledge verified.` });
-
-        await answerInteraction.update({ embeds: [correctEmbed], components: [] });
-
-      } else {
-        const wrongEmbed = new EmbedBuilder()
-          .setColor('#FF4757')
-          .setTitle('『 Incorrect Answer 』')
-          .setDescription(
-            `**${question.question}**\n\n` +
-            `**Your Response:** ${shuffledAnswers[selectedAnswer]}\n` +
-            `**Correct Answer:** ${correctAnswer}\n\n` +
-            `**Notice:** Analysis suggests further study, Master.`
-          )
-          .setFooter({ text: `${user.username}` });
-
-        await answerInteraction.update({ embeds: [wrongEmbed], components: [] });
-      }
-
     } catch (error) {
-      const timeoutEmbed = new EmbedBuilder()
-        .setColor('#FFD700')
-        .setTitle('『 Time Expired 』')
-        .setDescription(
-          `**${question.question}**\n\n` +
-          `**Correct Answer:** ${correctAnswer}\n\n` +
-          `**Notice:** Response time exceeded the limit, Master.`
-        )
-        .setFooter({ text: `${user.username}` });
-
-      await triviaMsg.edit({ embeds: [timeoutEmbed], components: [] });
+      console.error('[Trivia] Error:', error);
+      return message.reply({
+        embeds: [await errorEmbed(guildId, 'Assessment Error', 'The knowledge assessment could not be started, Master. Please try again.')]
+      }).catch(() => {});
     }
   }
 };

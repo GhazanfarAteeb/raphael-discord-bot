@@ -1,9 +1,15 @@
 import { EmbedBuilder } from 'discord.js';
 import Economy from '../../models/Economy.js';
 import Guild from '../../models/Guild.js';
-import { DICE_MIN, DICE_MAX } from '../../utils/gameConfig.js';
-import { errorEmbed } from '../../utils/embeds.js';
-import { getPrefix } from '../../utils/helpers.js';
+import { DICE_MIN, DICE_MAX, DEFAULT_COIN_NAME } from '../../utils/gameConfig.js';
+import { errorEmbed, COLORS } from '../../utils/embeds.js';
+import { getPrefix, formatNumber } from '../../utils/helpers.js';
+import { getRandomFooter } from '../../utils/raphael.js';
+
+// Guessing the exact face pays 5x the wager in total
+const DICE_MULTIPLIER = 5;
+// Die-face symbols (text glyphs, not emoji)
+const DIE_FACES = ['⚀', '⚁', '⚂', '⚃', '⚄', '⚅'];
 
 export default {
   name: 'dice',
@@ -24,10 +30,10 @@ export default {
       if (!amount || isNaN(amount)) {
         const prefix = await getPrefix(guildId);
         return message.reply({
-          embeds: [await errorEmbed(guildId,
-            `Please provide a valid bet amount!\n\n` +
-            `Usage: \`${prefix}dice <amount> <number 1-6>\`\n` +
-            `Example: \`${prefix}dice 100 5\``
+          embeds: [await errorEmbed(guildId, 'Invalid Parameters',
+            `Please provide a valid wager, Master.\n\n` +
+            `▸ Syntax: \`${prefix}dice <amount> <number 1-6>\`\n` +
+            `▸ Example: \`${prefix}dice 100 5\``
           )]
         });
       }
@@ -35,37 +41,36 @@ export default {
       if (!guess || isNaN(guess) || guess < 1 || guess > 6) {
         const prefix = await getPrefix(guildId);
         return message.reply({
-          embeds: [await errorEmbed(guildId,
-            `Please choose a number between 1 and 6!\n\n` +
-            `Usage: \`${prefix}dice <amount> <number 1-6>\`\n` +
-            `Example: \`${prefix}dice 100 5\``
+          embeds: [await errorEmbed(guildId, 'Selection Required',
+            `Please choose a number between 1 and 6, Master.\n\n` +
+            `▸ Syntax: \`${prefix}dice <amount> <number 1-6>\`\n` +
+            `▸ Example: \`${prefix}dice 100 5\``
           )]
         });
       }
 
       if (amount < DICE_MIN) {
         return message.reply({
-          embeds: [await errorEmbed(guildId, `Minimum bet is **${DICE_MIN}** coins!`)]
+          embeds: [await errorEmbed(guildId, 'Wager Rejected', `Minimum wager is **${formatNumber(DICE_MIN)}** coins, Master.`)]
         });
       }
 
       if (amount > DICE_MAX) {
         return message.reply({
-          embeds: [await errorEmbed(guildId, `Maximum bet is **${DICE_MAX}** coins!`)]
+          embeds: [await errorEmbed(guildId, 'Wager Rejected', `Maximum wager is **${formatNumber(DICE_MAX)}** coins, Master.`)]
         });
       }
 
       const guildConfig = await Guild.getGuild(guildId);
       const economy = await Economy.getEconomy(userId, guildId);
-      const coinEmoji = guildConfig.economy?.coinEmoji || '💰';
-      const coinName = guildConfig.economy?.coinName || 'coins';
+      const coinName = guildConfig.economy?.coinName || DEFAULT_COIN_NAME;
 
       if (economy.coins < amount) {
         return message.reply({
-          embeds: [await errorEmbed(guildId,
-            `You don't have enough ${coinEmoji} ${coinName}!\n\n` +
-            `**Your Balance:** ${economy.coins} ${coinEmoji} ${coinName}\n` +
-            `**Bet Amount:** ${amount} ${coinEmoji} ${coinName}`
+          embeds: [await errorEmbed(guildId, 'Insufficient Resources',
+            `Your current balance is insufficient, Master.\n\n` +
+            `▸ **Available Funds:** ${formatNumber(economy.coins)} ${coinName}\n` +
+            `▸ **Required Wager:** ${formatNumber(amount)} ${coinName}`
           )]
         });
       }
@@ -74,46 +79,45 @@ export default {
       const roll = Math.floor(Math.random() * 6) + 1;
       const won = roll === guess;
 
-      const diceEmojis = ['⚀', '⚁', '⚂', '⚃', '⚄', '⚅'];
-
-      // Win = 5x payout (guessing exact number is hard!)
-      const winnings = won ? amount * 5 : 0;
+      const winnings = won ? amount * DICE_MULTIPLIER : 0;
       const netGain = won ? winnings - amount : -amount;
 
-      // Update balance
+      // Stats first, so the single save inside addCoins/removeCoins records them too
       if (won) {
-        await economy.addCoins(netGain, 'Dice win (5x)');
         economy.gamblingWins = (economy.gamblingWins || 0) + 1;
       } else {
-        await economy.removeCoins(amount, 'Dice loss');
         economy.gamblingLosses = (economy.gamblingLosses || 0) + 1;
       }
       economy.gamblingTotal = (economy.gamblingTotal || 0) + amount;
-      await economy.save();
+
+      if (won) {
+        await economy.addCoins(netGain, `Dice win (${DICE_MULTIPLIER}x)`);
+      } else {
+        await economy.removeCoins(amount, 'Dice loss');
+      }
 
       const embed = new EmbedBuilder()
         .setTitle('『 Dice Roll 』')
         .setDescription(
-          `**▸ Your Guess:** ${guess}\n` +
-          `**▸ Dice Roll:** ${diceEmojis[roll - 1]} **${roll}**\n\n` +
-          `**${won ? '◉ VICTORY' : '○ DEFEAT'}**\n\n` +
+          `▸ **Your Guess:** ${guess}\n` +
+          `▸ **Dice Roll:** ${DIE_FACES[roll - 1]} **${roll}**\n\n` +
           (won
-            ? `**Multiplier:** 5x\n**Winnings:** +${winnings} ${coinEmoji} ${coinName}\n**Profit:** +${netGain} ${coinEmoji} ${coinName}`
-            : `**Lost:** -${amount} ${coinEmoji} ${coinName}`) +
-          `\n\n**New Balance:** ${economy.coins} ${coinEmoji} ${coinName}`
+            ? `◉ **VICTORY**\n\n▸ **Multiplier:** ${DICE_MULTIPLIER}x\n▸ **Winnings:** +${formatNumber(winnings)} ${coinName}\n▸ **Net Profit:** +${formatNumber(netGain)} ${coinName}\n\n*Precisely as calculated, Master.*`
+            : `◆ **DEFEAT**\n\n▸ **Loss:** -${formatNumber(amount)} ${coinName}\n\n*The probabilities were not in your favor, Master.*`)
         )
-        .setColor(won ? '#00ff00' : '#ff0000')
+        .addFields({ name: '▸ Updated Balance', value: `**${formatNumber(economy.coins)}** ${coinName}` })
+        .setColor(won ? COLORS.RAPHAEL_SUCCESS : COLORS.RAPHAEL_ERROR)
         .setThumbnail(message.author.displayAvatarURL({ extension: 'png' }))
-        .setFooter({ text: `Gambling Stats: ${economy.gamblingWins || 0}W / ${economy.gamblingLosses || 0}L` })
+        .setFooter({ text: `${getRandomFooter()} | W:${economy.gamblingWins || 0} L:${economy.gamblingLosses || 0}` })
         .setTimestamp();
 
       await message.reply({ embeds: [embed] });
 
     } catch (error) {
-      console.error('Error in dice command:', error);
+      console.error('[Dice] Error:', error);
       return message.reply({
-        embeds: [await errorEmbed(guildId, 'An error occurred while rolling dice.')]
-      });
+        embeds: [await errorEmbed(guildId, 'System Error', 'An anomaly occurred while rolling the dice, Master.')]
+      }).catch(() => {});
     }
   }
 };

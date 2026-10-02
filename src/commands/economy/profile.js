@@ -2,10 +2,20 @@ import { AttachmentBuilder, EmbedBuilder } from 'discord.js';
 import { createCanvas, loadImage } from '@napi-rs/canvas';
 import '../../utils/fonts.js';
 import Economy from '../../models/Economy.js';
-import Member from '../../models/Member.js';
 import Level from '../../models/Level.js';
 import Guild from '../../models/Guild.js';
 import { getBackground } from '../../utils/shopItems.js';
+import { DEFAULT_COIN_NAME } from '../../utils/gameConfig.js';
+import { errorEmbed, COLORS } from '../../utils/embeds.js';
+import { getPrefix, formatNumber } from '../../utils/helpers.js';
+import { getRandomFooter } from '../../utils/raphael.js';
+
+// Description block layout: lines stop short of the coins/streak/rep row at the bottom
+const DESC_LINE_HEIGHT = 24;
+const DESC_BOTTOM_GAP = 22;
+const ELLIPSIS = '...';
+// Discord's embed field value limit
+const MAX_FIELD_VALUE = 1024;
 
 // Helper function to convert hex to rgba
 function hexToRgba(hex, opacity) {
@@ -17,29 +27,70 @@ function hexToRgba(hex, opacity) {
   return `rgba(${r}, ${g}, ${b}, ${opacity})`;
 }
 
-// Helper function to wrap text
-function wrapText(ctx, text, maxWidth) {
-  const words = text.split(' ');
-  const lines = [];
-  let currentLine = '';
-
-  for (const word of words) {
-    const testLine = currentLine + (currentLine ? ' ' : '') + word;
-    const metrics = ctx.measureText(testLine);
-
-    if (metrics.width > maxWidth && currentLine !== '') {
-      lines.push(currentLine);
-      currentLine = word;
+// Splits a word wider than maxWidth into pieces that fit (by code point, so emoji stay whole)
+function breakWord(ctx, word, maxWidth) {
+  const pieces = [];
+  let current = '';
+  for (const char of word) {
+    if (current && ctx.measureText(current + char).width > maxWidth) {
+      pieces.push(current);
+      current = char;
     } else {
-      currentLine = testLine;
+      current += char;
     }
   }
+  if (current) pieces.push(current);
+  return pieces;
+}
 
-  if (currentLine) {
-    lines.push(currentLine);
+// Helper function to wrap text; honours line breaks and breaks words too long for one line
+function wrapText(ctx, text, maxWidth) {
+  const lines = [];
+
+  for (const paragraph of String(text).split(/\r?\n/)) {
+    let currentLine = '';
+
+    for (const word of paragraph.split(' ').filter(Boolean)) {
+      const testLine = currentLine ? `${currentLine} ${word}` : word;
+
+      if (ctx.measureText(testLine).width <= maxWidth) {
+        currentLine = testLine;
+        continue;
+      }
+
+      if (currentLine) lines.push(currentLine);
+
+      if (ctx.measureText(word).width > maxWidth) {
+        const pieces = breakWord(ctx, word, maxWidth);
+        lines.push(...pieces.slice(0, -1));
+        currentLine = pieces[pieces.length - 1];
+      } else {
+        currentLine = word;
+      }
+    }
+
+    if (currentLine) lines.push(currentLine);
   }
 
   return lines;
+}
+
+// Shortens a line until it fits with a trailing ellipsis
+function withEllipsis(ctx, line, maxWidth) {
+  const chars = Array.from(line);
+  while (chars.length > 0 && ctx.measureText(chars.join('') + ELLIPSIS).width > maxWidth) {
+    chars.pop();
+  }
+  return chars.join('').trimEnd() + ELLIPSIS;
+}
+
+// The lines to draw: at most maxLines, the last one ellipsized when text was cut
+function fitLines(ctx, text, maxWidth, maxLines) {
+  const lines = wrapText(ctx, text, maxWidth);
+  if (lines.length <= maxLines) return lines;
+  const shown = lines.slice(0, maxLines);
+  shown[maxLines - 1] = withEllipsis(ctx, shown[maxLines - 1], maxWidth);
+  return shown;
 }
 
 // Helper function to draw rounded rectangle
@@ -57,10 +108,10 @@ function roundedRect(ctx, x, y, width, height, radius) {
   ctx.closePath();
 }
 
-// Calculate XP needed for level (same formula as Level model)
-// Formula: 100 + (level * 50) + (level^1.5 * 25)
-function xpForLevel(level) {
-  return Math.floor(100 + (level * 50) + Math.pow(level, 1.5) * 25);
+// Read-only: viewing a profile never creates documents (members or bots). Unsaved model
+// instances supply the schema defaults when there is no data yet.
+async function loadEconomy(userId, guildId) {
+  return (await Economy.findOne({ userId, guildId })) ?? new Economy({ userId, guildId });
 }
 
 export default {
@@ -75,43 +126,39 @@ export default {
     const targetUser = message.mentions.users.first() || message.author;
     const userId = targetUser.id;
     const guildId = message.guild.id;
+    const isSelf = userId === message.author.id;
 
     try {
       await message.channel.sendTyping();
 
-      const economy = await Economy.getEconomy(userId, guildId);
-      const memberData = await Member.getMember(userId, guildId, {
-        username: targetUser.username,
-        discriminator: targetUser.discriminator,
-        displayName: targetUser.displayName,
-        globalName: targetUser.globalName,
-        avatarUrl: targetUser.displayAvatarURL({ extension: 'png', size: 256 }),
-        tag: targetUser.tag,
-        createdAt: targetUser.createdAt
-      });
+      const prefix = await getPrefix(guildId);
+      const economy = await loadEconomy(userId, guildId);
 
       // Try to get level data
       let levelData = null;
-      let rank = 1;
+      let rankText = 'Rank —';
       try {
-        levelData = await Level.findOne({ userId: userId, guildId });
+        levelData = await Level.findOne({ userId, guildId });
         if (levelData) {
-          rank = await Level.getUserRank(userId, guildId) || 1;
+          const ahead = await Level.countDocuments({ guildId, totalXP: { $gt: levelData.totalXP || 0 } });
+          rankText = `Rank #${ahead + 1}`;
         }
       } catch (e) {
         // Level system might not be set up
       }
 
-      const currentLevel = levelData?.level || 1;
-      const currentXP = levelData?.xp || 0;
-      const totalXP = levelData?.totalXP || 0;
-      const dailyXP = levelData?.dailyXP || 0;
-      const messagesCount = levelData?.messageCount || memberData?.messages || economy.stats.messagesCount || 0;
-      const neededXP = xpForLevel(currentLevel);
+      const level = levelData ?? new Level({ userId, guildId });
+      const currentLevel = level.level ?? 0;
+      const currentXP = level.xp || 0;
+      const totalXP = level.totalXP || 0;
+      const dailyXP = level.dailyXP || 0;
+      const messagesCount = level.messageCount || economy.stats?.messagesCount || 0;
+      const neededXP = level.xpForNextLevel();
 
       // Get guild config for fallback background
       const guildConfig = await Guild.getGuild(guildId);
       const fallbackBg = guildConfig.economy?.fallbackBackground;
+      const coinName = guildConfig.economy?.coinName || DEFAULT_COIN_NAME;
 
       // Check if user customization is enabled (default: true)
       const customizationEnabled = guildConfig.economy?.profileCustomization?.enabled !== false;
@@ -157,38 +204,23 @@ export default {
       const canvas = createCanvas(900, 420);
       const ctx = canvas.getContext('2d');
 
-      // Draw background
-      if (bgImage) {
-        try {
-          const loadedBg = await loadImage(bgImage).catch(() => null);
-          if (loadedBg) {
-            ctx.drawImage(loadedBg, 0, 0, canvas.width, canvas.height);
-            // Add overlay for readability (uses user or guild customization)
-            ctx.fillStyle = hexToRgba(overlayColor, overlayOpacity);
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
-          } else {
-            // Background gradient fallback
-            const bgGradient = ctx.createLinearGradient(0, 0, 900, 420);
-            bgGradient.addColorStop(0, '#2C2F33');
-            bgGradient.addColorStop(1, '#23272A');
-            ctx.fillStyle = bgGradient;
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
-          }
-        } catch {
-          // Background gradient fallback
-          const bgGradient = ctx.createLinearGradient(0, 0, 900, 420);
-          bgGradient.addColorStop(0, '#2C2F33');
-          bgGradient.addColorStop(1, '#23272A');
-          ctx.fillStyle = bgGradient;
-          ctx.fillRect(0, 0, canvas.width, canvas.height);
-        }
-      } else {
-        // Background gradient
+      const drawGradientBackground = () => {
         const bgGradient = ctx.createLinearGradient(0, 0, 900, 420);
         bgGradient.addColorStop(0, '#2C2F33');
         bgGradient.addColorStop(1, '#23272A');
         ctx.fillStyle = bgGradient;
         ctx.fillRect(0, 0, canvas.width, canvas.height);
+      };
+
+      // Draw background
+      const loadedBg = bgImage ? await loadImage(bgImage).catch(() => null) : null;
+      if (loadedBg) {
+        ctx.drawImage(loadedBg, 0, 0, canvas.width, canvas.height);
+        // Add overlay for readability (uses user or guild customization)
+        ctx.fillStyle = hexToRgba(overlayColor, overlayOpacity);
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+      } else {
+        drawGradientBackground();
       }
 
       // Accent bar at TOP with gradient (same as rank card)
@@ -228,7 +260,7 @@ export default {
         ctx.arc(avatarX + avatarSize / 2, avatarY, avatarSize / 2, 0, Math.PI * 2);
         ctx.stroke();
       } catch (error) {
-        console.error('Error loading avatar:', error);
+        console.error('[Profile] Error loading avatar:', error);
       }
 
       // Text area starting position
@@ -245,7 +277,7 @@ export default {
       // Draw Rank
       ctx.font = '18px "Poppins", sans-serif';
       ctx.fillStyle = '#B9BBBE';
-      ctx.fillText(`Rank #${rank}`, textX, textY);
+      ctx.fillText(rankText, textX, textY);
 
       textY += 30;
 
@@ -259,7 +291,7 @@ export default {
       // Draw XP text
       ctx.font = '16px "Poppins", sans-serif';
       ctx.fillStyle = '#B9BBBE';
-      ctx.fillText(`${currentXP} / ${neededXP} XP`, textX, textY);
+      ctx.fillText(`${formatNumber(currentXP)} / ${formatNumber(neededXP)} XP`, textX, textY);
 
       textY += 20;
 
@@ -287,14 +319,14 @@ export default {
 
       textY += 45;
 
-      // Draw bottom stats (Messages, Total XP, Daily XP) - like rank card
+      // Draw level stats (Messages, Total XP, Daily XP) - like rank card
       ctx.font = '14px "Poppins", sans-serif';
       ctx.fillStyle = '#72767D';
 
       const statsSpacing = 180;
-      ctx.fillText(`Messages: ${messagesCount.toLocaleString()}`, textX, textY);
-      ctx.fillText(`Total XP: ${totalXP.toLocaleString()}`, textX + statsSpacing, textY);
-      ctx.fillText(`Daily XP: ${dailyXP.toLocaleString()}`, textX + statsSpacing * 2, textY);
+      ctx.fillText(`Messages: ${formatNumber(messagesCount)}`, textX, textY);
+      ctx.fillText(`Total XP: ${formatNumber(totalXP)}`, textX + statsSpacing, textY);
+      ctx.fillText(`Daily XP: ${formatNumber(dailyXP)}`, textX + statsSpacing * 2, textY);
 
       // ========== DESCRIPTION SECTION (BOTTOM) ==========
 
@@ -309,6 +341,7 @@ export default {
       // Description area
       const descStartY = separatorY + 30;
       const descPadding = 40;
+      const bottomY = canvas.height - 30;
 
       // Draw "About Me" label
       ctx.font = 'bold 20px "Poppins Bold", sans-serif';
@@ -326,21 +359,18 @@ export default {
       ctx.font = '16px "Poppins", sans-serif';
       ctx.fillStyle = '#DCDDDE';
 
-      const description = economy.profile.description || economy.profile.bio || 'No description set. Use `setprofile description <text>` to add one!';
-      const descLines = wrapText(ctx, description, canvas.width - (descPadding * 2));
-      const maxDescLines = 5;
+      const description = economy.profile.description
+        || (isSelf ? `No description set. Use ${prefix}setprofile description <text> to add one.` : 'No description set.');
       let descY = descStartY + 35;
+      const maxDescLines = Math.max(1, Math.floor((bottomY - DESC_BOTTOM_GAP - descY) / DESC_LINE_HEIGHT) + 1);
 
-      for (let i = 0; i < Math.min(descLines.length, maxDescLines); i++) {
-        const line = descLines[i] + (i === maxDescLines - 1 && descLines.length > maxDescLines ? '...' : '');
+      for (const line of fitLines(ctx, description, canvas.width - (descPadding * 2), maxDescLines)) {
         ctx.fillText(line, descPadding, descY);
-        descY += 26;
+        descY += DESC_LINE_HEIGHT;
       }
 
       // Draw economy stats at bottom
-      const bottomY = canvas.height - 30;
       ctx.font = '14px "Poppins", sans-serif';
-      ctx.fillStyle = '#72767D';
 
       // Coins - draw colored dot indicator
       ctx.beginPath();
@@ -348,7 +378,7 @@ export default {
       ctx.fillStyle = '#FFD700';
       ctx.fill();
       ctx.fillStyle = '#DCDDDE';
-      ctx.fillText(`${economy.coins.toLocaleString()} coins`, descPadding + 20, bottomY);
+      ctx.fillText(`${formatNumber(economy.coins)} ${coinName}`, descPadding + 20, bottomY);
 
       // Streak - draw colored dot indicator
       ctx.beginPath();
@@ -356,7 +386,7 @@ export default {
       ctx.fillStyle = '#FF6B6B';
       ctx.fill();
       ctx.fillStyle = '#DCDDDE';
-      ctx.fillText(`${economy.daily.streak || 0} day streak`, descPadding + 200, bottomY);
+      ctx.fillText(`${economy.daily?.streak || 0} day streak`, descPadding + 200, bottomY);
 
       // Reputation - draw colored dot indicator
       ctx.beginPath();
@@ -364,20 +394,17 @@ export default {
       ctx.fillStyle = '#FFC0CB';
       ctx.fill();
       ctx.fillStyle = '#DCDDDE';
-      ctx.fillText(`${economy.reputation || 0} rep`, descPadding + 400, bottomY);
-
-      // Total Earned
-      // ctx.fillStyle = '#72767D';
-      // ctx.fillText(`Total Earned: ${economy.stats.totalEarned.toLocaleString()}`, descPadding + 520, bottomY);
+      ctx.fillText(`${formatNumber(economy.reputation || 0)} rep`, descPadding + 400, bottomY);
 
       // Draw badges in top right if enabled
-      if (economy.profile.showBadges !== false && economy.inventory.badges.length > 0) {
+      const badges = economy.inventory?.badges || [];
+      if (economy.profile.showBadges !== false && badges.length > 0) {
         const badgeY = 50;
         const badgeSize = 24;
         const badgeSpacing = 32;
         let badgeX = canvas.width - 50;
 
-        for (let i = 0; i < Math.min(economy.inventory.badges.length, 5); i++) {
+        for (let i = 0; i < Math.min(badges.length, 5); i++) {
           // Draw badge as a golden circle with star shape
           ctx.beginPath();
           ctx.arc(badgeX, badgeY, badgeSize / 2, 0, Math.PI * 2);
@@ -403,34 +430,44 @@ export default {
       await message.reply({ files: [attachment] });
 
     } catch (error) {
-      console.error('Profile command error:', error);
+      console.error('[Profile] Error generating card:', error);
 
       // Fallback to embed-based profile display
       try {
-        const economy = await Economy.getEconomy(userId, guildId);
+        const prefix = await getPrefix(guildId);
+        const guildConfig = await Guild.getGuild(guildId);
+        const coinName = guildConfig.economy?.coinName || DEFAULT_COIN_NAME;
+        const economy = await loadEconomy(userId, guildId);
+        const description = economy.profile.description || 'No description set.';
 
         const embed = new EmbedBuilder()
-          .setColor(economy.profile.accentColor || '#7289DA')
+          .setColor(COLORS.RAPHAEL)
           .setAuthor({
             name: targetUser.tag,
-            iconURL: targetUser.displayAvatarURL({ dynamic: true })
+            iconURL: targetUser.displayAvatarURL()
           })
-          .setTitle(economy.profile.title || '📋 Profile Card')
-          .setThumbnail(targetUser.displayAvatarURL({ dynamic: true, size: 256 }))
+          .setTitle(`『 ${economy.profile.title || `${targetUser.username}'s Profile`} 』`)
+          .setThumbnail(targetUser.displayAvatarURL({ size: 256 }))
+          .setDescription('The profile card could not be rendered, Master. A text summary follows.')
           .addFields(
-            { name: '📝 Bio', value: economy.profile.bio || 'No bio set', inline: false },
-            { name: '📄 Description', value: economy.profile.description || 'No description set', inline: false },
-            { name: '💰 Coins', value: `${economy.coins.toLocaleString()}`, inline: true },
-            { name: '🔥 Streak', value: `${economy.daily.streak || 0} days`, inline: true },
-            { name: '⭐ Reputation', value: `${economy.reputation || 0}`, inline: true },
-            // { name: '📊 Total Earned', value: `${economy.stats.totalEarned.toLocaleString()}`, inline: true }
+            {
+              name: '▸ Description',
+              value: description.length > MAX_FIELD_VALUE ? `${description.slice(0, MAX_FIELD_VALUE - ELLIPSIS.length)}${ELLIPSIS}` : description,
+              inline: false
+            },
+            { name: '▸ Balance', value: `**${formatNumber(economy.coins)}** ${coinName}`, inline: true },
+            { name: '▸ Daily Streak', value: `**${economy.daily?.streak || 0}** day${economy.daily?.streak === 1 ? '' : 's'}`, inline: true },
+            { name: '▸ Reputation', value: `**${formatNumber(economy.reputation || 0)}**`, inline: true }
           )
-          .setFooter({ text: 'Use !setprofile to customize your profile' })
+          .setFooter({ text: `${getRandomFooter()} | Use ${prefix}setprofile to customize` })
           .setTimestamp();
 
-        message.reply({ embeds: [embed] });
+        await message.reply({ embeds: [embed] });
       } catch (fallbackError) {
-        message.reply('An error occurred while generating your profile card. Please try again!');
+        console.error('[Profile] Fallback embed failed:', fallbackError);
+        await message.reply({
+          embeds: [await errorEmbed(guildId, 'Profile Error', 'An error occurred while generating the profile card. Please try again, Master.')]
+        }).catch(() => {});
       }
     }
   }

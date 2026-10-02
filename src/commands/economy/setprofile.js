@@ -1,8 +1,18 @@
-import { EmbedBuilder, SlashCommandBuilder } from 'discord.js';
+import { EmbedBuilder, SlashCommandBuilder, MessageFlags } from 'discord.js';
 import Economy from '../../models/Economy.js';
 import Guild from '../../models/Guild.js';
 import { getPrefix } from '../../utils/helpers.js';
-import { successEmbed, errorEmbed, GLYPHS } from '../../utils/embeds.js';
+import { successEmbed, errorEmbed, GLYPHS, COLORS } from '../../utils/embeds.js';
+import { getRandomFooter } from '../../utils/raphael.js';
+
+// Discord's embed field value limit is 1024; the preview stays well below it
+const DESCRIPTION_PREVIEW_LENGTH = 150;
+
+// Replies to a message or a slash interaction; slash replies can be private
+function respond(context, payload, isSlash, ephemeral = false) {
+  if (isSlash && ephemeral) return context.reply({ ...payload, flags: MessageFlags.Ephemeral });
+  return context.reply(payload);
+}
 
 // Helper function to convert hex to rgba
 function hexToRgba(hex, opacity) {
@@ -70,120 +80,145 @@ export default {
   async execute(message, args) {
     const userId = message.author.id;
     const guildId = message.guild.id;
-    const prefix = await getPrefix(guildId);
 
-    const guildConfig = await Guild.getGuild(guildId);
-    const customizationEnabled = guildConfig.economy?.profileCustomization?.enabled !== false;
-
-    // No args - show help
-    if (!args[0]) {
-      return showHelp(message, guildId, prefix, customizationEnabled);
+    try {
+      return await runPrefixCommand(message, args, userId, guildId);
+    } catch (error) {
+      console.error('[SetProfile] Error:', error);
+      return message.reply({
+        embeds: [await errorEmbed(guildId, 'Profile Error', 'An anomaly occurred while updating your profile, Master. Please try again.')]
+      }).catch(() => {});
     }
-
-    const setting = args[0].toLowerCase();
-    const value = args.slice(1).join(' ');
-
-    // View current settings
-    if (setting === 'view' || setting === 'show' || setting === 'status') {
-      return showProfileSettings(message, userId, guildId, customizationEnabled);
-    }
-
-    // Reset settings
-    if (setting === 'reset' || setting === 'clear') {
-      return resetProfileSettings(message, userId, guildId, customizationEnabled);
-    }
-
-    // Set description
-    if (setting === 'description' || setting === 'desc') {
-      return setDescription(message, userId, guildId, value);
-    }
-
-    // Overlay subcommands: overlay color <hex> or overlay opacity <0-100>
-    if (setting === 'overlay') {
-      if (!customizationEnabled) {
-        const embed = await errorEmbed(guildId, 'Customization Disabled',
-          `${GLYPHS.WARNING} Profile customization is disabled on this server.\n\n` +
-          `Server admins control the overlay using \`${prefix}setoverlay\`.`
-        );
-        return message.reply({ embeds: [embed] });
-      }
-
-      const subSetting = args[1]?.toLowerCase();
-      const subValue = args[2];
-
-      if (!subSetting || !['color', 'colour', 'opacity'].includes(subSetting)) {
-        const embed = await errorEmbed(guildId, 'Invalid Overlay Setting',
-          `${GLYPHS.WARNING} Please specify \`color\` or \`opacity\`.\n\n` +
-          `**Usage:**\n` +
-          `\`${prefix}setprofile overlay color <hex>\`\n` +
-          `\`${prefix}setprofile overlay opacity <0-100>\``
-        );
-        return message.reply({ embeds: [embed] });
-      }
-
-      if (subSetting === 'color' || subSetting === 'colour') {
-        return setOverlayColor(message, userId, guildId, subValue, prefix);
-      }
-
-      if (subSetting === 'opacity') {
-        return setOverlayOpacity(message, userId, guildId, subValue, prefix);
-      }
-    }
-
-    // Unknown setting
-    const embed = await errorEmbed(guildId, 'Invalid Setting',
-      `${GLYPHS.WARNING} Unknown setting. Use \`description\`, \`overlay\`, \`view\`, or \`reset\`.\n\n` +
-      `Use \`${prefix}setprofile\` to see all options.`
-    );
-    return message.reply({ embeds: [embed] });
   },
 
   // Slash command execution
   async executeSlash(interaction) {
-    const userId = interaction.user.id;
-    const guildId = interaction.guild.id;
-
-    const guildConfig = await Guild.getGuild(guildId);
-    const customizationEnabled = guildConfig.economy?.profileCustomization?.enabled !== false;
-
-    const subcommandGroup = interaction.options.getSubcommandGroup(false);
-    const subcommand = interaction.options.getSubcommand();
-
-    if (subcommand === 'view') {
-      return showProfileSettings(interaction, userId, guildId, customizationEnabled, true);
-    }
-
-    if (subcommand === 'reset') {
-      return resetProfileSettings(interaction, userId, guildId, customizationEnabled, true);
-    }
-
-    if (subcommand === 'description') {
-      const text = interaction.options.getString('text') || '';
-      return setDescription(interaction, userId, guildId, text, true);
-    }
-
-    // Overlay subcommand group
-    if (subcommandGroup === 'overlay') {
-      if (!customizationEnabled) {
-        const embed = await errorEmbed(guildId, 'Customization Disabled',
-          `${GLYPHS.WARNING} Profile customization is disabled on this server.\n\n` +
-          `Server admins control the overlay using \`/setoverlay\`.`
-        );
-        return interaction.reply({ embeds: [embed], ephemeral: true });
-      }
-
-      if (subcommand === 'color') {
-        const hex = interaction.options.getString('hex');
-        return setOverlayColor(interaction, userId, guildId, hex, null, true);
-      }
-
-      if (subcommand === 'opacity') {
-        const percent = interaction.options.getInteger('percent');
-        return setOverlayOpacity(interaction, userId, guildId, String(percent), null, true);
-      }
+    try {
+      return await runSlashCommand(interaction);
+    } catch (error) {
+      console.error('[SetProfile] Slash error:', error);
+      const reply = {
+        embeds: [await errorEmbed(interaction.guild.id, 'Profile Error', 'An anomaly occurred while updating your profile, Master. Please try again.')],
+        flags: MessageFlags.Ephemeral
+      };
+      return (interaction.replied || interaction.deferred ? interaction.followUp(reply) : interaction.reply(reply)).catch(() => {});
     }
   }
 };
+
+async function runPrefixCommand(message, args, userId, guildId) {
+  const prefix = await getPrefix(guildId);
+
+  const guildConfig = await Guild.getGuild(guildId);
+  const customizationEnabled = guildConfig.economy?.profileCustomization?.enabled !== false;
+
+  // No args - show help
+  if (!args[0]) {
+    return showHelp(message, guildId, prefix, customizationEnabled);
+  }
+
+  const setting = args[0].toLowerCase();
+  const value = args.slice(1).join(' ');
+
+  // View current settings
+  if (setting === 'view' || setting === 'show' || setting === 'status') {
+    return showProfileSettings(message, userId, guildId, customizationEnabled, prefix);
+  }
+
+  // Reset settings
+  if (setting === 'reset' || setting === 'clear') {
+    return resetProfileSettings(message, userId, guildId, customizationEnabled);
+  }
+
+  // Set description
+  if (setting === 'description' || setting === 'desc') {
+    return setDescription(message, userId, guildId, value);
+  }
+
+  // Overlay subcommands: overlay color <hex> or overlay opacity <0-100>
+  if (setting === 'overlay') {
+    if (!customizationEnabled) {
+      const embed = await errorEmbed(guildId, 'Customization Disabled',
+        `${GLYPHS.WARNING} Profile customization is disabled on this server.\n\n` +
+        `Server admins control the overlay using \`${prefix}setoverlay\`.`
+      );
+      return message.reply({ embeds: [embed] });
+    }
+
+    const subSetting = args[1]?.toLowerCase();
+    const subValue = args[2];
+
+    if (!subSetting || !['color', 'colour', 'opacity'].includes(subSetting)) {
+      const embed = await errorEmbed(guildId, 'Invalid Overlay Setting',
+        `${GLYPHS.WARNING} Please specify \`color\` or \`opacity\`.\n\n` +
+        `**Usage:**\n` +
+        `\`${prefix}setprofile overlay color <hex>\`\n` +
+        `\`${prefix}setprofile overlay opacity <0-100>\``
+      );
+      return message.reply({ embeds: [embed] });
+    }
+
+    if (subSetting === 'color' || subSetting === 'colour') {
+      return setOverlayColor(message, userId, guildId, subValue, prefix);
+    }
+
+    if (subSetting === 'opacity') {
+      return setOverlayOpacity(message, userId, guildId, subValue, prefix);
+    }
+  }
+
+  // Unknown setting
+  const embed = await errorEmbed(guildId, 'Invalid Setting',
+    `${GLYPHS.WARNING} Unknown setting, Master. Use \`description\`, \`overlay\`, \`view\`, or \`reset\`.\n\n` +
+    `Use \`${prefix}setprofile\` to see all options.`
+  );
+  return message.reply({ embeds: [embed] });
+}
+
+async function runSlashCommand(interaction) {
+  const userId = interaction.user.id;
+  const guildId = interaction.guild.id;
+
+  const guildConfig = await Guild.getGuild(guildId);
+  const customizationEnabled = guildConfig.economy?.profileCustomization?.enabled !== false;
+
+  const subcommandGroup = interaction.options.getSubcommandGroup(false);
+  const subcommand = interaction.options.getSubcommand();
+
+  if (subcommand === 'view') {
+    return showProfileSettings(interaction, userId, guildId, customizationEnabled, await getPrefix(guildId), true);
+  }
+
+  if (subcommand === 'reset') {
+    return resetProfileSettings(interaction, userId, guildId, customizationEnabled, true);
+  }
+
+  if (subcommand === 'description') {
+    const text = interaction.options.getString('text') || '';
+    return setDescription(interaction, userId, guildId, text, true);
+  }
+
+  // Overlay subcommand group
+  if (subcommandGroup === 'overlay') {
+    if (!customizationEnabled) {
+      const embed = await errorEmbed(guildId, 'Customization Disabled',
+        `${GLYPHS.WARNING} Profile customization is disabled on this server.\n\n` +
+        `Server admins control the overlay using \`/setoverlay\`.`
+      );
+      return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+    }
+
+    if (subcommand === 'color') {
+      const hex = interaction.options.getString('hex');
+      return setOverlayColor(interaction, userId, guildId, hex, null, true);
+    }
+
+    if (subcommand === 'opacity') {
+      const percent = interaction.options.getInteger('percent');
+      return setOverlayOpacity(interaction, userId, guildId, String(percent), null, true);
+    }
+  }
+}
 
 // Show help message
 async function showHelp(context, guildId, prefix, customizationEnabled) {
@@ -220,19 +255,19 @@ async function showHelp(context, guildId, prefix, customizationEnabled) {
   );
 
   const embed = new EmbedBuilder()
-    .setColor('#00CED1')
+    .setColor(COLORS.RAPHAEL)
     .setTitle('『 Profile Customization 』')
     .setDescription(customizationEnabled
       ? '**Customize your profile, Master:**'
-      : '**Profile customization is managed by admins.**\nYou can only set your description.')
+      : '**Profile customization is managed by admins, Master.**\nYou can only set your description.')
     .addFields(fields)
-    .setFooter({ text: `Use ${prefix}profile to preview your card` });
+    .setFooter({ text: `${getRandomFooter()} | Use ${prefix}profile to preview your card` });
 
   return context.reply({ embeds: [embed] });
 }
 
 // Show current profile settings
-async function showProfileSettings(context, userId, guildId, customizationEnabled, isSlash = false) {
+async function showProfileSettings(context, userId, guildId, customizationEnabled, prefix, isSlash = false) {
   const economy = await Economy.getEconomy(userId, guildId);
   const profile = economy.profile || {};
 
@@ -240,47 +275,48 @@ async function showProfileSettings(context, userId, guildId, customizationEnable
   const overlayOpacity = profile.overlayOpacity ?? 0.5;
   const overlayRgba = hexToRgba(overlayColor, overlayOpacity);
 
+  // Code-block preview; stray backticks would end the block early
+  const preview = profile.description?.replace(/`/g, "'");
   const fields = [
     {
-      name: '📄 Description',
-      value: profile.description ? `\`\`\`${profile.description.substring(0, 150)}${profile.description.length > 150 ? '...' : ''}\`\`\`` : '`Not set`',
+      name: '▸ Description',
+      value: preview
+        ? `\`\`\`${preview.substring(0, DESCRIPTION_PREVIEW_LENGTH)}${preview.length > DESCRIPTION_PREVIEW_LENGTH ? '...' : ''}\`\`\``
+        : '`Not set`',
       inline: false
     },
     {
-      name: '🎨 Overlay Color',
+      name: '▸ Overlay Color',
       value: `\`${overlayColor}\``,
       inline: true
     },
     {
-      name: '💧 Overlay Opacity',
+      name: '▸ Overlay Opacity',
       value: `\`${Math.round(overlayOpacity * 100)}%\``,
       inline: true
     },
     {
-      name: '📋 Result',
-      value: `\`${overlayRgba}\``,
+      name: '▸ Result',
+      value: `\`${overlayRgba ?? 'Invalid color'}\``,
       inline: true
     },
     {
-      name: '🖼️ Background',
+      name: '▸ Background',
       value: `\`${profile.background || 'default'}\``,
       inline: true
     }
   ];
 
   const embed = new EmbedBuilder()
-    .setColor('#00CED1')
+    .setColor(COLORS.RAPHAEL)
     .setTitle('『 Your Profile Settings 』')
     .setDescription(customizationEnabled
-      ? '**You can customize your overlay.**'
-      : '**Overlay is controlled by server admins.**')
+      ? '**You can customize your overlay, Master.**'
+      : '**Overlay is controlled by server admins, Master.**')
     .addFields(fields)
-    .setFooter({ text: 'Use /profile to preview your card' });
+    .setFooter({ text: `${getRandomFooter()} | Use ${prefix}profile to preview your card` });
 
-  if (isSlash) {
-    return context.reply({ embeds: [embed], ephemeral: true });
-  }
-  return context.reply({ embeds: [embed] });
+  return respond(context, { embeds: [embed] }, isSlash, true);
 }
 
 // Reset profile settings (overlay only)
@@ -289,11 +325,11 @@ async function resetProfileSettings(context, userId, guildId, customizationEnabl
     const embed = await errorEmbed(guildId, 'Customization Disabled',
       `${GLYPHS.WARNING} Profile customization is disabled.\nOverlay is controlled by server admins.`
     );
-    if (isSlash) return context.reply({ embeds: [embed], ephemeral: true });
-    return context.reply({ embeds: [embed] });
+    return respond(context, { embeds: [embed] }, isSlash, true);
   }
 
-  await Economy.updateEconomy(userId, guildId, {
+  await Economy.getEconomy(userId, guildId); // make sure the document exists
+  await Economy.updateOne({ userId, guildId }, {
     $set: {
       'profile.overlayColor': '#000000',
       'profile.overlayOpacity': 0.5
@@ -307,8 +343,7 @@ async function resetProfileSettings(context, userId, guildId, customizationEnabl
     `◇ Opacity: \`50%\``
   );
 
-  if (isSlash) return context.reply({ embeds: [embed] });
-  return context.reply({ embeds: [embed] });
+  return respond(context, { embeds: [embed] }, isSlash);
 }
 
 // Set description
@@ -322,8 +357,7 @@ async function setDescription(context, userId, guildId, value, isSlash = false) 
     const embed = await successEmbed(guildId, 'Description Cleared',
       `${GLYPHS.SUCCESS} Your description has been cleared, Master.`
     );
-    if (isSlash) return context.reply({ embeds: [embed] });
-    return context.reply({ embeds: [embed] });
+    return respond(context, { embeds: [embed] }, isSlash);
   }
 
   if (value.length > 500) {
@@ -331,8 +365,7 @@ async function setDescription(context, userId, guildId, value, isSlash = false) 
       `${GLYPHS.WARNING} Description must not exceed 500 characters, Master.\n\n` +
       `Your text: **${value.length}** characters`
     );
-    if (isSlash) return context.reply({ embeds: [embed], ephemeral: true });
-    return context.reply({ embeds: [embed] });
+    return respond(context, { embeds: [embed] }, isSlash, true);
   }
 
   economy.profile.description = value;
@@ -343,8 +376,7 @@ async function setDescription(context, userId, guildId, value, isSlash = false) 
     `**Length:** ${value.length}/500 characters`
   );
 
-  if (isSlash) return context.reply({ embeds: [embed] });
-  return context.reply({ embeds: [embed] });
+  return respond(context, { embeds: [embed] }, isSlash);
 }
 
 // Set overlay color
@@ -353,8 +385,7 @@ async function setOverlayColor(context, userId, guildId, value, prefix, isSlash 
     const embed = await errorEmbed(guildId, 'Missing Value',
       `${GLYPHS.WARNING} Please provide a hex color (e.g., #000000), Master.`
     );
-    if (isSlash) return context.reply({ embeds: [embed], ephemeral: true });
-    return context.reply({ embeds: [embed] });
+    return respond(context, { embeds: [embed] }, isSlash, true);
   }
 
   // Validate hex color
@@ -369,8 +400,7 @@ async function setOverlayColor(context, userId, guildId, value, prefix, isSlash 
       `◇ \`#1a1a2e\` - Dark Blue\n` +
       `◇ \`#2C2F33\` - Discord Dark`
     );
-    if (isSlash) return context.reply({ embeds: [embed], ephemeral: true });
-    return context.reply({ embeds: [embed] });
+    return respond(context, { embeds: [embed] }, isSlash, true);
   }
 
   const hexColor = value.startsWith('#') ? value.toLowerCase() : `#${value.toLowerCase()}`;
@@ -385,8 +415,7 @@ async function setOverlayColor(context, userId, guildId, value, prefix, isSlash 
     .setDescription(`${GLYPHS.SUCCESS} **Confirmed:** Set to \`${hexColor}\`, Master.`)
     .setFooter({ text: 'Applied to your profile and level cards.' });
 
-  if (isSlash) return context.reply({ embeds: [embed] });
-  return context.reply({ embeds: [embed] });
+  return respond(context, { embeds: [embed] }, isSlash);
 }
 
 // Set overlay opacity
@@ -395,8 +424,7 @@ async function setOverlayOpacity(context, userId, guildId, value, prefix, isSlas
     const embed = await errorEmbed(guildId, 'Missing Value',
       `${GLYPHS.WARNING} Please provide an opacity value (0-100), Master.`
     );
-    if (isSlash) return context.reply({ embeds: [embed], ephemeral: true });
-    return context.reply({ embeds: [embed] });
+    return respond(context, { embeds: [embed] }, isSlash, true);
   }
 
   const opacityPercent = parseInt(value);
@@ -409,8 +437,7 @@ async function setOverlayOpacity(context, userId, guildId, value, prefix, isSlas
       `◇ \`50\` - Half opacity\n` +
       `◇ \`100\` - Fully opaque`
     );
-    if (isSlash) return context.reply({ embeds: [embed], ephemeral: true });
-    return context.reply({ embeds: [embed] });
+    return respond(context, { embeds: [embed] }, isSlash, true);
   }
 
   const opacity = opacityPercent / 100;
@@ -424,6 +451,5 @@ async function setOverlayOpacity(context, userId, guildId, value, prefix, isSlas
     `Applied to your profile and level cards.`
   );
 
-  if (isSlash) return context.reply({ embeds: [embed] });
-  return context.reply({ embeds: [embed] });
+  return respond(context, { embeds: [embed] }, isSlash);
 }

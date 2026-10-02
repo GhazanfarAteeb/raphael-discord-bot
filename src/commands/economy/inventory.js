@@ -1,8 +1,31 @@
-import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType } from 'discord.js';
+import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, MessageFlags } from 'discord.js';
 import Economy from '../../models/Economy.js';
 import Guild from '../../models/Guild.js';
+import { errorEmbed, infoEmbed, COLORS } from '../../utils/embeds.js';
 import { getPrefix } from '../../utils/helpers.js';
 import { getRandomFooter } from '../../utils/raphael.js';
+
+// The inventory closes after this long without a button press
+const IDLE_TIMEOUT = 120_000;
+// Discord's embed description limit
+const MAX_DESCRIPTION = 4096;
+
+const relativeTime = (date) => (date ? `<t:${Math.floor(new Date(date).getTime() / 1000)}:R>` : 'Unknown');
+
+// Joins entries until the description limit, noting how many were left out
+function joinWithinLimit(entries, separator = '\n\n') {
+  const shown = [];
+  let length = 0;
+  for (const entry of entries) {
+    const remaining = entries.length - shown.length - 1;
+    const reserve = remaining > 0 ? 40 : 0; // room for the "and N more" line
+    if (length + separator.length + entry.length + reserve > MAX_DESCRIPTION) break;
+    shown.push(entry);
+    length += separator.length + entry.length;
+  }
+  const hidden = entries.length - shown.length;
+  return shown.join(separator) + (hidden > 0 ? `${separator}*...and ${hidden} more*` : '');
+}
 
 export default {
   name: 'inventory',
@@ -19,45 +42,50 @@ export default {
     try {
       const economy = await Economy.getEconomy(userId, guildId);
       const guildConfig = await Guild.getGuild(guildId);
+      const prefix = await getPrefix(guildId);
 
       const category = args[0]?.toLowerCase() || 'backgrounds';
+      const author = {
+        name: `${message.author.tag}'s Inventory`,
+        iconURL: message.author.displayAvatarURL()
+      };
 
       if (category === 'backgrounds' || category === 'bg') {
         // Filter out the default background from display
         const ownedBackgrounds = economy.inventory.backgrounds.filter(bg => bg.id !== 'default');
 
         if (ownedBackgrounds.length === 0) {
-          const prefix = await getPrefix(guildId);
-          return message.reply(`**Notice:** Your inventory is vacant, Master. Visit \`${prefix}shop\` to acquire assets.`);
+          return message.reply({
+            embeds: [await infoEmbed(guildId, 'Inventory Vacant',
+              `Your inventory is vacant, Master. Visit \`${prefix}shop\` to acquire assets.`)]
+          });
         }
 
         // Get shop items to find images
         const shopItems = guildConfig.customShopItems || [];
 
         let currentPage = 0;
+        let equippedId = economy.profile.background;
         const maxPages = ownedBackgrounds.length;
 
         const generateEmbed = (page) => {
           const bg = ownedBackgrounds[page];
-          const isEquipped = economy.profile.background === bg.id;
+          const isEquipped = equippedId === bg.id;
 
           // Find the image from shop items
           const shopItem = shopItems.find(item => item.id === bg.id);
           const imageUrl = shopItem?.image || bg.image || '';
 
           const embed = new EmbedBuilder()
-            .setColor('#00CED1')
-            .setAuthor({
-              name: `${message.author.tag}'s Inventory`,
-              iconURL: message.author.displayAvatarURL({ dynamic: true })
-            })
+            .setColor(COLORS.RAPHAEL)
+            .setAuthor(author)
             .setTitle(`『 ${bg.name} 』`)
             .addFields(
-              { name: '▸ Status', value: isEquipped ? '◉ **ACTIVE**' : '○ Inactive', inline: true },
-              { name: '▸ Acquired', value: `<t:${Math.floor(bg.purchasedAt.getTime() / 1000)}:R>`, inline: true }
+              { name: '▸ Status', value: isEquipped ? '◉ **ACTIVE**' : '◇ Inactive', inline: true },
+              { name: '▸ Acquired', value: relativeTime(bg.purchasedAt), inline: true }
             )
             .setFooter({
-              text: `${getRandomFooter()} | Item ${page + 1} of ${maxPages} | Use !setbg ${bg.id} to equip`
+              text: `${getRandomFooter()} | Item ${page + 1} of ${maxPages} | Use ${prefix}setbg ${bg.id} to equip`
             })
             .setTimestamp();
 
@@ -68,120 +96,132 @@ export default {
           return embed;
         };
 
-        const generateButtons = (page) => {
+        const generateButtons = (page, allDisabled = false) => {
           const bg = ownedBackgrounds[page];
-          const isEquipped = economy.profile.background === bg.id;
+          const isEquipped = equippedId === bg.id;
 
           return new ActionRowBuilder()
             .addComponents(
               new ButtonBuilder()
-                .setCustomId('previous')
-                .setLabel('◀ Previous')
+                .setCustomId('inventory_previous')
+                .setLabel('‹ Previous')
                 .setStyle(ButtonStyle.Secondary)
-                .setDisabled(page === 0),
+                .setDisabled(allDisabled || page === 0),
               new ButtonBuilder()
-                .setCustomId('equip')
+                .setCustomId('inventory_equip')
                 .setLabel(isEquipped ? '◉ Active' : 'Activate')
                 .setStyle(isEquipped ? ButtonStyle.Secondary : ButtonStyle.Success)
-                .setDisabled(isEquipped),
+                .setDisabled(allDisabled || isEquipped),
               new ButtonBuilder()
-                .setCustomId('next')
-                .setLabel('Next ▶')
+                .setCustomId('inventory_next')
+                .setLabel('Next ›')
                 .setStyle(ButtonStyle.Secondary)
-                .setDisabled(page === maxPages - 1)
+                .setDisabled(allDisabled || page === maxPages - 1)
             );
         };
 
-        const embed = generateEmbed(currentPage);
-        const buttons = generateButtons(currentPage);
-
         const invMessage = await message.reply({
-          embeds: [embed],
-          components: [buttons]
+          embeds: [generateEmbed(currentPage)],
+          components: [generateButtons(currentPage)]
         });
 
         const collector = invMessage.createMessageComponentCollector({
           componentType: ComponentType.Button,
-          filter: (i) => i.user.id === message.author.id,
-          time: 120000
+          idle: IDLE_TIMEOUT
         });
 
         collector.on('collect', async (interaction) => {
-          if (interaction.customId === 'previous') {
-            currentPage = Math.max(0, currentPage - 1);
-            await interaction.update({
-              embeds: [generateEmbed(currentPage)],
-              components: [generateButtons(currentPage)]
-            });
-          } else if (interaction.customId === 'next') {
-            currentPage = Math.min(maxPages - 1, currentPage + 1);
-            await interaction.update({
-              embeds: [generateEmbed(currentPage)],
-              components: [generateButtons(currentPage)]
-            });
-          } else if (interaction.customId === 'equip') {
-            const bg = ownedBackgrounds[currentPage];
-            economy.profile.background = bg.id;
-            await economy.save();
+          try {
+            if (interaction.user.id !== userId) {
+              return await interaction.reply({
+                content: `This inventory belongs to ${message.author.username}, Master. Use \`${prefix}inventory\` to view your own.`,
+                flags: MessageFlags.Ephemeral
+              });
+            }
+
+            if (interaction.customId === 'inventory_previous') {
+              currentPage = Math.max(0, currentPage - 1);
+            } else if (interaction.customId === 'inventory_next') {
+              currentPage = Math.min(maxPages - 1, currentPage + 1);
+            } else if (interaction.customId === 'inventory_equip') {
+              const bg = ownedBackgrounds[currentPage];
+              // Only equips a background the member still owns
+              const result = await Economy.updateOne(
+                { userId, guildId, 'inventory.backgrounds.id': bg.id },
+                { $set: { 'profile.background': bg.id } }
+              );
+              if (result.matchedCount === 0) {
+                return await interaction.reply({
+                  content: 'That background is no longer in your inventory, Master.',
+                  flags: MessageFlags.Ephemeral
+                });
+              }
+              equippedId = bg.id;
+            }
 
             await interaction.update({
               embeds: [generateEmbed(currentPage)],
               components: [generateButtons(currentPage)]
             });
+          } catch (error) {
+            console.error('[Inventory] Error handling button:', error);
+            const reply = { embeds: [await errorEmbed(guildId, 'Inventory Error', 'That action could not be processed, Master. Please try again.')], flags: MessageFlags.Ephemeral };
+            await (interaction.replied || interaction.deferred ? interaction.followUp(reply) : interaction.reply(reply)).catch(() => {});
           }
         });
 
         collector.on('end', () => {
-          invMessage.edit({ components: [] }).catch(() => { });
+          invMessage.edit({ components: [generateButtons(currentPage, true)] }).catch(() => { });
         });
 
       } else if (category === 'badges') {
+        const badges = economy.inventory.badges;
         const embed = new EmbedBuilder()
-          .setColor('#FFD700')
-          .setAuthor({
-            name: `${message.author.tag}'s Inventory`,
-            iconURL: message.author.displayAvatarURL({ dynamic: true })
-          })
-          .setTitle('🏅 Badges')
+          .setColor(COLORS.RAPHAEL_WARNING)
+          .setAuthor(author)
+          .setTitle('『 Badges 』')
           .setDescription(
-            economy.inventory.badges.length > 0
-              ? economy.inventory.badges.map((badge, i) =>
-                `${i + 1}. 🏅 **${badge.name}**\nEarned: <t:${Math.floor(badge.earnedAt.getTime() / 1000)}:R>`
-              ).join('\n\n')
-              : 'No badges earned yet! Complete achievements to earn badges.'
+            badges.length > 0
+              ? joinWithinLimit(badges.map((badge, i) =>
+                `${i + 1}. ◈ **${badge.name}**\nEarned: ${relativeTime(badge.earnedAt)}`
+              ))
+              : 'No badges earned yet, Master. Complete achievements to earn badges.'
           )
-          .setFooter({ text: `Total: ${economy.inventory.badges.length} badges` })
+          .setFooter({ text: `${getRandomFooter()} | Total: ${badges.length} badge${badges.length === 1 ? '' : 's'}` })
           .setTimestamp();
 
-        message.reply({ embeds: [embed] });
+        await message.reply({ embeds: [embed] });
 
       } else if (category === 'items') {
+        const items = economy.inventory.items;
         const embed = new EmbedBuilder()
-          .setColor('#3498DB')
-          .setAuthor({
-            name: `${message.author.tag}'s Inventory`,
-            iconURL: message.author.displayAvatarURL({ dynamic: true })
-          })
-          .setTitle('📦 Items')
+          .setColor(COLORS.RAPHAEL)
+          .setAuthor(author)
+          .setTitle('『 Items 』')
           .setDescription(
-            economy.inventory.items.length > 0
-              ? economy.inventory.items.map((item, i) =>
-                `${i + 1}. **${item.name}** x${item.quantity}\nPurchased: <t:${Math.floor(item.purchasedAt.getTime() / 1000)}:R>`
-              ).join('\n\n')
-              : 'No items yet!'
+            items.length > 0
+              ? joinWithinLimit(items.map((item, i) =>
+                `${i + 1}. **${item.name}** x${item.quantity}\nPurchased: ${relativeTime(item.purchasedAt)}`
+              ))
+              : 'No items acquired yet, Master.'
           )
-          .setFooter({ text: `Total: ${economy.inventory.items.length} item types` })
+          .setFooter({ text: `${getRandomFooter()} | Total: ${items.length} item type${items.length === 1 ? '' : 's'}` })
           .setTimestamp();
 
-        message.reply({ embeds: [embed] });
+        await message.reply({ embeds: [embed] });
 
       } else {
-        message.reply('**Error:** Invalid category specified. Use: `backgrounds`, `badges`, or `items`, Master.');
+        await message.reply({
+          embeds: [await errorEmbed(guildId, 'Invalid Category',
+            `Unknown category, Master. Use \`backgrounds\`, \`badges\`, or \`items\`.\n\n**Syntax:** \`${prefix}inventory [backgrounds/badges/items]\``)]
+        });
       }
 
     } catch (error) {
-      console.error('Inventory command error:', error);
-      message.reply('**Error:** An anomaly occurred while loading inventory data, Master.');
+      console.error('[Inventory] Error:', error);
+      return message.reply({
+        embeds: [await errorEmbed(guildId, 'Inventory Error', 'An anomaly occurred while loading inventory data, Master.')]
+      }).catch(() => {});
     }
   }
 };

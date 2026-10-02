@@ -62,6 +62,22 @@ export const DICE_MAX = 1000;
 export const ROULETTE_MIN = 10;
 export const ROULETTE_MAX = 5000;
 
+// Roulette payouts: total returned per coin wagered, stake included (single-zero wheel)
+export const ROULETTE_PAYOUTS = {
+    color: 2,     // red/black, 1:1
+    straight: 36  // a single number, including green (0), 35:1
+};
+
+// Trivia: coins per correct answer (inclusive), paid at most once per cooldown per member
+export const TRIVIA_REWARD = {
+    min: 50,
+    max: 150
+};
+export const TRIVIA_REWARD_COOLDOWN = 60; // seconds
+
+// Marriage proposals expire after this long (seconds)
+export const MARRIAGE_PROPOSAL_TIMEOUT = 60;
+
 // Default coin emoji (can be customized per server)
 export const DEFAULT_COIN_EMOJI = '💰';
 export const DEFAULT_COIN_NAME = 'coins';

@@ -1,5 +1,12 @@
-import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
+import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags } from 'discord.js';
 import Social from '../../models/Social.js';
+import { errorEmbed, infoEmbed, COLORS } from '../../utils/embeds.js';
+import { getRandomFooter } from '../../utils/raphael.js';
+
+// The member has this long to confirm
+const CONFIRM_TIMEOUT = 30_000;
+const MARRIAGE_FIELDS = { 'marriage.partnerId': 1, 'marriage.marriedAt': 1, 'marriage.proposedBy': 1 };
+const days = (count) => `${count} day${count === 1 ? '' : 's'}`;
 
 export default {
   name: 'divorce',
@@ -11,88 +18,117 @@ export default {
 
   async execute(message, args, client) {
     const guildId = message.guild.id;
-    const odId = message.author.id;
+    const userId = message.author.id;
 
     try {
-      const userSocial = await Social.getSocial(odId, guildId);
+      const userSocial = await Social.getSocial(userId, guildId);
 
       if (!userSocial.isMarried()) {
-        return message.reply('**Notice:** Analysis indicates you are not bound to anyone, Master.');
+        return message.reply({
+          embeds: [await infoEmbed(guildId, 'No Bond Detected', '**Notice:** Analysis indicates you are not bound to anyone, Master.')]
+        });
       }
 
       const partnerId = userSocial.marriage.partnerId;
       const partner = await client.users.fetch(partnerId).catch(() => null);
       const partnerName = partner?.username || 'your partner';
-      const marriageDays = userSocial.getMarriageDuration();
+      const marriageDays = userSocial.getMarriageDuration() ?? 0;
 
       const embed = new EmbedBuilder()
-        .setColor('#FF4757')
+        .setColor(COLORS.RAPHAEL_ERROR)
         .setTitle('『 Bond Dissolution Protocol 』')
-        .setDescription(`**Confirmation Required:**\n\nDo you wish to sever the bond with **${partnerName}**, Master?\n\n▸ **Duration:** ${marriageDays} days`)
-        .setFooter({ text: 'Warning: This action is irreversible.' });
+        .setDescription(`**Confirmation Required:**\n\nDo you wish to sever the bond with **${partnerName}**, Master?\n\n▸ **Duration:** ${days(marriageDays)}`)
+        .setFooter({ text: `${getRandomFooter()} | This action is irreversible` });
 
       const row = new ActionRowBuilder()
         .addComponents(
           new ButtonBuilder()
-            .setCustomId(`divorce_confirm_${odId}`)
+            .setCustomId(`divorce_confirm_${userId}`)
             .setLabel('Confirm Dissolution')
             .setStyle(ButtonStyle.Danger),
           new ButtonBuilder()
-            .setCustomId(`divorce_cancel_${odId}`)
+            .setCustomId(`divorce_cancel_${userId}`)
             .setLabel('Cancel')
             .setStyle(ButtonStyle.Secondary)
         );
 
       const confirmMsg = await message.reply({ embeds: [embed], components: [row] });
 
-      const filter = i => i.customId.startsWith('divorce_') && i.user.id === odId;
-
+      // Only the member who asked can confirm; anyone else is told so privately
       const collector = confirmMsg.createMessageComponentCollector({
-        filter,
-        time: 30000,
+        filter: (interaction) => {
+          if (interaction.user.id === userId) return true;
+          interaction.reply({
+            content: `Only ${message.author.username} can confirm this, Master.`,
+            flags: MessageFlags.Ephemeral
+          }).catch(() => {});
+          return false;
+        },
+        time: CONFIRM_TIMEOUT,
         max: 1
       });
 
       collector.on('collect', async interaction => {
-        if (interaction.customId.includes('confirm')) {
-          // Process divorce
-          const partnerSocial = await Social.getSocial(partnerId, guildId);
+        try {
+          if (!interaction.customId.startsWith('divorce_confirm_')) {
+            const cancelEmbed = new EmbedBuilder()
+              .setColor(COLORS.RAPHAEL_SUCCESS)
+              .setTitle('『 Protocol Cancelled 』')
+              .setDescription(`**Confirmed:** Bond with **${partnerName}** remains intact, Master.`)
+              .setFooter({ text: getRandomFooter() });
 
-          userSocial.marriage = undefined;
-          partnerSocial.marriage = undefined;
+            return await interaction.update({ embeds: [cancelEmbed], components: [] });
+          }
 
-          await userSocial.save();
-          await partnerSocial.save();
+          await interaction.deferUpdate();
+
+          // Only dissolves the bond the member was shown (it may have changed since)
+          const dissolved = await Social.findOneAndUpdate(
+            { odId: userId, guildId, 'marriage.partnerId': partnerId },
+            { $unset: MARRIAGE_FIELDS }
+          );
+          if (!dissolved) {
+            return await interaction.editReply({
+              embeds: [await infoEmbed(guildId, 'Bond Already Dissolved', `**Notice:** You are no longer bonded to **${partnerName}**, Master.`)],
+              components: []
+            });
+          }
+
+          // The partner's side is cleared only if it still points back at this member
+          await Social.updateOne(
+            { odId: partnerId, guildId, 'marriage.partnerId': userId },
+            { $unset: MARRIAGE_FIELDS }
+          );
 
           const divorceEmbed = new EmbedBuilder()
-            .setColor('#808080')
+            .setColor(COLORS.RAPHAEL)
             .setTitle('『 Bond Dissolved 』')
-            .setDescription(`**Confirmed:** The bond between **${message.author.username}** and **${partnerName}** has been severed.\n\n▸ **Duration:** ${marriageDays} days`)
-            .setFooter({ text: 'Acknowledged. May your paths diverge peacefully.' });
+            .setDescription(`**Confirmed:** The bond between **${message.author.username}** and **${partnerName}** has been severed.\n\n▸ **Duration:** ${days(marriageDays)}`)
+            .setFooter({ text: `${getRandomFooter()} | May your paths diverge peacefully` });
 
-          await interaction.update({ embeds: [divorceEmbed], components: [] });
+          await interaction.editReply({ embeds: [divorceEmbed], components: [] });
 
           // Notify partner if possible
           if (partner) {
             try {
               await partner.send({
                 embeds: [new EmbedBuilder()
-                  .setColor('#FF4757')
+                  .setColor(COLORS.RAPHAEL_ERROR)
                   .setTitle('『 Notification 』')
-                  .setDescription(`**Notice:** **${message.author.username}** has dissolved the bond in **${message.guild.name}**, Master.`)]
+                  .setDescription(`**Notice:** **${message.author.username}** has dissolved the bond in **${message.guild.name}**, Master.`)
+                  .setFooter({ text: getRandomFooter() })]
               });
             } catch (e) {
               // DMs disabled
             }
           }
-
-        } else {
-          const cancelEmbed = new EmbedBuilder()
-            .setColor('#00FF7F')
-            .setTitle('『 Protocol Cancelled 』')
-            .setDescription(`**Confirmed:** Bond with **${partnerName}** remains intact, Master.`);
-
-          await interaction.update({ embeds: [cancelEmbed], components: [] });
+        } catch (error) {
+          console.error('[Divorce] Error handling confirmation:', error);
+          const embed = await errorEmbed(guildId, 'Dissolution Error', 'An anomaly occurred during processing. Please try again, Master.');
+          await (interaction.deferred || interaction.replied
+            ? interaction.editReply({ embeds: [embed], components: [] })
+            : interaction.update({ embeds: [embed], components: [] })
+          ).catch(() => {});
         }
       });
 
@@ -103,8 +139,10 @@ export default {
       });
 
     } catch (error) {
-      console.error('Divorce command error:', error);
-      return message.reply('**Error:** An anomaly occurred during processing. Please try again, Master.');
+      console.error('[Divorce] Error:', error);
+      return message.reply({
+        embeds: [await errorEmbed(guildId, 'Dissolution Error', 'An anomaly occurred during processing. Please try again, Master.')]
+      }).catch(() => {});
     }
   }
 };
