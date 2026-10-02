@@ -66,14 +66,11 @@ export default class ServerData {
     }
   }
 
+  // Guild config and prefix go straight to Guild.getGuild, which already caches and is
+  // invalidated by Guild.updateGuild. A second cache here kept prefix, feature and
+  // command-channel changes from taking effect for up to 15 minutes.
   async getGuild(guildId, guildName = null) {
-    const cacheKey = `guild:${guildId}`;
-    const cached = this.getCached(cacheKey);
-    if (cached) return cached;
-
-    const guild = await this.Guild.getGuild(guildId, guildName);
-    this.setCache(cacheKey, guild);
-    return guild;
+    return this.Guild.getGuild(guildId, guildName);
   }
 
   async get(guildId) {
@@ -90,24 +87,12 @@ export default class ServerData {
   }
 
   async setPrefix(guildId, prefix) {
-    const guild = await this.Guild.getGuild(guildId);
-    guild.prefix = prefix;
-    await guild.save();
-
-    // Invalidate cache
-    this.cache.delete(`prefix:${guildId}`);
+    await this.Guild.updateGuild(guildId, { $set: { prefix } });
   }
 
   async getPrefix(guildId) {
-    const cacheKey = `prefix:${guildId}`;
-    const cached = this.getCached(cacheKey);
-    if (cached !== null) return cached;
-
     const guild = await this.Guild.getGuild(guildId);
-    const prefix = guild?.prefix || process.env.DEFAULT_PREFIX || '!';
-
-    this.setCache(cacheKey, prefix);
-    return prefix;
+    return guild?.prefix || process.env.DEFAULT_PREFIX || '!';
   }
 
   async set_247(guildId, textId, voiceId) {

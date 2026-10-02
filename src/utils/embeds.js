@@ -17,30 +17,33 @@ export const GLYPHS = {
     INFO: '◇',
     LOADING: '◎',
     
-    // Symbols
-    SHIELD: '🛡️',
-    HAMMER: '🔨',
-    EYE: '👁️',
-    RADAR: '📡',
-    LOCK: '🔒',
-    UNLOCK: '🔓',
-    KEY: '🔑',
-    CROWN: '👑',
-    STAR: '⭐',
-    SPARKLE: '✨',
+    // Symbols (plain glyphs: bot text never uses emoji)
+    SHIELD: '◈',
+    HAMMER: '◆',
+    EYE: '◉',
+    RADAR: '◉',
+    LOCK: '◆',
+    UNLOCK: '◇',
+    KEY: '◈',
+    CROWN: '◆',
+    STAR: '◈',
+    SPARKLE: '◇',
+    CALENDAR: '◇',
     
     // Member status
-    EGG: '🥚',
-    BABY: '👶',
-    ALERT: '🚨',
-    BELL: '🔔',
+    EGG: '◇',
+    BABY: '◇',
+    ALERT: '⚠',
+    BELL: '◈',
     
     // Moderation
-    BAN: '🔨',
-    KICK: '👢',
-    MUTE: '🔇',
-    WARN: '⚠️',
-    NOTE: '📝',
+    BAN: '◆',
+    KICK: '◆',
+    MUTE: '◆',
+    TIMEOUT: '◆',
+    UNTIMEOUT: '◇',
+    WARN: '⚠',
+    NOTE: '▸',
     
     // Dividers
     DOT: '•',
@@ -57,12 +60,27 @@ export const GLYPHS = {
     CORNER_BR: '┘',
     
     // Numbers
-    ONE: '1️⃣',
-    TWO: '2️⃣',
-    THREE: '3️⃣',
-    FOUR: '4️⃣',
-    FIVE: '5️⃣'
+    ONE: '1.',
+    TWO: '2.',
+    THREE: '3.',
+    FOUR: '4.',
+    FIVE: '5.'
 };
+
+// Earlier schema default; guilds that never chose a color still have it stored
+const LEGACY_DEFAULT_COLOR = '#5865F2';
+
+// A description that already opens with its own bold label or status glyph keeps it,
+// instead of stacking the helper's ("**Warning:** **Notice:** ...", "**Confirmed.** ◉ ...")
+const OWN_LEAD_IN = /^\s*(\*\*|[▸◂▴▾◉⚠◈◇◎•▪◆■›—])/;
+function withLeadIn(label, description) {
+    return OWN_LEAD_IN.test(description) ? description : `${label} ${description}`;
+}
+
+// Titles passed in already framed are not framed twice ("『 『 Title 』 』")
+function frameTitle(title) {
+    return String(title).trim().startsWith('『') ? title : `『 ${title} 』`;
+}
 
 // Color scheme
 export const COLORS = {
@@ -91,7 +109,9 @@ export async function createEmbed(guildId, type = 'info') {
         success: COLORS.RAPHAEL_SUCCESS,
         error: COLORS.RAPHAEL_ERROR,
         warning: COLORS.RAPHAEL_WARNING,
-        info: guild?.embedStyle?.color || COLORS.RAPHAEL,
+        info: guild?.embedStyle?.color && guild.embedStyle.color.toUpperCase() !== LEGACY_DEFAULT_COLOR
+            ? guild.embedStyle.color
+            : COLORS.RAPHAEL,
         primary: COLORS.RAPHAEL
     };
     
@@ -111,12 +131,10 @@ export async function createEmbed(guildId, type = 'info') {
 // Success embed - Raphael style
 export async function successEmbed(guildId, title, description) {
     const embed = await createEmbed(guildId, 'success');
-    const guildConfig = await Guild.getGuild(guildId);
-    const useGlyphs = guildConfig?.embedStyle?.useGlyphs !== false;
     
     // Raphael style: analytical title format
-    embed.setTitle(`『 ${title} 』`)
-        .setDescription(`**Confirmed.** ${description}`);
+    embed.setTitle(frameTitle(title));
+    if (description) embed.setDescription(withLeadIn('**Confirmed.**', description));
     
     return embed;
 }
@@ -124,8 +142,6 @@ export async function successEmbed(guildId, title, description) {
 // Error embed - Raphael style
 export async function errorEmbed(guildId, title = 'Alert', description) {
     const embed = await createEmbed(guildId, 'error');
-    const guildConfig = await Guild.getGuild(guildId);
-    const useGlyphs = guildConfig?.embedStyle?.useGlyphs !== false;
     
     // If only 2 parameters, treat second param as description
     if (description === undefined && title) {
@@ -134,10 +150,10 @@ export async function errorEmbed(guildId, title = 'Alert', description) {
     }
     
     // Raphael style: analytical alert format
-    embed.setTitle(`『 ${title} 』`);
+    embed.setTitle(frameTitle(title));
     
     if (description) {
-        embed.setDescription(`**Warning:** ${description}`);
+        embed.setDescription(withLeadIn('**Warning:**', description));
     }
     
     return embed;
@@ -146,12 +162,10 @@ export async function errorEmbed(guildId, title = 'Alert', description) {
 // Warning embed - Raphael style
 export async function warningEmbed(guildId, title, description) {
     const embed = await createEmbed(guildId, 'warning');
-    const guildConfig = await Guild.getGuild(guildId);
-    const useGlyphs = guildConfig?.embedStyle?.useGlyphs !== false;
     
     // Raphael style: caution format
-    embed.setTitle(`『 ${title} 』`)
-        .setDescription(`**Caution:** ${description}`);
+    embed.setTitle(frameTitle(title));
+    if (description) embed.setDescription(withLeadIn('**Caution:**', description));
     
     return embed;
 }
@@ -159,14 +173,12 @@ export async function warningEmbed(guildId, title, description) {
 // Info embed - Raphael style
 export async function infoEmbed(guildId, title, description) {
     const embed = await createEmbed(guildId, 'info');
-    const guildConfig = await Guild.getGuild(guildId);
-    const useGlyphs = guildConfig?.embedStyle?.useGlyphs !== false;
     
     // Raphael style: analysis format
-    embed.setTitle(`『 ${title} 』`);
+    embed.setTitle(frameTitle(title));
     
     if (description) {
-        embed.setDescription(`**Analysis:** ${description}`);
+        embed.setDescription(withLeadIn('**Analysis:**', description));
     }
     
     return embed;
@@ -175,20 +187,18 @@ export async function infoEmbed(guildId, title, description) {
 // Moderation log embed - Raphael style
 export async function modLogEmbed(guildId, action, data) {
     const embed = await createEmbed(guildId, 'info');
-    const guildConfig = await Guild.getGuild(guildId);
-    const useGlyphs = guildConfig?.embedStyle?.useGlyphs !== false;
     
-    const actionEmojis = {
+    const actionGlyphs = {
         warn: GLYPHS.WARN,
         mute: GLYPHS.MUTE,
         kick: GLYPHS.KICK,
         ban: GLYPHS.BAN,
+        timeout: GLYPHS.TIMEOUT,
+        untimeout: GLYPHS.UNTIMEOUT,
         note: GLYPHS.NOTE
     };
     
-    const emoji = useGlyphs ? (actionEmojis[action] || GLYPHS.HAMMER) : '';
-    
-    embed.setTitle(`${emoji} ${action.toUpperCase()} | Case #${data.caseNumber}`)
+    embed.setTitle(`${actionGlyphs[action] || GLYPHS.HAMMER} ${action.toUpperCase()} | Case #${data.caseNumber}`)
         .addFields(
             { name: `${GLYPHS.ARROW_RIGHT} User`, value: data.targetTag || 'Unknown', inline: true },
             { name: `${GLYPHS.ARROW_RIGHT} Moderator`, value: data.moderatorTag, inline: true },
@@ -208,7 +218,7 @@ export async function modLogEmbed(guildId, action, data) {
         const truncatedMessage = data.deletedMessage.length > 500 
             ? data.deletedMessage.substring(0, 497) + '...' 
             : data.deletedMessage;
-        embed.addFields({ name: `${GLYPHS.ERROR || '🗑️'} Deleted Message`, value: `\`\`\`${truncatedMessage}\`\`\`` });
+        embed.addFields({ name: `${GLYPHS.ERROR} Deleted Message`, value: `\`\`\`${truncatedMessage}\`\`\`` });
     }
     
     return embed;
@@ -217,10 +227,8 @@ export async function modLogEmbed(guildId, action, data) {
 // Sus alert embed
 export async function susAlertEmbed(guildId, member, memberData) {
     const embed = await createEmbed(guildId, 'warning');
-    const guildConfig = await Guild.getGuild(guildId);
-    const useGlyphs = guildConfig?.embedStyle?.useGlyphs !== false;
     
-    const title = `${useGlyphs ? GLYPHS.RADAR : '🚨'} SUSPICIOUS ACTIVITY DETECTED`;
+    const title = `${GLYPHS.ALERT} SUSPICIOUS ACTIVITY DETECTED`;
     
     embed.setTitle(title)
         .setDescription(`${GLYPHS.ALERT} Member **${member.user.tag}** has triggered the sus detection system.`)
@@ -250,11 +258,9 @@ export async function susAlertEmbed(guildId, member, memberData) {
 // New account alert embed
 export async function newAccountEmbed(guildId, member, accountAge) {
     const embed = await createEmbed(guildId, 'info');
-    const guildConfig = await Guild.getGuild(guildId);
-    const useGlyphs = guildConfig?.embedStyle?.useGlyphs !== false;
     
-    embed.setTitle(`${useGlyphs ? GLYPHS.EGG : '🥚'} New Account Detected`)
-        .setDescription(`${GLYPHS.BABY} **${member.user.tag}** has a very new account!`)
+    embed.setTitle(`${GLYPHS.EGG} New Account Detected`)
+        .setDescription(`${GLYPHS.ARROW_RIGHT} **${member.user.tag}** has a very new account, Master.`)
         .addFields(
             { name: `${GLYPHS.ARROW_RIGHT} User`, value: `${member.user.tag}\n\`${member.user.id}\``, inline: true },
             { name: `${GLYPHS.ARROW_RIGHT} Account Created`, value: `<t:${Math.floor(member.user.createdTimestamp / 1000)}:R>`, inline: true },

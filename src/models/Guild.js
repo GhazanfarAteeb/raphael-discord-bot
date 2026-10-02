@@ -325,7 +325,7 @@ const guildSchema = new mongoose.Schema({
     }]
   },
   embedStyle: {
-    color: { type: String, default: '#5865F2' },
+    color: { type: String, default: '#00CED1' },
     footer: String,
     timestamp: { type: Boolean, default: true },
     useGlyphs: { type: Boolean, default: true }

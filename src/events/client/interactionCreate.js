@@ -1,4 +1,4 @@
-import { Events, Collection, PermissionFlagsBits, MessageFlags, GuildOnboardingPromptType } from 'discord.js';
+import { Events, Collection, PermissionFlagsBits, MessageFlags, GuildOnboardingPromptType, ApplicationCommandOptionType } from 'discord.js';
 import logger from '../../utils/logger.js';
 import Guild from '../../models/Guild.js';
 import { hasModPerms, isServerAdmin, normalizeAntiNukeAction } from '../../utils/helpers.js';
@@ -92,29 +92,54 @@ export default {
     try {
       const startTime = Date.now();
 
-      // Parse slash command options into args array (do this before deferring)
+      // Flatten the options into prefix-style args: subcommand group, subcommand, then the
+      // option values in order, so "/goodbye channel #bye" reaches the command as
+      // "goodbye channel #bye". Users, channels and roles become mention strings and are
+      // also put in mentions.*, which is where the prefix commands look for them.
       const args = [];
-
-      // Handle different option types
-      for (const option of interaction.options.data) {
-        if (option.type === 6) { // USER type
-          const user = interaction.options.getUser(option.name);
-          if (user) args.push(`<@${user.id}>`); // Add as mention string for compatibility
-        } else if (option.value !== undefined) {
-          args.push(String(option.value));
+      const mentions = {
+        users: new Collection(),
+        members: new Collection(),
+        channels: new Collection(),
+        roles: new Collection()
+      };
+      const collectOptions = (options) => {
+        for (const option of options) {
+          switch (option.type) {
+            case ApplicationCommandOptionType.SubcommandGroup:
+            case ApplicationCommandOptionType.Subcommand:
+              args.push(option.name);
+              collectOptions(option.options ?? []);
+              break;
+            case ApplicationCommandOptionType.User:
+              args.push(`<@${option.value}>`);
+              if (option.user) mentions.users.set(option.user.id, option.user);
+              if (option.member?.roles) mentions.members.set(option.value, option.member);
+              break;
+            case ApplicationCommandOptionType.Channel:
+              args.push(`<#${option.value}>`);
+              if (option.channel) mentions.channels.set(option.value, option.channel);
+              break;
+            case ApplicationCommandOptionType.Role:
+              args.push(`<@&${option.value}>`);
+              if (option.role) mentions.roles.set(option.value, option.role);
+              break;
+            default:
+              if (option.value !== undefined) args.push(String(option.value));
+          }
         }
-      }
+      };
+      collectOptions(interaction.options.data);
 
       // Convert interaction to message-like object with Collection instead of Map
       const fakeMessage = {
         author: interaction.user,
+        client,
+        content: `/${interaction.commandName} ${args.join(' ')}`.trim(),
         guild: interaction.guild,
         channel: interaction.channel,
         member: interaction.member,
-        mentions: {
-          users: new Collection(),
-          members: new Collection()
-        },
+        mentions,
         reply: async (options) => {
           try {
             if (interaction.deferred || interaction.replied) {
@@ -131,17 +156,11 @@ export default {
       // Defer reply now, before heavy operations
       await interaction.deferReply().catch(() => { });
 
-      // Add mentioned users to fake message
-      for (const option of interaction.options.data) {
-        if (option.type === 6) { // USER type
-          const user = interaction.options.getUser(option.name);
-          if (user) {
-            fakeMessage.mentions.users.set(user.id, user);
-            if (interaction.guild) {
-              const member = await interaction.guild.members.fetch(user.id).catch(() => null);
-              if (member) fakeMessage.mentions.members.set(user.id, member);
-            }
-          }
+      // Resolve full members for mentioned users the interaction didn't include
+      for (const user of mentions.users.values()) {
+        if (!mentions.members.has(user.id) && interaction.guild) {
+          const member = await interaction.guild.members.fetch(user.id).catch(() => null);
+          if (member) mentions.members.set(user.id, member);
         }
       }
 
@@ -174,7 +193,7 @@ export default {
             }
 
             await interaction.editReply({
-              content: `⏰ **Cooldown Active**\n\n⏱️ Please wait **${timeString}** before using \`${command.name}\` again.\n\nAvailable <t:${Math.floor(expirationTime / 1000)}:R>`
+              content: `**Notice:** Cooldown active. Please wait **${timeString}** before using \`${command.name}\` again (available <t:${Math.floor(expirationTime / 1000)}:R>), Master.`
             });
             return;
           }
@@ -208,12 +227,13 @@ export default {
       logger.error(`Slash command execution failed: ${command.name}`, error);
       console.error(`Error executing ${interaction.commandName}:`, error);
 
-      const errorMessage = 'There was an error while executing this command!';
+      const errorMessage = '**Alert:** An anomaly occurred while executing this skill, Master. Please try again.';
 
+      // Replace the deferred "thinking" placeholder rather than leaving it hanging
       if (interaction.replied || interaction.deferred) {
-        await interaction.followUp({ content: errorMessage, flags: MessageFlags.Ephemeral });
+        await interaction.editReply({ content: errorMessage, embeds: [], components: [] }).catch(() => {});
       } else {
-        await interaction.reply({ content: errorMessage, flags: MessageFlags.Ephemeral });
+        await interaction.reply({ content: errorMessage, flags: MessageFlags.Ephemeral }).catch(() => {});
       }
     }
   },
