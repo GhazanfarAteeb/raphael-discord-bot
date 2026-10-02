@@ -1,6 +1,15 @@
-import { PermissionFlagsBits, ChannelType, EmbedBuilder } from 'discord.js';
+import { PermissionFlagsBits, ChannelType } from 'discord.js';
 import Guild from '../../models/Guild.js';
+import { successEmbed, errorEmbed, infoEmbed, GLYPHS } from '../../utils/embeds.js';
 import { getPrefix, hasModPerms } from '../../utils/helpers.js';
+
+const CHANNEL_ID = /^(?:<#)?(\d{17,20})>?$/;
+// Publishing other members' messages needs Manage Messages in the announcement channel
+const PUBLISH_PERMISSIONS = [PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageMessages];
+
+function describeChannel(guild, channelId) {
+  return guild.channels.cache.has(channelId) ? `<#${channelId}>` : `Deleted channel (\`${channelId}\`)`;
+}
 
 export default {
   name: 'autopublish',
@@ -11,128 +20,183 @@ export default {
   permissions: [PermissionFlagsBits.ManageGuild],
   cooldown: 5,
 
-  async execute(message, args, client) {
+  async execute(message, args) {
     const guildId = message.guild.id;
-    const prefix = await getPrefix(guildId);
-    const guildConfig = await Guild.getGuild(guildId);
 
-    // Check for moderator permissions (admin, mod role, or ManageGuild)
-    if (!hasModPerms(message.member, guildConfig)) {
-      const { errorEmbed, GLYPHS } = await import('../../utils/embeds.js');
+    try {
+      const prefix = await getPrefix(guildId);
+      const guildConfig = await Guild.getGuild(guildId);
+
+      // Check for moderator permissions (admin, mod role, or ManageGuild)
+      if (!hasModPerms(message.member, guildConfig)) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Permission Denied',
+            `${GLYPHS.LOCK} You need Moderator/Staff permissions to manage auto-publish.`)]
+        });
+      }
+
+      const settings = {
+        enabled: guildConfig.autoPublish?.enabled ?? false,
+        channels: guildConfig.autoPublish?.channels || []
+      };
+      const subCommand = args[0]?.toLowerCase();
+
+      switch (subCommand) {
+        case undefined:
+          return showHelp(message, settings, prefix);
+
+        case 'enable':
+          await Guild.updateGuild(guildId, { $set: { 'autoPublish.enabled': true } });
+          return message.reply({
+            embeds: [await successEmbed(guildId, 'Auto-Publish Activated',
+              `${GLYPHS.SUCCESS} Messages in configured announcement channels will be published automatically, Master.` +
+              (settings.channels.length === 0
+                ? `\n\nNo channels are configured yet. Add one with \`${prefix}autopublish add #channel\`.`
+                : ''))]
+          });
+
+        case 'disable':
+          await Guild.updateGuild(guildId, { $set: { 'autoPublish.enabled': false } });
+          return message.reply({
+            embeds: [await successEmbed(guildId, 'Auto-Publish Deactivated',
+              `${GLYPHS.SUCCESS} Auto-publish has been disabled, Master.`)]
+          });
+
+        case 'add':
+          return addChannel(message, args[1], settings, prefix);
+
+        case 'remove':
+          return removeChannel(message, args[1], settings, prefix);
+
+        case 'list':
+          return listChannels(message, settings, prefix);
+
+        default:
+          return message.reply({
+            embeds: [await errorEmbed(guildId, 'Unknown Subcommand',
+              `${GLYPHS.ERROR} Unknown subcommand. Use \`${prefix}autopublish\` for guidance, Master.`)]
+          });
+      }
+    } catch (error) {
+      console.error('[AutoPublish] Error:', error);
       return message.reply({
-        embeds: [await errorEmbed(guildId, 'Permission Denied',
-          `${GLYPHS.LOCK} You need Moderator/Staff permissions to manage auto-publish.`)]
-      });
-    }
-
-    const subCommand = args[0]?.toLowerCase();
-
-    if (!subCommand) {
-      const embed = new EmbedBuilder()
-        .setColor('#5865F2')
-        .setTitle('📢 Auto-Publish Announcements')
-        .setDescription('Automatically publish messages sent in announcement channels!')
-        .addFields(
-          { name: `${prefix}autopublish enable`, value: 'Enable auto-publish', inline: true },
-          { name: `${prefix}autopublish disable`, value: 'Disable auto-publish', inline: true },
-          { name: `${prefix}autopublish add #channel`, value: 'Add a channel', inline: true },
-          { name: `${prefix}autopublish remove #channel`, value: 'Remove a channel', inline: true },
-          { name: `${prefix}autopublish list`, value: 'List all channels', inline: true }
-        );
-
-      return message.reply({ embeds: [embed] });
-    }
-
-    switch (subCommand) {
-      case 'enable': {
-        await Guild.updateGuild(guildId, { $set: { 'autoPublish.enabled': true } });
-
-        const embed = new EmbedBuilder()
-          .setColor('#00FF7F')
-          .setTitle('『 Auto-Publish Activated 』')
-          .setDescription(`**Confirmed:** Messages in configured announcement channels will be automatically published, Master.\n\nUse \`${prefix}autopublish add #channel\` to add channels.`);
-
-        return message.reply({ embeds: [embed] });
-      }
-
-      case 'disable': {
-        await Guild.updateGuild(guildId, { $set: { 'autoPublish.enabled': false } });
-
-        const embed = new EmbedBuilder()
-          .setColor('#FFD700')
-          .setTitle('『 Auto-Publish Deactivated 』')
-          .setDescription('**Confirmed:** Auto-publish functionality has been disabled, Master.');
-
-        return message.reply({ embeds: [embed] });
-      }
-
-      case 'add': {
-        const channel = message.mentions.channels.first();
-
-        if (!channel) {
-          return message.reply(`**Error:** Please mention a channel. Usage: \`${prefix}autopublish add #channel\`, Master.`);
-        }
-
-        // Check if it's an announcement channel
-        if (channel.type !== ChannelType.GuildAnnouncement) {
-          return message.reply(`**Error:** ${channel} is not an announcement channel. Only channels with "Announcement" type are valid, Master.`);
-        }
-
-        if (guildConfig.autoPublish?.channels?.includes(channel.id)) {
-          return message.reply(`**Notice:** ${channel} is already in the auto-publish list, Master.`);
-        }
-
-        await Guild.updateGuild(guildId, { $push: { 'autoPublish.channels': channel.id } });
-
-        const embed = new EmbedBuilder()
-          .setColor('#00FF7F')
-          .setDescription(`**Confirmed:** Added ${channel} to auto-publish list. All messages will be automatically published, Master.`);
-
-        return message.reply({ embeds: [embed] });
-      }
-
-      case 'remove': {
-        const channel = message.mentions.channels.first();
-
-        if (!channel) {
-          return message.reply(`**Error:** Please mention a channel. Usage: \`${prefix}autopublish remove #channel\`, Master.`);
-        }
-
-        if (!guildConfig.autoPublish?.channels?.includes(channel.id)) {
-          return message.reply(`**Notice:** ${channel} is not in the auto-publish list, Master.`);
-        }
-
-        await Guild.updateGuild(guildId, { $pull: { 'autoPublish.channels': channel.id } });
-
-        const embed = new EmbedBuilder()
-          .setColor('#00FF7F')
-          .setDescription(`**Confirmed:** Removed ${channel} from auto-publish list, Master.`);
-
-        return message.reply({ embeds: [embed] });
-      }
-
-      case 'list': {
-        const channelList = guildConfig.autoPublish?.channels || [];
-        const channels = channelList.length > 0
-          ? channelList.map(id => {
-            const channel = message.guild.channels.cache.get(id);
-            return channel ? `<#${id}>` : `Unknown (${id})`;
-          }).join('\n')
-          : 'No channels configured';
-
-        const embed = new EmbedBuilder()
-          .setColor('#00CED1')
-          .setTitle('『 Auto-Publish Channels 』')
-          .addFields(
-            { name: '▸ Status', value: guildConfig.autoPublish?.enabled ? '◉ Active' : '○ Inactive', inline: true },
-            { name: '▸ Channels', value: channels }
-          );
-
-        return message.reply({ embeds: [embed] });
-      }
-
-      default:
-        return message.reply(`**Error:** Unknown subcommand. Use \`${prefix}autopublish\` for guidance, Master.`);
+        embeds: [await errorEmbed(guildId, 'Configuration Error',
+          'The auto-publish settings could not be updated, Master. Please try again.')]
+      }).catch(() => null);
     }
   }
 };
+
+async function showHelp(message, settings, prefix) {
+  const embed = await infoEmbed(message.guild.id, 'Auto-Publish Announcements',
+    `${GLYPHS.INFO} Automatically publish messages sent in announcement channels to following servers.\n\n` +
+    `${GLYPHS.ARROW_RIGHT} **Status:** ${settings.enabled ? 'Active' : 'Inactive'}\n` +
+    `${GLYPHS.ARROW_RIGHT} **Channels:** ${settings.channels.length}`);
+
+  embed.addFields({
+    name: `${GLYPHS.ARROW_RIGHT} Commands`,
+    value:
+      `\`${prefix}autopublish enable\` - Enable auto-publish\n` +
+      `\`${prefix}autopublish disable\` - Disable auto-publish\n` +
+      `\`${prefix}autopublish add #channel\` - Add an announcement channel\n` +
+      `\`${prefix}autopublish remove <#channel|channel_id>\` - Remove a channel\n` +
+      `\`${prefix}autopublish list\` - List all channels`
+  });
+
+  return message.reply({ embeds: [embed] });
+}
+
+async function addChannel(message, arg, settings, prefix) {
+  const guildId = message.guild.id;
+  const channel = message.mentions.channels.first() ||
+    message.guild.channels.cache.get(arg?.match(CHANNEL_ID)?.[1]);
+
+  if (!channel) {
+    return message.reply({
+      embeds: [await errorEmbed(guildId, 'No Channel',
+        `${GLYPHS.ERROR} Please mention a channel.\n\n**Usage:** \`${prefix}autopublish add #channel\``)]
+    });
+  }
+
+  if (channel.type !== ChannelType.GuildAnnouncement) {
+    return message.reply({
+      embeds: [await errorEmbed(guildId, 'Not an Announcement Channel',
+        `${GLYPHS.ERROR} ${channel} is not an announcement channel. Only channels of the "Announcement" type can be published, Master.`)]
+    });
+  }
+
+  if (settings.channels.includes(channel.id)) {
+    return message.reply({
+      embeds: [await infoEmbed(guildId, 'Already Added',
+        `${GLYPHS.INFO} ${channel} is already in the auto-publish list, Master.`)]
+    });
+  }
+
+  await Guild.updateGuild(guildId, { $addToSet: { 'autoPublish.channels': channel.id } });
+
+  const embed = await successEmbed(guildId, 'Channel Added',
+    `${GLYPHS.SUCCESS} Added ${channel} to the auto-publish list. Every message there will be published automatically, Master.` +
+    (settings.enabled ? '' : `\n\nAuto-publish is currently off. Turn it on with \`${prefix}autopublish enable\`.`));
+
+  const botPermissions = channel.permissionsFor?.(message.guild.members.me);
+  if (!botPermissions?.has(PUBLISH_PERMISSIONS)) {
+    embed.addFields({
+      name: `${GLYPHS.WARNING} Missing Permissions`,
+      value: `I need **Send Messages** and **Manage Messages** in ${channel} to publish other members' messages.`
+    });
+  }
+
+  return message.reply({ embeds: [embed] });
+}
+
+async function removeChannel(message, arg, settings, prefix) {
+  const guildId = message.guild.id;
+  // Raw IDs work too, so deleted channels can be removed
+  const channelId = message.mentions.channels.first()?.id || arg?.match(CHANNEL_ID)?.[1];
+
+  if (!channelId) {
+    return message.reply({
+      embeds: [await errorEmbed(guildId, 'No Channel',
+        `${GLYPHS.ERROR} Please mention a channel or give its ID.\n\n**Usage:** \`${prefix}autopublish remove <#channel|channel_id>\``)]
+    });
+  }
+
+  if (!settings.channels.includes(channelId)) {
+    return message.reply({
+      embeds: [await errorEmbed(guildId, 'Not Found',
+        `${GLYPHS.ERROR} ${describeChannel(message.guild, channelId)} is not in the auto-publish list, Master.`)]
+    });
+  }
+
+  // Also drop channels that were deleted since they were added
+  const stale = settings.channels.filter(id => id !== channelId && !message.guild.channels.cache.has(id));
+  await Guild.updateGuild(guildId, { $pull: { 'autoPublish.channels': { $in: [channelId, ...stale] } } });
+
+  return message.reply({
+    embeds: [await successEmbed(guildId, 'Channel Removed',
+      `${GLYPHS.SUCCESS} Removed ${describeChannel(message.guild, channelId)} from the auto-publish list, Master.` +
+      (stale.length ? `\n${GLYPHS.INFO} Also removed ${stale.length} deleted channel(s).` : ''))]
+  });
+}
+
+async function listChannels(message, settings, prefix) {
+  let channels = settings.channels.length
+    ? settings.channels.map(id => `${GLYPHS.DOT} ${describeChannel(message.guild, id)}`).join('\n')
+    : 'No channels configured';
+  if (channels.length > 1024) {
+    channels = `${channels.slice(0, 1000).replace(/\n[^\n]*$/, '')}\n— and more`;
+  }
+
+  const embed = await infoEmbed(message.guild.id, 'Auto-Publish Channels',
+    `${GLYPHS.ARROW_RIGHT} **Status:** ${settings.enabled ? 'Active' : 'Inactive'}`);
+  embed.addFields({ name: `${GLYPHS.ARROW_RIGHT} Channels (${settings.channels.length})`, value: channels });
+
+  if (settings.channels.some(id => !message.guild.channels.cache.has(id))) {
+    embed.addFields({
+      name: `${GLYPHS.WARNING} Deleted Channels`,
+      value: `Remove them with \`${prefix}autopublish remove <channel_id>\`.`
+    });
+  }
+
+  return message.reply({ embeds: [embed] });
+}

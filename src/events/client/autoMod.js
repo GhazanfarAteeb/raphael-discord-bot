@@ -4,11 +4,13 @@ import Member from '../../models/Member.js';
 import ModLog from '../../models/ModLog.js';
 import { errorEmbed, modLogEmbed, GLYPHS } from '../../utils/embeds.js';
 import { checkBadWords, checkBadWordsAdvanced, getWordSeverity, getBuiltInWordCount } from '../../utils/badWordsFilter.js';
+import { isWhitelistedHost } from '../../commands/config/automod.js';
 
 // Cache for tracking spam, mentions, etc.
 const messageCache = new Collection(); // userId -> { messages: [], lastMessage: Date }
 const mentionCache = new Collection(); // userId -> { count: number, lastMention: Date }
-const inviteRegex = /(discord\.(gg|io|me|li|link)|discordapp\.com\/invite|discord\.com\/invite)\/[a-zA-Z0-9]+/gi;
+// No "g" flag: a global regex keeps lastIndex between .test() calls and skips matches
+const inviteRegex = /(discord\.(gg|io|me|li|link)|discordapp\.com\/invite|discord\.com\/invite)\/[a-zA-Z0-9]+/i;
 const linkRegex = /https?:\/\/[^\s]+/gi;
 
 export default {
@@ -148,10 +150,8 @@ export default {
           const whitelistedDomains = getFeatureProp(autoMod.antiLinks, 'whitelistedDomains', []);
           const hasUnwhitelistedLink = links.some(link => {
             try {
-              const domain = new URL(link).hostname;
-              return !whitelistedDomains.some(
-                whitelisted => domain.includes(whitelisted)
-              );
+              // Exact domain or a subdomain of it: "youtube.com" must not allow "notyoutube.com"
+              return !isWhitelistedHost(new URL(link).hostname, whitelistedDomains);
             } catch {
               return true; // Invalid URL, treat as unwhitelisted
             }
@@ -199,26 +199,26 @@ async function handleViolation(message, client, guildConfig, type, reason, actio
     // Create a personalized warning message for the user
     const warningMessages = {
       badWords: [
-        `Hey **${user.username}**, please watch your language! 🚫`,
-        `**${user.username}**, that word isn't allowed here! Please be respectful. ⚠️`,
-        `Whoa there **${user.username}**! Let's keep it friendly. 🛑`,
-        `**${user.username}**, please keep the chat clean! 🧹`
+        `**${user.username}**, please watch your language.`,
+        `**${user.username}**, that word is not permitted here. Please be respectful.`,
+        `**${user.username}**, please keep the conversation civil.`,
+        `**${user.username}**, please keep the chat clean.`
       ],
       spam: [
-        `Slow down **${user.username}**! You're sending messages too fast. 🐢`,
-        `**${user.username}**, please don't spam the chat! ⏰`
+        `**${user.username}**, you are sending messages too quickly. Please slow down.`,
+        `**${user.username}**, please do not spam the chat.`
       ],
       massMention: [
-        `**${user.username}**, please don't mass mention users! 📢`,
-        `Easy on the mentions, **${user.username}**! 🔔`
+        `**${user.username}**, please do not mass mention users.`,
+        `**${user.username}**, please limit the number of mentions per message.`
       ],
       invite: [
-        `**${user.username}**, posting invite links isn't allowed here! 🔗`,
-        `No advertising please, **${user.username}**! 📝`
+        `**${user.username}**, posting invite links is not permitted here.`,
+        `**${user.username}**, advertising is not permitted here.`
       ],
       link: [
-        `**${user.username}**, that link isn't allowed here! 🔗`,
-        `**${user.username}**, please don't post unauthorized links! ⛔`
+        `**${user.username}**, that link is not permitted here.`,
+        `**${user.username}**, please do not post unauthorized links.`
       ]
     };
 

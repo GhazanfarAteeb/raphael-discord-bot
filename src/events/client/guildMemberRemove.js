@@ -3,7 +3,7 @@ import Member from '../../models/Member.js';
 import Guild from '../../models/Guild.js';
 import { infoEmbed, GLYPHS } from '../../utils/embeds.js';
 import { getRandomFooter } from '../../utils/raphael.js';
-import { parseLeaveMessage, buildLeaveEmbed } from '../../commands/config/goodbye.js';
+import { buildLeavePayload } from '../../commands/config/goodbye.js';
 
 export default {
   name: Events.GuildMemberRemove,
@@ -32,22 +32,13 @@ export default {
       // Get guild config
       const guildConfig = await Guild.getGuild(guildId);
 
-      // Send goodbye message if enabled
+      // Send goodbye message if enabled (same builder as the goodbye test and preview)
       const leaveSettings = guildConfig?.features?.leaveSystem;
       if (leaveSettings?.enabled && leaveSettings?.channel) {
         try {
           const goodbyeChannel = member.guild.channels.cache.get(leaveSettings.channel);
           if (goodbyeChannel) {
-            if (leaveSettings.embedEnabled !== false) {
-              const embed = buildLeaveEmbed(member, leaveSettings, guildConfig);
-              await goodbyeChannel.send({ embeds: [embed] });
-            } else {
-              const leaveMsg = parseLeaveMessage(
-                leaveSettings.message || 'Goodbye {username}! We hope to see you again.',
-                member
-              );
-              await goodbyeChannel.send(leaveMsg);
-            }
+            await goodbyeChannel.send(buildLeavePayload(member, leaveSettings, guildConfig));
           }
         } catch (error) {
           console.error('[GOODBYE] Error sending goodbye message:', error.message);

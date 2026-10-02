@@ -1,97 +1,86 @@
 import { PermissionFlagsBits, ChannelType } from 'discord.js';
 import Guild from '../../models/Guild.js';
 import { successEmbed, errorEmbed, GLYPHS } from '../../utils/embeds.js';
+import { getPrefix, hasAdminPerms } from '../../utils/helpers.js';
+
+// Each type and its aliases, with the config paths the channel is stored under
+const CHANNEL_TYPES = [
+  { names: ['modlog', 'mod'], label: 'Moderation Log', paths: ['channels.modLog'] },
+  {
+    names: ['alert', 'alerts', 'security'],
+    label: 'Alert Log',
+    paths: ['channels.alertLog', 'features.memberTracking.alertChannel', 'features.accountAge.alertChannel']
+  },
+  { names: ['join', 'joinlog', 'joins'], label: 'Join Log', paths: ['channels.joinLog'] }
+];
 
 export default {
   name: 'setchannel',
   description: 'Set log channels for different features',
-  usage: '<type> <#channel|channel_id>',
-  aliases: ['setlog'],
+  usage: '<modlog|alert|join> <#channel|channel_id>',
+  category: 'config',
   permissions: [PermissionFlagsBits.Administrator],
   cooldown: 3,
 
   async execute(message, args) {
-    const guild = await Guild.getGuild(message.guild.id, message.guild.name);
+    const guildId = message.guild.id;
 
-    // Check for admin role
-    const hasAdminRole = guild.roles.adminRoles?.some(roleId =>
-      message.member.roles.cache.has(roleId)
-    );
+    try {
+      const guild = await Guild.getGuild(guildId, message.guild.name);
+      const prefix = await getPrefix(guildId);
 
-    if (!message.member.permissions.has(PermissionFlagsBits.Administrator) && !hasAdminRole) {
+      if (!hasAdminPerms(message.member, guild)) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Permission Denied',
+            `${GLYPHS.LOCK} You need Administrator permissions to set channels.`)]
+        });
+      }
+
+      if (args.length < 2) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Invalid Usage',
+            `${GLYPHS.ARROW_RIGHT} Usage: \`${prefix}setchannel <type> <#channel|channel_id>\`\n\n` +
+            `**Types:**\n` +
+            `${GLYPHS.DOT} \`modlog\` - Moderation logs\n` +
+            `${GLYPHS.DOT} \`alert\` - Security alerts\n` +
+            `${GLYPHS.DOT} \`join\` - Join logs\n\n` +
+            `For every other log type, use \`${prefix}setlogs\`.`)]
+        });
+      }
+
+      const type = args[0].toLowerCase();
+      const channelType = CHANNEL_TYPES.find(t => t.names.includes(type));
+
+      if (!channelType) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Unknown Type',
+            `${GLYPHS.WARNING} Unknown channel type. Use \`modlog\`, \`alert\` or \`join\`.\n\n` +
+            `For every other log type, use \`${prefix}setlogs\`.`)]
+        });
+      }
+
+      const channelId = args[1].replace(/[<#>]/g, '');
+      const channel = message.guild.channels.cache.get(channelId);
+      if (!channel || channel.type !== ChannelType.GuildText) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Channel Not Found',
+            `${GLYPHS.ERROR} Could not find that text channel.`)]
+        });
+      }
+
+      const update = Object.fromEntries(channelType.paths.map(path => [path, channel.id]));
+      await Guild.updateGuild(guildId, { $set: update });
+
       return message.reply({
-        embeds: [await errorEmbed(message.guild.id, 'Permission Denied',
-          `${GLYPHS.LOCK} You need Administrator permissions to set channels.`)]
+        embeds: [await successEmbed(guildId, 'Channel Configured',
+          `${GLYPHS.SUCCESS} **${channelType.label}** channel set to ${channel}.`)]
       });
+    } catch (error) {
+      console.error('[SetChannel] Error:', error);
+      return message.reply({
+        embeds: [await errorEmbed(guildId, 'Configuration Error',
+          'The channel could not be saved, Master. Please try again.')]
+      }).catch(() => null);
     }
-
-    if (args.length < 2) {
-      const embed = await errorEmbed(message.guild.id, 'Invalid Usage',
-        `${GLYPHS.ARROW_RIGHT} Usage: \`setchannel <type> <#channel|channel_id>\`\n\n` +
-        `**Types:**\n` +
-        `${GLYPHS.DOT} \`modlog\` - Moderation logs\n` +
-        `${GLYPHS.DOT} \`alert\` - Security alerts\n` +
-        `${GLYPHS.DOT} \`join\` - Join/leave logs`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    const type = args[0].toLowerCase();
-    const channelId = args[1].replace(/[<#>]/g, '');
-
-    // Verify channel exists
-    const channel = message.guild.channels.cache.get(channelId);
-    if (!channel || channel.type !== ChannelType.GuildText) {
-      const embed = await errorEmbed(message.guild.id, 'Channel Not Found',
-        `${GLYPHS.ERROR} Could not find that text channel.`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    switch (type) {
-      case 'modlog':
-      case 'mod':
-        guild.channels.modLog = channelId;
-        await guild.save();
-        break;
-
-      case 'alert':
-      case 'alerts':
-      case 'security':
-        guild.channels.alertLog = channelId;
-        guild.features.memberTracking.alertChannel = channelId;
-        guild.features.accountAge.alertChannel = channelId;
-        await guild.save();
-        break;
-
-      case 'join':
-      case 'joinlog':
-      case 'joins':
-        guild.channels.joinLog = channelId;
-        await guild.save();
-        break;
-
-      default:
-        const embed = await errorEmbed(message.guild.id, 'Unknown Type',
-          `${GLYPHS.WARNING} Unknown channel type. Use: modlog, alert, or join`
-        );
-        return message.reply({ embeds: [embed] });
-    }
-
-    const typeNames = {
-      modlog: 'Moderation Log',
-      mod: 'Moderation Log',
-      alert: 'Alert Log',
-      alerts: 'Alert Log',
-      security: 'Alert Log',
-      join: 'Join/Leave Log',
-      joinlog: 'Join/Leave Log',
-      joins: 'Join/Leave Log'
-    };
-
-    const embed = await successEmbed(message.guild.id, 'Channel Configured',
-      `${GLYPHS.ARROW_RIGHT} **${typeNames[type]}** channel set to ${channel}`
-    );
-    return message.reply({ embeds: [embed] });
   }
 };

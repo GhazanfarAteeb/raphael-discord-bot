@@ -1,7 +1,14 @@
-import { EmbedBuilder, PermissionFlagsBits, ChannelType } from 'discord.js';
+import { PermissionFlagsBits, ChannelType } from 'discord.js';
 import Guild from '../../models/Guild.js';
 import { successEmbed, errorEmbed, infoEmbed, GLYPHS } from '../../utils/embeds.js';
 import { getPrefix, hasModPerms } from '../../utils/helpers.js';
+
+const PATH = 'features.levelSystem.noXpChannels';
+const CHANNEL_ID = /^(?:<#)?(\d{17,20})>?$/;
+
+function describeChannel(guild, channelId) {
+  return guild.channels.cache.has(channelId) ? `<#${channelId}>` : `Deleted channel (\`${channelId}\`)`;
+}
 
 export default {
   name: 'noxp',
@@ -14,185 +21,172 @@ export default {
 
   async execute(message, args) {
     const guildId = message.guild.id;
-    const guildConfig = await Guild.getGuild(guildId);
 
-    // Check for moderator permissions (admin, mod role, or ManageGuild)
-    if (!hasModPerms(message.member, guildConfig)) {
+    try {
+      const guildConfig = await Guild.getGuild(guildId);
+
+      // Check for moderator permissions (admin, mod role, or ManageGuild)
+      if (!hasModPerms(message.member, guildConfig)) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Permission Denied',
+            `${GLYPHS.LOCK} You need Moderator/Staff permissions to manage XP channels.`)]
+        });
+      }
+
+      const ctx = {
+        message,
+        guildId,
+        prefix: await getPrefix(guildId),
+        channels: guildConfig.features?.levelSystem?.noXpChannels || []
+      };
+
+      switch (args[0]?.toLowerCase()) {
+        case 'add':
+          return addChannel(ctx, args[1]);
+        case 'remove':
+        case 'delete':
+          return removeChannel(ctx, args[1]);
+        case 'list':
+        case 'show':
+          return listChannels(ctx);
+        case 'clear':
+          return clearChannels(ctx);
+        default:
+          return showHelp(ctx);
+      }
+    } catch (error) {
+      console.error('[NoXP] Error:', error);
       return message.reply({
-        embeds: [await errorEmbed(guildId, 'Permission Denied',
-          `${GLYPHS.LOCK} You need Moderator/Staff permissions to manage XP channels.`)]
-      });
+        embeds: [await errorEmbed(guildId, 'Configuration Error',
+          'The no-XP channel list could not be updated, Master. Please try again.')]
+      }).catch(() => null);
     }
-
-    const subCommand = args[0]?.toLowerCase();
-
-    // Initialize noXpChannels array if not exists
-    if (!guildConfig.features.levelSystem.noXpChannels) {
-      guildConfig.features.levelSystem.noXpChannels = [];
-    }
-
-    // No args - show help
-    if (!subCommand) {
-      return this.showHelp(message, guildId, guildConfig);
-    }
-
-    switch (subCommand) {
-      case 'add':
-        return this.addChannel(message, args.slice(1), guildConfig, guildId);
-      case 'remove':
-      case 'delete':
-        return this.removeChannel(message, args.slice(1), guildConfig, guildId);
-      case 'list':
-      case 'show':
-        return this.listChannels(message, guildConfig, guildId);
-      case 'clear':
-        return this.clearChannels(message, guildConfig, guildId);
-      default:
-        return this.showHelp(message, guildId, guildConfig);
-    }
-  },
-
-  async showHelp(message, guildId, guildConfig) {
-    const channels = guildConfig.features.levelSystem.noXpChannels || [];
-    const prefix = await getPrefix(guildId);
-
-    const embed = new EmbedBuilder()
-      .setColor('#5865F2')
-      .setTitle('🚫 No-XP Channels')
-      .setDescription(
-        `**Blacklisted Channels:** ${channels.length}\n\n` +
-        `Messages in these channels won't earn XP.\n\n` +
-        `**Commands:**\n` +
-        `${GLYPHS.ARROW_RIGHT} \`${prefix}noxp add #channel\` - Blacklist channel\n` +
-        `${GLYPHS.ARROW_RIGHT} \`${prefix}noxp remove #channel\` - Remove from blacklist\n` +
-        `${GLYPHS.ARROW_RIGHT} \`${prefix}noxp list\` - View blacklisted channels\n` +
-        `${GLYPHS.ARROW_RIGHT} \`${prefix}noxp clear\` - Clear all\n\n` +
-        `**Example:**\n` +
-        `\`${prefix}noxp add #spam\`\n` +
-        `\`${prefix}noxp add #bot-commands\``
-      )
-      .setFooter({ text: 'Great for spam/bot command channels!' })
-      .setTimestamp();
-
-    return message.reply({ embeds: [embed] });
-  },
-
-  async addChannel(message, args, guildConfig, guildId) {
-    const channel = message.mentions.channels.first() ||
-      message.guild.channels.cache.get(args[0]);
-    const prefix = await getPrefix(guildId);
-
-    if (!channel) {
-      const embed = await errorEmbed(guildId, 'No Channel',
-        `${GLYPHS.ERROR} Please mention a channel or provide a channel ID.\n\n` +
-        `**Usage:** \`${prefix}noxp add #channel\``
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    if (channel.type !== ChannelType.GuildText) {
-      const embed = await errorEmbed(guildId, 'Invalid Channel',
-        `${GLYPHS.ERROR} Please select a text channel.`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    // Check if already blacklisted
-    if (guildConfig.features.levelSystem.noXpChannels.includes(channel.id)) {
-      const embed = await errorEmbed(guildId, 'Already Blacklisted',
-        `${GLYPHS.ERROR} ${channel} is already blacklisted from earning XP.`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    await Guild.updateGuild(guildId, {
-      $push: { 'features.levelSystem.noXpChannels': channel.id }
-    });
-
-    const embed = await successEmbed(guildId, 'Channel Blacklisted',
-      `${GLYPHS.SUCCESS} ${channel} has been added to the no-XP list.\n\n` +
-      `Messages in this channel will no longer earn XP.`
-    );
-    return message.reply({ embeds: [embed] });
-  },
-
-  async removeChannel(message, args, guildConfig, guildId) {
-    const channel = message.mentions.channels.first() ||
-      message.guild.channels.cache.get(args[0]);
-    const prefix = await getPrefix(guildId);
-
-    if (!channel) {
-      const embed = await errorEmbed(guildId, 'No Channel',
-        `${GLYPHS.ERROR} Please mention a channel or provide a channel ID.\n\n` +
-        `**Usage:** \`${prefix}noxp remove #channel\``
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    const index = guildConfig.features.levelSystem.noXpChannels.indexOf(channel.id);
-
-    if (index === -1) {
-      const embed = await errorEmbed(guildId, 'Not Blacklisted',
-        `${GLYPHS.ERROR} ${channel} is not in the no-XP list.`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    await Guild.updateGuild(guildId, {
-      $pull: { 'features.levelSystem.noXpChannels': channel.id }
-    });
-
-    const embed = await successEmbed(guildId, 'Channel Removed',
-      `${GLYPHS.SUCCESS} ${channel} has been removed from the no-XP list.\n\n` +
-      `Messages in this channel will now earn XP again.`
-    );
-    return message.reply({ embeds: [embed] });
-  },
-
-  async listChannels(message, guildConfig, guildId) {
-    const channels = guildConfig.features.levelSystem.noXpChannels || [];
-    const prefix = await getPrefix(guildId);
-
-    if (channels.length === 0) {
-      const embed = await infoEmbed(guildId, 'No Blacklisted Channels',
-        `${GLYPHS.INFO} No channels are blacklisted from earning XP.\n\n` +
-        `Use \`${prefix}noxp add #channel\` to add one!`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    const channelList = channels.map(id => {
-      const channel = message.guild.channels.cache.get(id);
-      return channel ? `${GLYPHS.ARROW_RIGHT} ${channel}` : `${GLYPHS.ARROW_RIGHT} <Deleted Channel>`;
-    }).join('\n');
-
-    const embed = new EmbedBuilder()
-      .setColor('#5865F2')
-      .setTitle('🚫 No-XP Channels')
-      .setDescription(
-        `**Blacklisted Channels:**\n\n${channelList}`
-      )
-      .setFooter({ text: `${channels.length} channel(s) blacklisted` })
-      .setTimestamp();
-
-    return message.reply({ embeds: [embed] });
-  },
-
-  async clearChannels(message, guildConfig, guildId) {
-    if (guildConfig.features.levelSystem.noXpChannels.length === 0) {
-      const embed = await errorEmbed(guildId, 'No Channels',
-        `${GLYPHS.ERROR} There are no blacklisted channels to clear.`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    await Guild.updateGuild(guildId, {
-      $set: { 'features.levelSystem.noXpChannels': [] }
-    });
-
-    const embed = await successEmbed(guildId, 'Channels Cleared',
-      `${GLYPHS.SUCCESS} All channels have been removed from the no-XP list.`
-    );
-    return message.reply({ embeds: [embed] });
   }
 };
+
+async function showHelp({ message, guildId, prefix, channels }) {
+  const embed = await infoEmbed(guildId, 'No-XP Channels',
+    `${GLYPHS.INFO} Messages in these channels do not earn XP. Useful for spam and bot-command channels.\n\n` +
+    `${GLYPHS.ARROW_RIGHT} **Blacklisted Channels:** ${channels.length}`);
+
+  embed.addFields(
+    {
+      name: `${GLYPHS.ARROW_RIGHT} Commands`,
+      value:
+        `\`${prefix}noxp add #channel\` - Blacklist a channel\n` +
+        `\`${prefix}noxp remove <#channel|channel_id>\` - Remove from the blacklist\n` +
+        `\`${prefix}noxp list\` - View blacklisted channels\n` +
+        `\`${prefix}noxp clear\` - Clear the blacklist`
+    },
+    {
+      name: `${GLYPHS.ARROW_RIGHT} Examples`,
+      value: `\`${prefix}noxp add #spam\`\n\`${prefix}noxp add #bot-commands\``
+    }
+  );
+
+  return message.reply({ embeds: [embed] });
+}
+
+async function addChannel({ message, guildId, prefix, channels }, arg) {
+  const channel = message.mentions.channels.first() ||
+    message.guild.channels.cache.get(arg?.match(CHANNEL_ID)?.[1]);
+
+  if (!channel) {
+    return message.reply({
+      embeds: [await errorEmbed(guildId, 'No Channel',
+        `${GLYPHS.ERROR} Please mention a channel or provide a channel ID.\n\n` +
+        `**Usage:** \`${prefix}noxp add #channel\``)]
+    });
+  }
+
+  if (channel.type !== ChannelType.GuildText) {
+    return message.reply({
+      embeds: [await errorEmbed(guildId, 'Invalid Channel',
+        `${GLYPHS.ERROR} Please select a text channel.`)]
+    });
+  }
+
+  if (channels.includes(channel.id)) {
+    return message.reply({
+      embeds: [await infoEmbed(guildId, 'Already Blacklisted',
+        `${GLYPHS.INFO} ${channel} is already blacklisted from earning XP.`)]
+    });
+  }
+
+  await Guild.updateGuild(guildId, { $addToSet: { [PATH]: channel.id } });
+
+  return message.reply({
+    embeds: [await successEmbed(guildId, 'Channel Blacklisted',
+      `${GLYPHS.SUCCESS} ${channel} has been added to the no-XP list.\n\n` +
+      `Messages in this channel will no longer earn XP.`)]
+  });
+}
+
+async function removeChannel({ message, guildId, prefix, channels }, arg) {
+  // Raw IDs work too, so deleted channels can be removed
+  const channelId = message.mentions.channels.first()?.id || arg?.match(CHANNEL_ID)?.[1];
+
+  if (!channelId) {
+    return message.reply({
+      embeds: [await errorEmbed(guildId, 'No Channel',
+        `${GLYPHS.ERROR} Please mention a channel or provide a channel ID.\n\n` +
+        `**Usage:** \`${prefix}noxp remove <#channel|channel_id>\``)]
+    });
+  }
+
+  if (!channels.includes(channelId)) {
+    return message.reply({
+      embeds: [await errorEmbed(guildId, 'Not Blacklisted',
+        `${GLYPHS.ERROR} ${describeChannel(message.guild, channelId)} is not in the no-XP list.`)]
+    });
+  }
+
+  await Guild.updateGuild(guildId, { $pull: { [PATH]: channelId } });
+
+  return message.reply({
+    embeds: [await successEmbed(guildId, 'Channel Removed',
+      `${GLYPHS.SUCCESS} ${describeChannel(message.guild, channelId)} has been removed from the no-XP list.` +
+      (message.guild.channels.cache.has(channelId) ? '\n\nMessages in this channel will now earn XP again.' : ''))]
+  });
+}
+
+async function listChannels({ message, guildId, prefix, channels }) {
+  if (channels.length === 0) {
+    return message.reply({
+      embeds: [await infoEmbed(guildId, 'No Blacklisted Channels',
+        `${GLYPHS.INFO} No channels are blacklisted from earning XP.\n\n` +
+        `Use \`${prefix}noxp add #channel\` to add one.`)]
+    });
+  }
+
+  let channelList = channels.map(id => `${GLYPHS.ARROW_RIGHT} ${describeChannel(message.guild, id)}`).join('\n');
+  if (channelList.length > 4000) {
+    channelList = `${channelList.slice(0, 3980).replace(/\n[^\n]*$/, '')}\n— and more`;
+  }
+
+  const embed = await infoEmbed(guildId, `No-XP Channels (${channels.length})`, channelList);
+  if (channels.some(id => !message.guild.channels.cache.has(id))) {
+    embed.addFields({
+      name: `${GLYPHS.WARNING} Deleted Channels`,
+      value: `Remove them with \`${prefix}noxp remove <channel_id>\`.`
+    });
+  }
+
+  return message.reply({ embeds: [embed] });
+}
+
+async function clearChannels({ message, guildId, channels }) {
+  if (channels.length === 0) {
+    return message.reply({
+      embeds: [await infoEmbed(guildId, 'Nothing to Clear',
+        `${GLYPHS.INFO} There are no blacklisted channels to clear.`)]
+    });
+  }
+
+  await Guild.updateGuild(guildId, { $set: { [PATH]: [] } });
+
+  return message.reply({
+    embeds: [await successEmbed(guildId, 'Channels Cleared',
+      `${GLYPHS.SUCCESS} All ${channels.length} channel(s) have been removed from the no-XP list.`)]
+  });
+}

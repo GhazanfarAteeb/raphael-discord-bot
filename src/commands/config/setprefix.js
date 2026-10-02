@@ -1,54 +1,64 @@
 import { PermissionFlagsBits } from 'discord.js';
 import Guild from '../../models/Guild.js';
-import { successEmbed, errorEmbed, GLYPHS } from '../../utils/embeds.js';
-import { getPrefix } from '../../utils/helpers.js';
+import { successEmbed, errorEmbed, infoEmbed, GLYPHS } from '../../utils/embeds.js';
+import { hasAdminPerms } from '../../utils/helpers.js';
+
+const MAX_PREFIX_LENGTH = 5;
 
 export default {
   name: 'setprefix',
   description: 'Change the bot prefix for this server',
   usage: '<new_prefix>',
+  category: 'config',
   aliases: ['prefix'],
   permissions: [PermissionFlagsBits.Administrator],
   cooldown: 5,
 
   async execute(message, args) {
-    const guild = await Guild.getGuild(message.guild.id, message.guild.name);
+    const guildId = message.guild.id;
 
-    // Check for admin role
-    const hasAdminRole = guild.roles.adminRoles?.some(roleId =>
-      message.member.roles.cache.has(roleId)
-    );
+    try {
+      const guild = await Guild.getGuild(guildId, message.guild.name);
+      const currentPrefix = guild.prefix || process.env.DEFAULT_PREFIX || '!';
 
-    if (!message.member.permissions.has(PermissionFlagsBits.Administrator) && !hasAdminRole) {
+      // No argument (e.g. `prefix` on its own): report the current prefix
+      if (!args[0]) {
+        return message.reply({
+          embeds: [await infoEmbed(guildId, 'Server Prefix',
+            `${GLYPHS.ARROW_RIGHT} The current prefix is \`${currentPrefix}\`, Master.\n` +
+            `${GLYPHS.ARROW_RIGHT} Change it with \`${currentPrefix}setprefix <new_prefix>\` (up to ${MAX_PREFIX_LENGTH} characters).`)]
+        });
+      }
+
+      if (!hasAdminPerms(message.member, guild)) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Permission Denied',
+            `${GLYPHS.LOCK} You need Administrator permissions to change the prefix.`)]
+        });
+      }
+
+      const newPrefix = args[0];
+
+      if (newPrefix.length > MAX_PREFIX_LENGTH) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Prefix Too Long',
+            `${GLYPHS.WARNING} The prefix must be ${MAX_PREFIX_LENGTH} characters or fewer.`)]
+        });
+      }
+
+      await Guild.updateGuild(guildId, { $set: { prefix: newPrefix } });
+
       return message.reply({
-        embeds: [await errorEmbed(message.guild.id, 'Permission Denied',
-          `${GLYPHS.LOCK} You need Administrator permissions to change the prefix.`)]
+        embeds: [await successEmbed(guildId, 'Prefix Updated',
+          `${GLYPHS.SUCCESS} The server prefix is now \`${newPrefix}\`.\n` +
+          `${GLYPHS.ARROW_RIGHT} Example: \`${newPrefix}help\``)]
       });
+    } catch (error) {
+      console.error('[SetPrefix] Error:', error);
+      return message.reply({
+        embeds: [await errorEmbed(guildId, 'Configuration Error',
+          'The prefix could not be updated, Master. Please try again.')]
+      }).catch(() => null);
     }
-
-    if (!args[0]) {
-      const embed = await errorEmbed(message.guild.id, 'Invalid Usage',
-        `${GLYPHS.ARROW_RIGHT} Usage: \`${await getPrefix(message.guild.id)}setprefix <new_prefix>\``
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    const newPrefix = args[0];
-
-    if (newPrefix.length > 5) {
-      const embed = await errorEmbed(message.guild.id, 'Prefix Too Long',
-        `${GLYPHS.WARNING} Prefix must be 5 characters or less.`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    guild.prefix = newPrefix;
-    await guild.save();
-
-    const embed = await successEmbed(message.guild.id, 'Prefix Updated',
-      `${GLYPHS.ARROW_RIGHT} Server prefix has been changed to: \`${newPrefix}\``
-    );
-
-    return message.reply({ embeds: [embed] });
   }
 };

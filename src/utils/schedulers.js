@@ -4,100 +4,139 @@ import Event from '../models/Event.js';
 import Guild from '../models/Guild.js';
 import BoosterRole from '../models/BoosterRole.js';
 import { infoEmbed, GLYPHS } from '../utils/embeds.js';
+import { buildBirthdayMessage, getAnnouncedAge, sendBirthdayAnnouncement } from '../commands/config/birthdayconfig.js';
 import { checkGiveaways } from '../events/client/giveawayHandler.js';
 import { checkReminders } from '../events/client/reminderHandler.js';
 import { cleanupTempChannels } from '../events/client/tempVoiceHandler.js';
 
+const FEB = 2;
+const LEAP_DAY = 29;
+const MAX_CONTENT_LENGTH = 2000;
+const MAX_FIELD_LENGTH = 1024;
+
+function isLeapYear(year) {
+  return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+}
+
+// Today's birthdays; Feb 29 birthdays are celebrated on Feb 28 in non-leap years
+async function getBirthdaysToCelebrate(guildId, today) {
+  const birthdays = await Birthday.getTodaysBirthdays(guildId);
+  const isFeb28 = today.getMonth() + 1 === FEB && today.getDate() === 28;
+
+  if (isFeb28 && !isLeapYear(today.getFullYear())) {
+    const leapDay = await Birthday.find({
+      guildId,
+      displayBirthday: true,
+      'birthday.month': FEB,
+      'birthday.day': LEAP_DAY
+    });
+    birthdays.push(...leapDay);
+  }
+
+  return birthdays;
+}
+
+function getBirthdayChannel(guild, guildConfig) {
+  const ids = [guildConfig.features?.birthdaySystem?.channel, guildConfig.channels?.birthdayChannel];
+  for (const id of ids) {
+    const channel = id ? guild.channels.cache.get(id) : null;
+    if (channel) return channel;
+  }
+  return null;
+}
+
+async function giveBirthdayRole(guild, member, guildConfig) {
+  const roleId = guildConfig.roles?.birthdayRole || guildConfig.features?.birthdaySystem?.role;
+  if (!roleId) return false;
+
+  const role = guild.roles.cache.get(roleId);
+  if (!role || member.roles.cache.has(role.id)) return false;
+  if (!role.editable) {
+    console.warn(`[Birthday] Cannot assign birthday role ${role.id} in ${guild.id}: it is above my highest role or managed.`);
+    return false;
+  }
+
+  await member.roles.add(role, 'Birthday');
+  return true;
+}
+
+async function celebrateBirthday(guild, guildConfig, channel, birthday, today) {
+  // celebrationPreference: public (default) = role + announcement, dm = role + DM,
+  // role = role only, none = no celebration
+  const preference = birthday.celebrationPreference || 'public';
+  if (preference === 'none') return false;
+
+  const member = await guild.members.fetch(birthday.userId).catch(() => null);
+  if (!member) return false;
+
+  let celebrated = false;
+
+  // The role is independent of the announcement: a role failure must not skip the message
+  try {
+    celebrated = await giveBirthdayRole(guild, member, guildConfig) || celebrated;
+  } catch (error) {
+    console.error(`[Birthday] Failed to give birthday role to ${birthday.userId}:`, error.message);
+  }
+
+  if (preference === 'public' && channel) {
+    celebrated = await sendBirthdayAnnouncement({ channel, member, guildConfig, birthday, date: today }) || celebrated;
+  }
+
+  if (preference === 'dm') {
+    try {
+      await member.send(buildBirthdayMessage(member, guildConfig, {
+        age: getAnnouncedAge(birthday, guildConfig, today),
+        customMessage: birthday.customMessage,
+        silent: true
+      }));
+      celebrated = true;
+    } catch {
+      console.log(`Could not DM birthday user: ${birthday.userId}`);
+    }
+  }
+
+  return celebrated;
+}
+
 // Check birthdays every day at midnight
 export function startBirthdayChecker(client) {
   cron.schedule('0 0 * * *', async () => {
-    console.log('🎂 Checking birthdays...');
+    console.log('[RAPHAEL] Checking birthdays...');
 
     try {
-      // Get all guilds
       const guilds = await Guild.find({ 'features.birthdaySystem.enabled': true });
 
       for (const guildConfig of guilds) {
         const guild = client.guilds.cache.get(guildConfig.guildId);
         if (!guild) continue;
 
-        // Get today's birthdays
-        const birthdays = await Birthday.getTodaysBirthdays(guildConfig.guildId);
+        try {
+          const today = new Date();
+          const birthdays = await getBirthdaysToCelebrate(guildConfig.guildId, today);
+          if (birthdays.length === 0) continue;
 
-        if (birthdays.length === 0) continue;
+          const channel = getBirthdayChannel(guild, guildConfig);
 
-        const channel = guildConfig.features.birthdaySystem.channel
-          ? guild.channels.cache.get(guildConfig.features.birthdaySystem.channel)
-          : guildConfig.channels.birthdayChannel
-            ? guild.channels.cache.get(guildConfig.channels.birthdayChannel)
-            : null;
-
-        if (!channel) continue;
-
-        // Announce each birthday
-        for (const birthday of birthdays) {
-          try {
-            const member = await guild.members.fetch(birthday.userId).catch(() => null);
-            if (!member) continue;
-
-            // Skip if already celebrated today
-            if (birthday.lastCelebrated &&
-              new Date(birthday.lastCelebrated).toDateString() === new Date().toDateString()) {
-              continue;
-            }
-
-            // Assign birthday role if configured (check both possible locations)
-            const birthdayRoleId = guildConfig.roles.birthdayRole || guildConfig.features.birthdaySystem.role;
-            if (birthdayRoleId) {
-              const birthdayRole = guild.roles.cache.get(birthdayRoleId);
-              if (birthdayRole && !member.roles.cache.has(birthdayRole.id)) {
-                await member.roles.add(birthdayRole);
+          for (const birthday of birthdays) {
+            try {
+              // Skip if already celebrated today
+              if (birthday.lastCelebrated &&
+                new Date(birthday.lastCelebrated).toDateString() === today.toDateString()) {
+                continue;
               }
+
+              const celebrated = await celebrateBirthday(guild, guildConfig, channel, birthday, today);
+              if (!celebrated) continue;
+
+              birthday.lastCelebrated = today;
+              birthday.notificationSent = true;
+              await birthday.save();
+            } catch (error) {
+              console.error(`Error celebrating birthday for ${birthday.userId}:`, error);
             }
-
-            // Create birthday message
-            let message = guildConfig.features.birthdaySystem.message || '**Notice:** Birthday celebration detected for {user}. Congratulations, Master.';
-            message = message.replace('{user}', member.toString());
-
-            const age = birthday.getAge();
-            if (age && birthday.showAge) {
-              message += `\n**Analysis:** Subject has reached ${age} years of age.`;
-            }
-
-            if (birthday.customMessage) {
-              message += `\n\n**Message:** "${birthday.customMessage}"`;
-            }
-
-            // Send birthday message
-            const embed = await infoEmbed(guildConfig.guildId,
-              `${GLYPHS.SPARKLE} Birthday Celebration!`,
-              message
-            );
-            embed.setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 256 }));
-            embed.setColor('#FF69B4'); // Pink color for birthdays
-
-            await channel.send({
-              content: `@everyone`,
-              embeds: [embed]
-            });
-
-            // Update last celebrated
-            birthday.lastCelebrated = new Date();
-            birthday.notificationSent = true;
-            await birthday.save();
-
-            // DM user if they want it
-            if (birthday.celebrationPreference === 'dm') {
-              try {
-                await member.send({ embeds: [embed] });
-              } catch (error) {
-                console.log(`Could not DM birthday user: ${birthday.userId}`);
-              }
-            }
-
-          } catch (error) {
-            console.error(`Error celebrating birthday for ${birthday.userId}:`, error);
           }
+        } catch (error) {
+          console.error(`Error checking birthdays for guild ${guildConfig.guildId}:`, error);
         }
       }
 
@@ -109,6 +148,120 @@ export function startBirthdayChecker(client) {
   console.log('[RAPHAEL] Birthday monitoring system initialized.');
 }
 
+// Role and participant mentions for an event reminder, kept under the message limit
+function buildEventMentions(event) {
+  const roleIds = (event.notificationRoles || []).filter(Boolean);
+  const userIds = [...new Set((event.participants || []).map(p => p.userId).filter(Boolean))];
+
+  const parts = roleIds.length > 0 ? roleIds.map(id => `<@&${id}>`) : ['@here'];
+  const mentionedUsers = [];
+  const reserve = 30; // room for the "+N more" suffix
+
+  for (const userId of userIds) {
+    const mention = `<@${userId}>`;
+    if ([...parts, mention].join(' ').length > MAX_CONTENT_LENGTH - reserve) break;
+    parts.push(mention);
+    mentionedUsers.push(userId);
+  }
+
+  const remaining = userIds.length - mentionedUsers.length;
+  if (remaining > 0) parts.push(`and ${remaining} more participant${remaining !== 1 ? 's' : ''}`);
+
+  return {
+    content: parts.join(' '),
+    allowedMentions: {
+      parse: roleIds.length > 0 ? [] : ['everyone'],
+      roles: roleIds,
+      users: mentionedUsers
+    }
+  };
+}
+
+async function sendEventReminder(client, event) {
+  const guild = client.guilds.cache.get(event.guildId);
+  if (!guild) return;
+
+  const guildConfig = await Guild.getGuild(event.guildId);
+  if (guildConfig.features?.eventSystem?.enabled === false) return;
+
+  const channelIds = [
+    event.notificationChannel,
+    guildConfig.features?.eventSystem?.channel,
+    guildConfig.channels?.eventChannel
+  ];
+  const channel = channelIds.map(id => (id ? guild.channels.cache.get(id) : null)).find(Boolean);
+  if (!channel) return;
+
+  // Calculate time until event
+  const timeUntil = Math.floor((event.eventDate.getTime() - Date.now()) / (1000 * 60));
+
+  // Create notification embed
+  const embed = await infoEmbed(event.guildId,
+    `${GLYPHS.BELL} Event Reminder`,
+    `**${event.title}** is starting ${timeUntil <= 1 ? 'now' : `in ${timeUntil} minutes`}, Master.`
+  );
+
+  if (event.description) {
+    embed.addFields({
+      name: '▸ Description',
+      value: event.description.length > MAX_FIELD_LENGTH
+        ? `${event.description.slice(0, MAX_FIELD_LENGTH - 1)}…`
+        : event.description,
+      inline: false
+    });
+  }
+
+  if (event.location) {
+    const locationChannel = guild.channels.cache.get(event.location);
+    embed.addFields({
+      name: '▸ Location',
+      value: locationChannel ? locationChannel.toString() : event.location.slice(0, MAX_FIELD_LENGTH),
+      inline: true
+    });
+  }
+
+  embed.addFields({
+    name: '▸ Time',
+    value: `<t:${Math.floor(event.eventDate.getTime() / 1000)}:F>`,
+    inline: true
+  });
+
+  if (event.participants.length > 0) {
+    embed.addFields({
+      name: '▸ Participants',
+      value: `${event.participants.length} member${event.participants.length !== 1 ? 's' : ''}`,
+      inline: true
+    });
+  }
+
+  if (event.color) {
+    try {
+      embed.setColor(event.color);
+    } catch {
+      // Keep the theme color when the stored color is invalid
+    }
+  }
+  if (event.imageUrl) {
+    try {
+      embed.setImage(event.imageUrl);
+    } catch {
+      // Skip an invalid image URL rather than dropping the reminder
+    }
+  }
+
+  await channel.send({ ...buildEventMentions(event), embeds: [embed] });
+
+  // Update event status
+  event.status = 'notified';
+  event.reminders.push({
+    sentAt: new Date(),
+    minutesBefore: timeUntil
+  });
+  await event.save();
+
+  console.log(`[RAPHAEL] Event notification dispatched: ${event.title}`);
+}
+
 // Check for events every minute
 export function startEventChecker(client) {
   cron.schedule('* * * * *', async () => {
@@ -118,83 +271,12 @@ export function startEventChecker(client) {
       for (const event of events) {
         if (!event.shouldSendReminder()) continue;
 
-        const guild = client.guilds.cache.get(event.guildId);
-        if (!guild) continue;
-
-        const guildConfig = await Guild.getGuild(event.guildId);
-        if (!guildConfig.eventSystem.enabled) continue;
-
-        const channel = event.notificationChannel
-          ? guild.channels.cache.get(event.notificationChannel)
-          : guildConfig.eventSystem.channel
-            ? guild.channels.cache.get(guildConfig.eventSystem.channel)
-            : null;
-
-        if (!channel) continue;
-
-        // Calculate time until event
-        const timeUntil = Math.floor((event.eventDate.getTime() - Date.now()) / (1000 * 60));
-
-        // Create notification embed
-        const embed = await infoEmbed(event.guildId,
-          `${GLYPHS.BELL} Event Reminder!`,
-          `**${event.title}** is starting ${timeUntil <= 1 ? 'now' : `in ${timeUntil} minutes`}!`
-        );
-
-        if (event.description) {
-          embed.addFields({
-            name: 'Description',
-            value: event.description,
-            inline: false
-          });
+        // One failing event must not block the reminders after it
+        try {
+          await sendEventReminder(client, event);
+        } catch (error) {
+          console.error(`Error sending reminder for event ${event._id}:`, error);
         }
-
-        if (event.location) {
-          const locationChannel = guild.channels.cache.get(event.location);
-          embed.addFields({
-            name: 'Location',
-            value: locationChannel ? locationChannel.toString() : event.location,
-            inline: true
-          });
-        }
-
-        embed.addFields({
-          name: 'Time',
-          value: `<t:${Math.floor(event.eventDate.getTime() / 1000)}:F>`,
-          inline: true
-        });
-
-        if (event.participants.length > 0) {
-          embed.addFields({
-            name: 'Participants',
-            value: `${event.participants.length} member${event.participants.length !== 1 ? 's' : ''}`,
-            inline: true
-          });
-        }
-
-        if (event.color) embed.setColor(event.color);
-        if (event.imageUrl) embed.setImage(event.imageUrl);
-
-        // Mention roles
-        let mention = '';
-        if (event.notificationRoles && event.notificationRoles.length > 0) {
-          mention = event.notificationRoles.map(roleId => `<@&${roleId}>`).join(' ');
-        }
-
-        await channel.send({
-          content: mention || '@here',
-          embeds: [embed]
-        });
-
-        // Update event status
-        event.status = 'notified';
-        event.reminders.push({
-          sentAt: new Date(),
-          minutesBefore: timeUntil
-        });
-        await event.save();
-
-        console.log(`[RAPHAEL] Event notification dispatched: ${event.title}`);
       }
 
     } catch (error) {
@@ -208,19 +290,24 @@ export function startEventChecker(client) {
 // Remove birthday role at end of day
 export function startBirthdayRoleRemover(client) {
   cron.schedule('59 23 * * *', async () => {
-    console.log('🎂 Removing birthday roles...');
+    console.log('[RAPHAEL] Removing birthday roles...');
 
     try {
+      // The role can be stored in either place (the birthday checker reads both)
       const guilds = await Guild.find({
         'features.birthdaySystem.enabled': true,
-        'roles.birthdayRole': { $exists: true }
+        $or: [
+          { 'roles.birthdayRole': { $nin: [null, ''] } },
+          { 'features.birthdaySystem.role': { $nin: [null, ''] } }
+        ]
       });
 
       for (const guildConfig of guilds) {
         const guild = client.guilds.cache.get(guildConfig.guildId);
         if (!guild) continue;
 
-        const birthdayRole = guild.roles.cache.get(guildConfig.roles.birthdayRole);
+        const roleId = guildConfig.roles?.birthdayRole || guildConfig.features?.birthdaySystem?.role;
+        const birthdayRole = roleId ? guild.roles.cache.get(roleId) : null;
         if (!birthdayRole) continue;
 
         // Remove role from all members who have it

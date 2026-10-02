@@ -1,6 +1,6 @@
 import Guild from '../../models/Guild.js';
 import Level from '../../models/Level.js';
-import { EmbedBuilder } from 'discord.js';
+import { sendLevelUpAnnouncement } from '../../commands/config/levelup.js';
 
 // Track voice sessions in memory
 const voiceSessions = new Map();
@@ -20,8 +20,8 @@ export default {
     try {
       const guildConfig = await Guild.getGuild(guildId);
 
-      // Check if voice XP is enabled
-      if (!guildConfig.voiceXP?.enabled && !guildConfig.features?.levelSystem?.enabled) return;
+      // Voice XP needs the leveling system on and voice XP not switched off
+      if (!guildConfig.features?.levelSystem?.enabled || guildConfig.voiceXP?.enabled === false) return;
 
       const sessionKey = `${guildId}-${userId}`;
 
@@ -75,6 +75,7 @@ async function handleVoiceJoin(state, guildConfig, sessionKey) {
     guildId: state.guild.id,
     channelId: channel.id,
     joinedAt: Date.now(),
+    earnedMs: 0, // time banked before a pause
     isPaused: false
   });
 }
@@ -85,10 +86,8 @@ async function handleVoiceLeave(state, guildConfig, sessionKey, client) {
 
   voiceSessions.delete(sessionKey);
 
-  // Don't award if paused
-  if (session.isPaused) return;
-
-  const timeSpent = Date.now() - session.joinedAt;
+  // Time before a mute/deafen pause still counts; the paused stretch does not
+  const timeSpent = (session.earnedMs || 0) + (session.isPaused ? 0 : Date.now() - session.joinedAt);
   const minutesSpent = Math.floor(timeSpent / 60000);
 
   // Minimum 1 minute to get XP
@@ -151,10 +150,26 @@ async function handleVoiceLeave(state, guildConfig, sessionKey, client) {
 
   await levelData.save();
 
-  // Announce level up
-  if (levelsGained.length > 0 && guildConfig.features?.levelSystem?.announceLevelUp) {
-    await announceLevelUp(state.guild, member, levelData, levelsGained, guildConfig, client);
-  }
+  if (levelsGained.length === 0 || !member) return;
+
+  // Announce with the guild's level up settings (levelup command). There is no message
+  // channel to fall back to, so it goes to the configured level up channel only.
+  await sendLevelUpAnnouncement({
+    guild: state.guild,
+    member,
+    guildConfig,
+    levelData,
+    levelsGained,
+    oldLevel,
+    fields: [
+      { name: '▸ Voice Time', value: formatTime(levelData.voiceTime), inline: true },
+      { name: '▸ Voice XP', value: levelData.voiceXP.toLocaleString(), inline: true }
+    ],
+    note: '*Earned through voice activity.*'
+  });
+
+  // Role rewards do not depend on announcements being enabled
+  await grantLevelRewards(member, levelsGained, guildConfig);
 }
 
 async function handleMuteDeafChange(state, guildConfig, sessionKey) {
@@ -169,7 +184,8 @@ async function handleMuteDeafChange(state, guildConfig, sessionKey) {
     (guildConfig.voiceXP?.deafenedExcluded && isDeafened);
 
   if (shouldPause && !session.isPaused) {
-    // Pause session - save current XP and mark as paused
+    // Pause session - bank the time earned so far
+    session.earnedMs = (session.earnedMs || 0) + (Date.now() - session.joinedAt);
     session.isPaused = true;
     session.pausedAt = Date.now();
   } else if (!shouldPause && session.isPaused) {
@@ -179,51 +195,15 @@ async function handleMuteDeafChange(state, guildConfig, sessionKey) {
   }
 }
 
-async function announceLevelUp(guild, member, levelData, levels, guildConfig, client) {
-  const highestLevel = Math.max(...levels);
-
-  let message = guildConfig.features?.levelSystem?.levelUpMessage ||
-    '🎉 {user} leveled up to level {level}!';
-
-  message = message
-    .replace(/{user}/g, `<@${member.id}>`)
-    .replace(/{username}/g, member.user.username)
-    .replace(/{level}/g, highestLevel)
-    .replace(/{totalxp}/g, levelData.totalXP);
-
-  // Add voice indicator
-  message += ' 🎤 *(from voice chat)*';
-
-  const channelId = guildConfig.features?.levelSystem?.levelUpChannel ||
-    guildConfig.channels?.levelUpChannel;
-
-  if (channelId) {
-    const channel = guild.channels.cache.get(channelId);
-    if (channel) {
-      const embed = new EmbedBuilder()
-        .setColor('#00FF00')
-        .setDescription(message)
-        .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
-        .addFields(
-          { name: '🎤 Voice Time', value: formatTime(levelData.voiceTime), inline: true },
-          { name: '✨ Voice XP', value: `${levelData.voiceXP}`, inline: true }
-        )
-        .setFooter({ text: `Total XP: ${levelData.totalXP}` });
-
-      await channel.send({ embeds: [embed] }).catch(() => { });
-    }
-  }
-
-  // Check for role rewards
-  if (guildConfig.features?.levelSystem?.rewards) {
-    for (const reward of guildConfig.features.levelSystem.rewards) {
-      if (levels.includes(reward.level) && reward.roleId) {
-        try {
-          await member.roles.add(reward.roleId);
-        } catch (e) {
-          console.error(`Failed to add level reward role: ${e.message}`);
-        }
-      }
+async function grantLevelRewards(member, levels, guildConfig) {
+  const rewards = guildConfig.features?.levelSystem?.rewards || [];
+  for (const reward of rewards) {
+    if (!reward.roleId || !levels.includes(Number(reward.level))) continue;
+    if (member.roles.cache.has(reward.roleId)) continue;
+    try {
+      await member.roles.add(reward.roleId, `Level ${reward.level} reward`);
+    } catch (e) {
+      console.error(`Failed to add level reward role: ${e.message}`);
     }
   }
 }

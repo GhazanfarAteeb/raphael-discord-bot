@@ -1,22 +1,38 @@
-import { EmbedBuilder, PermissionFlagsBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType } from 'discord.js';
+import { PermissionFlagsBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, MessageFlags } from 'discord.js';
 import Guild from '../../models/Guild.js';
-import { successEmbed, errorEmbed, infoEmbed, GLYPHS } from '../../utils/embeds.js';
+import { successEmbed, errorEmbed, warningEmbed, infoEmbed, GLYPHS } from '../../utils/embeds.js';
 import { getPrefix, hasModPerms } from '../../utils/helpers.js';
+
+const CONFIRM_TIMEOUT = 30000;
+const PATH = 'settings.reactionRoles';
+
+function jumpLink(guildId, panel) {
+  return `https://discord.com/channels/${guildId}/${panel.channelId}/${panel.messageId}`;
+}
+
+// Delete a panel's message if it still exists
+async function deletePanelMessage(guild, panel) {
+  const channel = guild.channels.cache.get(panel.channelId);
+  if (!channel?.messages) return;
+  const msg = await channel.messages.fetch(panel.messageId).catch(() => null);
+  if (msg) await msg.delete().catch(() => { });
+}
 
 export default {
   name: 'reactionroles',
   description: 'Manage reaction role panels',
-  usage: 'reactionroles <list|add|remove|clear>',
+  usage: 'reactionroles <list|remove|clear>',
+  category: 'config',
   aliases: ['rr', 'rroles'],
   permissions: [PermissionFlagsBits.ManageGuild],
   cooldown: 5,
 
   async execute(message, args) {
     const guildId = message.guild.id;
-    const subCommand = args[0]?.toLowerCase();
-    const prefix = await getPrefix(guildId);
 
     try {
+      const subCommand = args[0]?.toLowerCase();
+      const prefix = await getPrefix(guildId);
       const guildConfig = await Guild.getGuild(guildId);
 
       // Check for moderator permissions (admin, mod role, or ManageGuild)
@@ -27,189 +43,202 @@ export default {
         });
       }
 
+      const panels = guildConfig.settings?.reactionRoles?.messages || [];
+
       if (!subCommand || subCommand === 'list') {
-        // List all reaction role panels
-        const panels = guildConfig.settings?.reactionRoles?.messages || [];
-
-        if (panels.length === 0) {
-          const embed = await infoEmbed(guildId, '📋 Reaction Roles',
-            `${GLYPHS.INFO} No reaction role panels set up.\n\n` +
-            `Use \`${prefix}colorroles\` to set up a color roles panel, or\n` +
-            `Use \`${prefix}reactionroles add\` to create a custom panel.`
-          );
-          return message.reply({ embeds: [embed] });
-        }
-
-        const embed = new EmbedBuilder()
-          .setColor('#5865F2')
-          .setTitle('📋 Reaction Role Panels')
-          .setDescription(
-            `**Total Panels:** ${panels.length}\n\n` +
-            panels.map((panel, i) => {
-              const channel = message.guild.channels.cache.get(panel.channelId);
-              return `**${i + 1}.** ${channel ? `<#${channel.id}>` : 'Unknown Channel'}\n` +
-                `${GLYPHS.DOT} Message ID: \`${panel.messageId}\`\n` +
-                `${GLYPHS.DOT} Roles: ${panel.roles.length}`;
-            }).join('\n\n')
-          )
-          .setFooter({ text: `Use ${prefix}reactionroles remove <number> to remove a panel` })
-          .setTimestamp();
-
-        return message.reply({ embeds: [embed] });
+        return listPanels(message, panels, prefix);
       }
 
       if (subCommand === 'remove' || subCommand === 'delete') {
-        const panelIndex = parseInt(args[1]) - 1;
-        const panels = guildConfig.settings?.reactionRoles?.messages || [];
-
-        if (isNaN(panelIndex) || panelIndex < 0 || panelIndex >= panels.length) {
-          const embed = await errorEmbed(guildId, 'Invalid Panel',
-            `${GLYPHS.ERROR} Please provide a valid panel number.\n\n` +
-            `Use \`${prefix}reactionroles list\` to see all panels.`
-          );
-          return message.reply({ embeds: [embed] });
-        }
-
-        const panel = panels[panelIndex];
-
-        // Try to delete the message
-        try {
-          const channel = message.guild.channels.cache.get(panel.channelId);
-          if (channel) {
-            const msg = await channel.messages.fetch(panel.messageId).catch(() => null);
-            if (msg) {
-              await msg.delete().catch(() => { });
-            }
-          }
-        } catch (err) {
-          // Message might be already deleted
-        }
-
-        // Remove from database
-        const updatedMessages = [...guildConfig.settings.reactionRoles.messages];
-        updatedMessages.splice(panelIndex, 1);
-        await Guild.updateGuild(guildId, { $set: { 'settings.reactionRoles.messages': updatedMessages } });
-
-        const embed = await successEmbed(guildId, 'Panel Removed',
-          `${GLYPHS.SUCCESS} Reaction role panel #${panelIndex + 1} has been removed.`
-        );
-        return message.reply({ embeds: [embed] });
+        return removePanel(message, panels, args[1], prefix);
       }
 
       if (subCommand === 'clear') {
-        const panels = guildConfig.settings?.reactionRoles?.messages || [];
-
-        if (panels.length === 0) {
-          const embed = await infoEmbed(guildId, 'No Panels',
-            `${GLYPHS.INFO} There are no reaction role panels to clear.`
-          );
-          return message.reply({ embeds: [embed] });
-        }
-
-        // Confirmation
-        const confirmEmbed = new EmbedBuilder()
-          .setColor('#FF0000')
-          .setTitle('⚠️ Confirm Clear')
-          .setDescription(
-            `Are you sure you want to remove **all ${panels.length}** reaction role panels?\n\n` +
-            `This will also delete the panel messages.`
-          );
-
-        const row = new ActionRowBuilder()
-          .addComponents(
-            new ButtonBuilder()
-              .setCustomId('confirm_clear')
-              .setLabel('Yes, Clear All')
-              .setStyle(ButtonStyle.Danger),
-            new ButtonBuilder()
-              .setCustomId('cancel_clear')
-              .setLabel('Cancel')
-              .setStyle(ButtonStyle.Secondary)
-          );
-
-        const confirmMsg = await message.reply({ embeds: [confirmEmbed], components: [row] });
-
-        const collector = confirmMsg.createMessageComponentCollector({
-          componentType: ComponentType.Button,
-          filter: (i) => i.user.id === message.author.id,
-          time: 30000,
-          max: 1
-        });
-
-        collector.on('collect', async (interaction) => {
-          if (interaction.customId === 'confirm_clear') {
-            // Delete all panel messages
-            for (const panel of panels) {
-              try {
-                const channel = message.guild.channels.cache.get(panel.channelId);
-                if (channel) {
-                  const msg = await channel.messages.fetch(panel.messageId).catch(() => null);
-                  if (msg) {
-                    await msg.delete().catch(() => { });
-                  }
-                }
-              } catch (err) {
-                // Ignore
-              }
-            }
-
-            // Clear from database
-            await Guild.updateGuild(guildId, {
-              $set: {
-                'settings.reactionRoles.messages': [],
-                'settings.reactionRoles.enabled': false
-              }
-            });
-
-            const embed = await successEmbed(guildId, 'All Panels Cleared',
-              `${GLYPHS.SUCCESS} All ${panels.length} reaction role panels have been removed.`
-            );
-            await interaction.update({ embeds: [embed], components: [] });
-          } else {
-            await interaction.update({
-              content: 'Cancelled.',
-              embeds: [],
-              components: []
-            });
-          }
-        });
-
-        collector.on('end', (collected) => {
-          if (collected.size === 0) {
-            confirmMsg.edit({ content: 'Timed out.', embeds: [], components: [] }).catch(() => { });
-          }
-        });
-
-        return;
+        return clearPanels(message, panels);
       }
 
-      if (subCommand === 'add') {
-        // Custom reaction role setup (simplified)
-        const embed = await infoEmbed(guildId, '➕ Add Reaction Role',
-          `**Quick Setup Commands:**\n\n` +
-          `${GLYPHS.ARROW_RIGHT} \`${prefix}colorroles [#channel]\` - Color roles panel\n\n` +
-          `**Custom Setup (Coming Soon):**\n` +
-          `A full custom reaction role builder will be added soon!`
-        );
-        return message.reply({ embeds: [embed] });
-      }
-
-      // Unknown subcommand
-      const embed = await infoEmbed(guildId, '📋 Reaction Roles Help',
-        `**Available Commands:**\n\n` +
-        `${GLYPHS.ARROW_RIGHT} \`${prefix}reactionroles list\` - List all panels\n` +
-        `${GLYPHS.ARROW_RIGHT} \`${prefix}reactionroles remove <#>\` - Remove a panel\n` +
-        `${GLYPHS.ARROW_RIGHT} \`${prefix}reactionroles clear\` - Remove all panels\n` +
-        `${GLYPHS.ARROW_RIGHT} \`${prefix}colorroles [#channel]\` - Create color roles panel`
-      );
-      return message.reply({ embeds: [embed] });
-
+      // Unknown subcommand (including the old `add`): show what is available
+      return showHelp(message, prefix);
     } catch (error) {
-      console.error('Reaction roles error:', error);
-      const embed = await errorEmbed(guildId, 'Error',
-        `${GLYPHS.ERROR} An error occurred. Please try again.`
-      );
-      return message.reply({ embeds: [embed] });
+      console.error('[ReactionRoles] Error:', error);
+      return message.reply({
+        embeds: [await errorEmbed(guildId, 'Error',
+          `${GLYPHS.ERROR} An error occurred. Please try again.`)]
+      }).catch(() => null);
     }
   }
 };
+
+async function showHelp(message, prefix) {
+  const embed = await infoEmbed(message.guild.id, 'Reaction Roles Help',
+    `${GLYPHS.INFO} Manage the reaction role panels on this server.`);
+  embed.addFields(
+    {
+      name: `${GLYPHS.ARROW_RIGHT} Panels`,
+      value:
+        `\`${prefix}reactionroles list\` - List all panels\n` +
+        `\`${prefix}reactionroles remove <number>\` - Remove a panel\n` +
+        `\`${prefix}reactionroles clear\` - Remove all panels`
+    },
+    {
+      name: `${GLYPHS.ARROW_RIGHT} Create a Panel`,
+      value: `\`${prefix}colorroles [#channel]\` - Create a color roles panel`
+    }
+  );
+  return message.reply({ embeds: [embed] });
+}
+
+async function listPanels(message, panels, prefix) {
+  const guildId = message.guild.id;
+
+  if (panels.length === 0) {
+    return message.reply({
+      embeds: [await infoEmbed(guildId, 'Reaction Roles',
+        `${GLYPHS.INFO} No reaction role panels are set up.\n\n` +
+        `Use \`${prefix}colorroles\` to set up a color roles panel.`)]
+    });
+  }
+
+  const lines = panels.map((panel, i) => {
+    const channel = message.guild.channels.cache.get(panel.channelId);
+    return `**${i + 1}.** ${channel ? `${channel}` : 'Deleted channel'} — [Jump to message](${jumpLink(guildId, panel)})\n` +
+      `${GLYPHS.DOT} Roles: ${panel.roles?.length || 0}`;
+  });
+
+  // Stay inside the 4096-character description limit
+  let description = `**Total Panels:** ${panels.length}`;
+  for (let i = 0; i < lines.length; i++) {
+    if (description.length + lines[i].length + 40 > 4000) {
+      description += `\n\n— and ${lines.length - i} more`;
+      break;
+    }
+    description += `\n\n${lines[i]}`;
+  }
+
+  const embed = await infoEmbed(guildId, 'Reaction Role Panels', description);
+  embed.addFields({
+    name: `${GLYPHS.ARROW_RIGHT} Remove a Panel`,
+    value: `\`${prefix}reactionroles remove <number>\``
+  });
+
+  return message.reply({ embeds: [embed] });
+}
+
+async function removePanel(message, panels, arg, prefix) {
+  const guildId = message.guild.id;
+  const panelIndex = parseInt(arg, 10) - 1;
+
+  if (isNaN(panelIndex) || panelIndex < 0 || panelIndex >= panels.length) {
+    return message.reply({
+      embeds: [await errorEmbed(guildId, 'Invalid Panel',
+        `${GLYPHS.ERROR} Please provide a valid panel number.\n\n` +
+        `Use \`${prefix}reactionroles list\` to see all panels.`)]
+    });
+  }
+
+  const panel = panels[panelIndex];
+  await deletePanelMessage(message.guild, panel);
+  await Guild.updateGuild(guildId, { $pull: { [`${PATH}.messages`]: { messageId: panel.messageId } } });
+
+  return message.reply({
+    embeds: [await successEmbed(guildId, 'Panel Removed',
+      `${GLYPHS.SUCCESS} Reaction role panel #${panelIndex + 1} has been removed.`)]
+  });
+}
+
+async function clearPanels(message, panels) {
+  const guildId = message.guild.id;
+
+  if (panels.length === 0) {
+    return message.reply({
+      embeds: [await infoEmbed(guildId, 'No Panels',
+        `${GLYPHS.INFO} There are no reaction role panels to clear.`)]
+    });
+  }
+
+  const confirmEmbed = await warningEmbed(guildId, 'Confirm Clear',
+    `${GLYPHS.WARNING} Are you sure you want to remove **all ${panels.length}** reaction role panels?\n\n` +
+    `This will also delete the panel messages.`);
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('rr_clear_confirm')
+      .setLabel('Yes, Clear All')
+      .setStyle(ButtonStyle.Danger),
+    new ButtonBuilder()
+      .setCustomId('rr_clear_cancel')
+      .setLabel('Cancel')
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  const confirmMsg = await message.reply({ embeds: [confirmEmbed], components: [row] });
+  if (!confirmMsg) return null;
+
+  const collector = confirmMsg.createMessageComponentCollector({
+    componentType: ComponentType.Button,
+    time: CONFIRM_TIMEOUT
+  });
+  let answered = false;
+
+  collector.on('collect', async (interaction) => {
+    try {
+      if (interaction.user.id !== message.author.id) {
+        return interaction.reply({
+          content: 'Only the member who started this can confirm it, Master.',
+          flags: MessageFlags.Ephemeral
+        });
+      }
+
+      answered = true;
+      collector.stop('answered');
+
+      if (interaction.customId !== 'rr_clear_confirm') {
+        return interaction.update({
+          embeds: [await infoEmbed(guildId, 'Clear Cancelled',
+            `${GLYPHS.INFO} No reaction role panels were removed.`)],
+          components: []
+        });
+      }
+
+      // Acknowledge first: deleting many panel messages can outlast the 3-second window
+      await interaction.deferUpdate();
+
+      for (const panel of panels) {
+        await deletePanelMessage(message.guild, panel);
+      }
+
+      await Guild.updateGuild(guildId, {
+        $set: {
+          [`${PATH}.messages`]: [],
+          [`${PATH}.enabled`]: false
+        }
+      });
+
+      await interaction.editReply({
+        embeds: [await successEmbed(guildId, 'All Panels Cleared',
+          `${GLYPHS.SUCCESS} All ${panels.length} reaction role panels have been removed.`)],
+        components: []
+      });
+    } catch (error) {
+      console.error('[ReactionRoles] Clear error:', error);
+      const embed = await errorEmbed(guildId, 'Clear Failed',
+        `${GLYPHS.ERROR} The panels could not be cleared. Please try again.`).catch(() => null);
+      if (embed) await confirmMsg.edit({ embeds: [embed], components: [] }).catch(() => { });
+    }
+  });
+
+  collector.on('end', async () => {
+    if (answered) return;
+    try {
+      await confirmMsg.edit({
+        embeds: [await infoEmbed(guildId, 'Confirmation Expired',
+          `${GLYPHS.INFO} No answer was given, so no reaction role panels were removed.`)],
+        components: []
+      });
+    } catch {
+      // Message was deleted
+    }
+  });
+
+  return confirmMsg;
+}

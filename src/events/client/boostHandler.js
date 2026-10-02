@@ -1,69 +1,76 @@
 import { Events, EmbedBuilder } from 'discord.js';
 import Guild from '../../models/Guild.js';
 
+// Discord tells us that a member boosts (premiumSince), not how many boosts they hold, so a
+// new boost always counts as one. Tier rewards above 1 boost cannot be detected automatically.
+export const DETECTABLE_BOOST_COUNT = 1;
+
+export const DEFAULT_BOOST_COLOR = '#f47fff';
+const DEFAULT_BOOST_TITLE = '『 Server Boost 』';
+const DEFAULT_BOOST_MESSAGE = 'Thank you {user} for boosting {server}!';
+const DEFAULT_BOOST_GREETING = '{user} just boosted the server!';
+
+// Earlier schema defaults (with emoji) still stored for guilds that never customised the text
+const LEGACY_BOOST_MESSAGES = new Set(['Thank you {user} for boosting {server}! 🎉']);
+const LEGACY_BOOST_GREETINGS = new Set(['💎 {user} just boosted the server!']);
+
+// Discord message and embed limits
+const LIMITS = { title: 256, description: 4096, footer: 2048, author: 256, content: 2000 };
+const HEX_COLOR = /^#[0-9a-f]{6}$/i;
+
 export default {
   name: Events.GuildMemberUpdate,
-  async execute(oldMember, newMember, client) {
-    // Check if user started boosting (didn't have booster role before, has it now)
+  async execute(oldMember, newMember) {
+    // Only trigger when someone starts boosting (not when they stop)
     const wasBoosting = oldMember.premiumSince !== null;
     const isBoosting = newMember.premiumSince !== null;
-
-    // Only trigger when someone starts boosting (not when they stop)
     if (wasBoosting || !isBoosting) return;
 
-    const guildId = newMember.guild.id;
-
     try {
-      const guildConfig = await Guild.getGuild(guildId, newMember.guild.name);
+      const guildConfig = await Guild.getGuild(newMember.guild.id, newMember.guild.name);
       const boostSettings = guildConfig.features?.boostSystem;
+      if (!boostSettings) return;
 
-      // Check if boost system is enabled
-      if (!boostSettings?.enabled) return;
+      // Tier rewards are their own feature: grant them even when the announcement is off
+      // or its channel is missing
+      const tierReward = await handleBoostTierRewards(newMember, boostSettings, DETECTABLE_BOOST_COUNT);
 
-      // Get the channel
-      const channelId = boostSettings.channel;
-      if (!channelId) return;
+      if (!boostSettings.enabled || !boostSettings.channel) return;
 
-      const channel = newMember.guild.channels.cache.get(channelId);
-      if (!channel) return;
-
-      // Get user's boost count (how many times they've boosted this server)
-      const userBoostCount = await getUserBoostCount(newMember);
-
-      // Handle boost tier rewards
-      const tierReward = await handleBoostTierRewards(newMember, boostSettings, userBoostCount);
-
-      // Build and send the boost message
-      const { embed, content } = buildBoostEmbed(newMember, boostSettings, guildConfig, userBoostCount, tierReward);
-
-      if (embed) {
-        await channel.send({ content, embeds: [embed] });
-      } else {
-        const boostMsg = parseBoostMessage(boostSettings.message || 'Thank you {user} for boosting {server}! 🎉', newMember, userBoostCount);
-        await channel.send(content || boostMsg);
+      const channel = newMember.guild.channels.cache.get(boostSettings.channel);
+      if (!channel) {
+        console.warn(`[BOOST] Configured boost channel ${boostSettings.channel} no longer exists in ${newMember.guild.name}`);
+        return;
       }
 
-      console.log(`[BOOST] ${newMember.user.tag} boosted ${newMember.guild.name} (Boost #${userBoostCount})`);
+      const { embed, content } = buildBoostEmbed(newMember, boostSettings, guildConfig, DETECTABLE_BOOST_COUNT, tierReward);
+      await channel.send(embed ? { content, embeds: [embed] } : { content });
+
+      console.log(`[BOOST] ${newMember.user.tag} boosted ${newMember.guild.name}`);
     } catch (error) {
-      console.error('[BOOST] Error sending boost message:', error);
+      console.error('[BOOST] Error handling new boost:', error);
     }
   }
 };
 
 /**
- * Get the number of times a user has boosted this server
- * Note: Discord API doesn't directly provide this, so we estimate based on premium subscription count changes
- * For accurate tracking, we'd need to store this separately
+ * The boost message template, ignoring the old emoji schema default
  */
-async function getUserBoostCount(member) {
-  // Discord doesn't provide per-user boost count directly
-  // We'll use the guild's premium subscription count as a reference
-  // For more accurate per-user tracking, you'd need to store this in the database
+export function getBoostMessageTemplate(boost = {}) {
+  return boost.message && !LEGACY_BOOST_MESSAGES.has(boost.message) ? boost.message : DEFAULT_BOOST_MESSAGE;
+}
 
-  // Check if member is boosting and count their contributions
-  // This is a simplified approach - returns 1 for first-time boosters
-  // For accurate multi-boost tracking, implement database storage
-  return 1; // Default to 1 for now - can be enhanced with database tracking
+/**
+ * The greeting template shown above the embed, ignoring the old emoji schema default
+ */
+export function getBoostGreetingTemplate(boost = {}) {
+  return boost.greetingText && !LEGACY_BOOST_GREETINGS.has(boost.greetingText)
+    ? boost.greetingText
+    : DEFAULT_BOOST_GREETING;
+}
+
+function clamp(text, max) {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
 /**
@@ -78,8 +85,7 @@ async function handleBoostTierRewards(member, boostSettings, boostCount) {
 
   // Find the highest tier the user qualifies for
   let qualifiedTier = null;
-  let rolesToAdd = [];
-  let rolesToRemove = [];
+  const rolesToAdd = [];
 
   for (const tier of sortedTiers) {
     if (boostCount >= tier.boostCount && tier.roleId) {
@@ -93,11 +99,10 @@ async function handleBoostTierRewards(member, boostSettings, boostCount) {
     }
   }
 
-  // If non-stackable, only add the highest qualified tier
   if (!qualifiedTier && rolesToAdd.length === 0) return null;
 
   try {
-    if (qualifiedTier && !qualifiedTier.stackable) {
+    if (qualifiedTier) {
       // Remove lower tier roles and add only the highest
       for (const tier of sortedTiers) {
         if (tier.boostCount < qualifiedTier.boostCount && tier.roleId) {
@@ -132,78 +137,73 @@ async function handleBoostTierRewards(member, boostSettings, boostCount) {
 }
 
 /**
- * Build the boost thank you embed based on settings
+ * Build the boost thank you message based on settings: { embed, content }.
+ * embed is null in plain text mode, where content carries the message.
  */
-function buildBoostEmbed(member, boost, guildConfig, boostCount = 1, tierReward = null) {
+function buildBoostEmbed(member, boost, guildConfig, boostCount = DETECTABLE_BOOST_COUNT, tierReward = null) {
+  const boostMsg = parseBoostMessage(getBoostMessageTemplate(boost), member, boostCount);
+
   if (boost.embedEnabled === false) {
     // Plain text mode
-    const boostMsg = parseBoostMessage(boost.message || 'Thank you {user} for boosting {server}! 🎉', member, boostCount);
-    return { embed: null, content: boostMsg };
+    return { embed: null, content: clamp(boostMsg, LIMITS.content) };
   }
 
-  // Decorative title with boost style
-  const decorativeTitle = '💎 ･ﾟ✧ Server Boost ✧･ﾟ 💎';
-
-  const boostMsg = parseBoostMessage(boost.message || 'Thank you {user} for boosting {server}! 🎉', member, boostCount);
-
   const embed = new EmbedBuilder()
-    .setColor(boost.embedColor || '#f47fff');
+    .setColor(HEX_COLOR.test(boost.embedColor ?? '') ? boost.embedColor : DEFAULT_BOOST_COLOR);
 
   // Author section
   const authorType = boost.authorType || 'username';
-  if (authorType !== 'none') {
-    if (authorType === 'server') {
-      embed.setAuthor({
-        name: member.guild.name,
-        iconURL: member.guild.iconURL({ dynamic: true, size: 128 })
-      });
-    } else if (authorType === 'displayname') {
-      embed.setAuthor({
-        name: member.displayName || member.user.displayName || member.user.username,
-        iconURL: member.user.displayAvatarURL({ dynamic: true, size: 128 })
-      });
-    } else {
-      embed.setAuthor({
-        name: member.user.username,
-        iconURL: member.user.displayAvatarURL({ dynamic: true, size: 128 })
-      });
-    }
+  if (authorType === 'server') {
+    embed.setAuthor({
+      name: clamp(member.guild.name, LIMITS.author),
+      iconURL: member.guild.iconURL({ size: 128 })
+    });
+  } else if (authorType === 'displayname') {
+    embed.setAuthor({
+      name: clamp(member.displayName || member.user.displayName || member.user.username, LIMITS.author),
+      iconURL: member.user.displayAvatarURL({ size: 128 })
+    });
+  } else if (authorType !== 'none') {
+    embed.setAuthor({
+      name: member.user.username,
+      iconURL: member.user.displayAvatarURL({ size: 128 })
+    });
   }
 
-  // Title
+  // Title: a single space means the title was removed
   const title = boost.embedTitle;
-  if (title && title.trim()) {
-    embed.setTitle(parseBoostMessage(title, member, boostCount));
+  if (title?.trim()) {
+    embed.setTitle(clamp(parseBoostMessage(title, member, boostCount), LIMITS.title));
   } else if (title !== ' ') {
-    embed.setTitle(decorativeTitle);
+    embed.setTitle(DEFAULT_BOOST_TITLE);
   }
 
-  // Description - include tier info if enabled and tier was earned
-  let description = boostMsg;
+  // Description, with the tier reward line when one was earned
+  let tierLine = '';
   if (boost.showTierInMessage !== false && tierReward) {
     const tierRole = member.guild.roles.cache.get(tierReward.roleId);
     if (tierRole) {
-      description += `\n\n🏆 **Tier Reward Unlocked!**\nYou've earned the ${tierRole} role!`;
+      tierLine = `\n\n◆ **Tier Reward Unlocked**\nYou have earned the ${tierRole} role.`;
     }
   }
-  embed.setDescription(description);
+  embed.setDescription(clamp(boostMsg, LIMITS.description - tierLine.length) + tierLine);
 
   // Thumbnail
   if (boost.thumbnailType === 'avatar') {
-    embed.setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 256 }));
+    embed.setThumbnail(member.user.displayAvatarURL({ size: 256 }));
   } else if (boost.thumbnailType === 'server') {
-    embed.setThumbnail(member.guild.iconURL({ dynamic: true, size: 256 }));
+    embed.setThumbnail(member.guild.iconURL({ size: 256 }));
   } else if (boost.thumbnailUrl) {
     embed.setThumbnail(boost.thumbnailUrl);
   } else if (boost.thumbnailType !== 'none' && boost.thumbnailType !== null) {
     // Default to avatar if no specific type set
-    embed.setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 256 }));
+    embed.setThumbnail(member.user.displayAvatarURL({ size: 256 }));
   }
 
-  // Footer
+  // Footer: a single space means the footer was removed
   const footerText = boost.footerText;
-  if (footerText && footerText.trim() && footerText !== ' ') {
-    embed.setFooter({ text: parseBoostMessage(footerText, member) });
+  if (footerText?.trim()) {
+    embed.setFooter({ text: clamp(parseBoostMessage(footerText, member, boostCount), LIMITS.footer) });
   } else if (footerText !== ' ') {
     embed.setFooter({ text: `Boost #${member.guild.premiumSubscriptionCount || 1}` });
   }
@@ -218,32 +218,31 @@ function buildBoostEmbed(member, boost, guildConfig, boostCount = 1, tierReward 
     embed.setImage(boost.bannerUrl);
   }
 
-  // Build greeting content (text above embed)
-  let content = undefined;
+  // Greeting content (text above embed)
+  let content;
   if (boost.mentionUser !== false) {
-    const greetingTemplate = boost.greetingText || '💎 {user} just boosted the server!';
-    content = parseBoostMessage(greetingTemplate, member, boostCount);
+    content = clamp(parseBoostMessage(getBoostGreetingTemplate(boost), member, boostCount), LIMITS.content);
   }
 
   return { embed, content };
 }
 
 /**
- * Parse boost message with variables
+ * Parse boost message with variables. Replacer functions keep "$" in names literal.
  */
-function parseBoostMessage(msg, member, boostCount = 1) {
+function parseBoostMessage(msg, member, boostCount = DETECTABLE_BOOST_COUNT) {
   return msg
-    .replace(/{user}/gi, `<@${member.user.id}>`)
-    .replace(/{username}/gi, member.user.username)
-    .replace(/{displayname}/gi, member.displayName || member.user.displayName || member.user.username)
-    .replace(/{tag}/gi, member.user.tag)
-    .replace(/{id}/gi, member.user.id)
-    .replace(/{server}/gi, member.guild.name)
-    .replace(/{membercount}/gi, member.guild.memberCount.toString())
-    .replace(/{boostcount}/gi, (member.guild.premiumSubscriptionCount || 0).toString())
-    .replace(/{boostlevel}/gi, member.guild.premiumTier.toString())
-    .replace(/{userboosts}/gi, boostCount.toString())
-    .replace(/{avatar}/gi, member.user.displayAvatarURL({ dynamic: true, size: 256 }))
+    .replace(/{user}/gi, () => `<@${member.user.id}>`)
+    .replace(/{username}/gi, () => member.user.username)
+    .replace(/{displayname}/gi, () => member.displayName || member.user.displayName || member.user.username)
+    .replace(/{tag}/gi, () => member.user.tag)
+    .replace(/{id}/gi, () => member.user.id)
+    .replace(/{server}/gi, () => member.guild.name)
+    .replace(/{membercount}/gi, () => member.guild.memberCount.toString())
+    .replace(/{boostcount}/gi, () => (member.guild.premiumSubscriptionCount || 0).toString())
+    .replace(/{boostlevel}/gi, () => member.guild.premiumTier.toString())
+    .replace(/{userboosts}/gi, () => boostCount.toString())
+    .replace(/{avatar}/gi, () => member.user.displayAvatarURL({ size: 256 }))
     .replace(/\\n/g, '\n');
 }
 

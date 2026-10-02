@@ -1,7 +1,7 @@
 import Member from '../../models/Member.js';
 import Level from '../../models/Level.js';
 import Guild from '../../models/Guild.js';
-import { EmbedBuilder } from 'discord.js';
+import { sendLevelUpAnnouncement } from '../../commands/config/levelup.js';
 
 // XP cooldown cache to prevent spam
 const xpCooldowns = new Map(); // guildId:userId -> lastXpTime
@@ -18,8 +18,8 @@ export default {
             const userId = message.author.id;
             const guildId = message.guild.id;
             
-            // Get or create member
-            const member = await Member.getMember(userId, guildId, {
+            // Get or create member (reassigned when a save hits a version conflict)
+            let member = await Member.getMember(userId, guildId, {
                 username: message.author.username,
                 discriminator: message.author.discriminator,
                 displayName: message.member?.displayName,
@@ -143,9 +143,11 @@ async function handleXPGain(message, client, userId, guildId) {
         
         const levelConfig = guildConfig.features.levelSystem;
         
-        // Check if channel is in no-XP list
+        // Check if channel is in no-XP list. Threads and forum posts inherit the blacklist
+        // of their parent channel.
         const noXpChannels = levelConfig.noXpChannels || [];
-        if (noXpChannels.includes(message.channel.id)) {
+        if (noXpChannels.includes(message.channel.id) ||
+            (message.channel.parentId && noXpChannels.includes(message.channel.parentId))) {
             return; // No XP in this channel
         }
         
@@ -215,9 +217,17 @@ async function handleXPGain(message, client, userId, guildId) {
         
         await levelData.save();
         
-        // Announce level up if enabled
+        // Announce level up with the guild's level up settings (levelup command)
         if (leveledUp.length > 0 && levelConfig.announceLevelUp !== false) {
-            await announceLevelUp(message, client, guildConfig, levelData, leveledUp);
+            await sendLevelUpAnnouncement({
+                guild: message.guild,
+                member: message.member ?? message.author,
+                guildConfig,
+                levelData,
+                levelsGained: leveledUp,
+                oldLevel: previousLevel,
+                fallbackChannel: message.channel
+            });
         }
         
         // Check for level rewards
@@ -227,55 +237,6 @@ async function handleXPGain(message, client, userId, guildId) {
         
     } catch (error) {
         console.error('Error handling XP gain:', error);
-    }
-}
-
-/**
- * Announce level up to the channel
- */
-async function announceLevelUp(message, client, guildConfig, levelData, leveledUp) {
-    try {
-        const newLevel = Math.max(...leveledUp);
-        const levelConfig = guildConfig.features.levelSystem;
-        
-        // Determine which channel to send to
-        let channel = message.channel;
-        if (levelConfig.levelUpChannel) {
-            const levelChannel = message.guild.channels.cache.get(levelConfig.levelUpChannel);
-            if (levelChannel) {
-                channel = levelChannel;
-            }
-        }
-        
-        // Build level up message
-        let levelUpMessage = levelConfig.levelUpMessage || '🎉 {user} leveled up to level {level}!';
-        levelUpMessage = levelUpMessage
-            .replace(/{user}/g, `<@${message.author.id}>`)
-            .replace(/{username}/g, message.author.username)
-            .replace(/{level}/g, newLevel)
-            .replace(/{totalxp}/g, levelData.totalXP.toLocaleString())
-            .replace(/{server}/g, message.guild.name);
-        
-        // Create embed
-        const embed = new EmbedBuilder()
-            .setColor(guildConfig.embedStyle?.color || '#FFD700')
-            .setTitle('🎉 Level Up!')
-            .setDescription(levelUpMessage)
-            .setThumbnail(message.author.displayAvatarURL({ extension: 'png', size: 128 }))
-            .addFields(
-                { name: 'New Level', value: `**${newLevel}**`, inline: true },
-                { name: 'Total XP', value: levelData.totalXP.toLocaleString(), inline: true }
-            )
-            .setFooter({ text: `Keep chatting to level up more!` })
-            .setTimestamp();
-        
-        await channel.send({ 
-            content: `<@${message.author.id}>`,
-            embeds: [embed] 
-        });
-        
-    } catch (error) {
-        console.error('Error announcing level up:', error);
     }
 }
 

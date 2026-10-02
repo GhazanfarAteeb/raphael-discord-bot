@@ -1,293 +1,247 @@
 import { PermissionFlagsBits } from 'discord.js';
 import Guild from '../../models/Guild.js';
-import { successEmbed, errorEmbed, GLYPHS } from '../../utils/embeds.js';
-import { isServerAdmin } from '../../utils/helpers.js';
+import { successEmbed, errorEmbed, infoEmbed, GLYPHS } from '../../utils/embeds.js';
+import { getPrefix, hasAdminPerms, isServerAdmin, getAssignableRoleError } from '../../utils/helpers.js';
+
+// Role lists that can hold several roles, keyed by every accepted type name
+const LIST_TYPES = {
+  admin: { field: 'adminRoles', label: 'Admin' },
+  administrator: { field: 'adminRoles', label: 'Admin' },
+  mod: { field: 'moderatorRoles', label: 'Moderator' },
+  moderator: { field: 'moderatorRoles', label: 'Moderator' },
+  staff: { field: 'staffRoles', label: 'Staff' }
+};
+
+// Single roles; the bot hands these out itself (on join, or when muting)
+const SINGLE_TYPES = {
+  sus: { label: 'Sus/Radar', paths: ['roles.susRole', 'features.memberTracking.susRole'] },
+  suspicious: { label: 'Sus/Radar', paths: ['roles.susRole', 'features.memberTracking.susRole'] },
+  radar: { label: 'Sus/Radar', paths: ['roles.susRole', 'features.memberTracking.susRole'] },
+  newaccount: { label: 'New Account', paths: ['roles.newAccountRole', 'features.accountAge.newAccountRole'] },
+  new: { label: 'New Account', paths: ['roles.newAccountRole', 'features.accountAge.newAccountRole'] },
+  egg: { label: 'New Account', paths: ['roles.newAccountRole', 'features.accountAge.newAccountRole'] },
+  baby: { label: 'New Account', paths: ['roles.newAccountRole', 'features.accountAge.newAccountRole'] },
+  muted: { label: 'Muted', paths: ['roles.mutedRole'] },
+  mute: { label: 'Muted', paths: ['roles.mutedRole'] }
+};
+
+const LIST_DESCRIPTIONS = {
+  adminRoles: 'can configure the bot',
+  moderatorRoles: 'can use moderation commands',
+  staffRoles: 'staff access'
+};
+
+// A role mention or raw ID (works for roles that have since been deleted)
+function parseRoleId(arg) {
+  return String(arg ?? '').match(/^(?:<@&)?(\d{17,20})>?$/)?.[1] ?? null;
+}
+
+function describeRole(guild, roleId) {
+  return guild.roles.cache.has(roleId) ? `<@&${roleId}>` : `Deleted role (\`${roleId}\`)`;
+}
 
 export default {
   name: 'setrole',
   description: 'Set custom roles for different features',
-  usage: '<type> <@role|role_id>',
+  usage: '<type> <@role|role_id> | remove <admin|mod|staff> <@role|role_id> | list',
+  category: 'config',
   aliases: ['configrole'],
   permissions: [PermissionFlagsBits.Administrator],
   cooldown: 3,
 
   async execute(message, args) {
-    const guild = await Guild.getGuild(message.guild.id, message.guild.name);
+    const guildId = message.guild.id;
 
-    // Check for admin role
-    const hasAdminRole = guild.roles.adminRoles?.some(roleId =>
-      message.member.roles.cache.has(roleId)
-    );
+    try {
+      const guild = await Guild.getGuild(guildId, message.guild.name);
+      const prefix = await getPrefix(guildId);
 
-    if (!message.member.permissions.has(PermissionFlagsBits.Administrator) && !hasAdminRole) {
-      return message.reply({
-        embeds: [await errorEmbed(message.guild.id, 'Permission Denied',
-          `${GLYPHS.LOCK} You need Administrator permissions to set roles.`)]
-      });
-    }
-
-    if (args.length < 2) {
-      const embed = await errorEmbed(message.guild.id, 'Invalid Usage',
-        `${GLYPHS.ARROW_RIGHT} Usage: \`setrole <type> <@role|role_id>\`\n\n` +
-        `**Types:**\n` +
-        `${GLYPHS.DOT} \`admin\` - Admin role (can configure bot, multiple allowed)\n` +
-        `${GLYPHS.DOT} \`mod\` - Moderator role (can use mod commands, multiple allowed)\n` +
-        `${GLYPHS.DOT} \`staff\` - Staff role (can add multiple)\n` +
-        `${GLYPHS.DOT} \`sus\` - Role for suspicious members\n` +
-        `${GLYPHS.DOT} \`newaccount\` - Role for new accounts\n` +
-        `${GLYPHS.DOT} \`muted\` - Role for muted members\n\n` +
-        `**Remove roles:**\n` +
-        `${GLYPHS.DOT} \`setrole remove admin @role\` - Remove an admin role\n` +
-        `${GLYPHS.DOT} \`setrole remove mod @role\` - Remove a mod role\n` +
-        `${GLYPHS.DOT} \`setrole list\` - Show all configured roles`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    const type = args[0].toLowerCase();
-
-    // Handle list command
-    if (type === 'list') {
-      return showRoleList(message, guild);
-    }
-
-    // Handle remove command
-    if (type === 'remove') {
-      if (args.length < 3) {
+      if (!hasAdminPerms(message.member, guild)) {
         return message.reply({
-          embeds: [await errorEmbed(message.guild.id, 'Invalid Usage',
-            `${GLYPHS.ARROW_RIGHT} Usage: \`setrole remove <admin|mod|staff> @role\``)]
+          embeds: [await errorEmbed(guildId, 'Permission Denied',
+            `${GLYPHS.LOCK} You need Administrator permissions to set roles.`)]
         });
       }
-      const removeType = args[1].toLowerCase();
-      const removeRoleId = args[2].replace(/[<@&>]/g, '');
-      return removeRole(message, guild, removeType, removeRoleId);
-    }
 
-    const roleId = args[1].replace(/[<@&>]/g, '');
+      const type = args[0]?.toLowerCase();
 
-    // Verify role exists
-    const role = message.guild.roles.cache.get(roleId);
-    if (!role) {
-      const embed = await errorEmbed(message.guild.id, 'Role Not Found',
-        `${GLYPHS.ERROR} Could not find that role.`
-      );
-      return message.reply({ embeds: [embed] });
-    }
-
-    // @everyone or an integration's role here would make every member (or a bot) staff
-    if (role.id === message.guild.id || role.managed) {
-      return message.reply({
-        embeds: [await errorEmbed(message.guild.id, 'Role Not Allowed',
-          `${role} cannot be used as a bot role, Master.`)]
-      });
-    }
-
-    // Only the owner or a real Administrator may create more bot admins/moderators
-    if (['admin', 'administrator', 'mod', 'moderator'].includes(type) && !isServerAdmin(message.member)) {
-      return message.reply({
-        embeds: [await errorEmbed(message.guild.id, 'Permission Denied',
-          'Only the server owner or an Administrator can grant bot admin or moderator roles, Master.')]
-      });
-    }
-
-    let updateData = {};
-    let responseText = '';
-
-    switch (type) {
-      case 'admin':
-      case 'administrator': {
-        const adminRoles = guild.roles?.adminRoles || [];
-        if (adminRoles.includes(roleId)) {
-          return message.reply({
-            embeds: [await errorEmbed(message.guild.id, 'Already Added',
-              `${GLYPHS.WARNING} ${role} is already an admin role.`)]
-          });
-        }
-        adminRoles.push(roleId);
-        updateData = { 'roles.adminRoles': adminRoles };
-        responseText = `${role} has been added as an **Admin** role.\nUsers with this role can configure the bot.`;
-        break;
+      // `list` takes no role, so it is handled before the argument-count check
+      if (type === 'list') {
+        return showRoleList(message, guild, prefix);
       }
 
-      case 'mod':
-      case 'moderator': {
-        const modRoles = guild.roles?.moderatorRoles || [];
-        if (modRoles.includes(roleId)) {
+      if (type === 'remove') {
+        const removeType = LIST_TYPES[args[1]?.toLowerCase()];
+        const removeRoleId = parseRoleId(args[2]);
+        if (!removeType || !removeRoleId) {
           return message.reply({
-            embeds: [await errorEmbed(message.guild.id, 'Already Added',
-              `${GLYPHS.WARNING} ${role} is already a moderator role.`)]
+            embeds: [await errorEmbed(guildId, 'Invalid Usage',
+              `${GLYPHS.ARROW_RIGHT} Usage: \`${prefix}setrole remove <admin|mod|staff> <@role|role_id>\``)]
           });
         }
-        modRoles.push(roleId);
-        updateData = { 'roles.moderatorRoles': modRoles };
-        responseText = `${role} has been added as a **Moderator** role.\nUsers with this role can use moderation commands.`;
-        break;
+        return removeRole(message, guild, removeType, removeRoleId);
       }
 
-      case 'staff': {
-        const staffRoles = guild.roles?.staffRoles || [];
-        if (staffRoles.includes(roleId)) {
-          return message.reply({
-            embeds: [await errorEmbed(message.guild.id, 'Already Added',
-              `${GLYPHS.WARNING} ${role} is already a staff role.`)]
-          });
-        }
-        staffRoles.push(roleId);
-        updateData = { 'roles.staffRoles': staffRoles };
-        responseText = `${role} has been added as a **Staff** role.`;
-        break;
+      if (args.length < 2) {
+        return showUsage(message, prefix);
       }
 
-      case 'sus':
-      case 'suspicious':
-      case 'radar':
-        updateData = {
-          'roles.susRole': roleId,
-          'features.memberTracking.susRole': roleId
-        };
-        responseText = `**Sus/Radar** role set to ${role}`;
-        break;
-
-      case 'newaccount':
-      case 'new':
-      case 'egg':
-      case 'baby':
-        updateData = {
-          'roles.newAccountRole': roleId,
-          'features.accountAge.newAccountRole': roleId
-        };
-        responseText = `**New Account** role set to ${role}`;
-        break;
-
-      case 'muted':
-      case 'mute':
-        updateData = { 'roles.mutedRole': roleId };
-        responseText = `**Muted** role set to ${role}`;
-        break;
-
-      default:
+      const listType = LIST_TYPES[type];
+      const singleType = SINGLE_TYPES[type];
+      if (!listType && !singleType) {
         return message.reply({
-          embeds: [await errorEmbed(message.guild.id, 'Unknown Type',
+          embeds: [await errorEmbed(guildId, 'Unknown Type',
             `${GLYPHS.WARNING} Unknown role type.\n\n**Valid types:** admin, mod, staff, sus, newaccount, muted`)]
         });
+      }
+
+      const role = message.guild.roles.cache.get(parseRoleId(args[1]));
+      if (!role) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Role Not Found',
+            `${GLYPHS.ERROR} Could not find that role.`)]
+        });
+      }
+
+      // @everyone or an integration's role here would make every member (or a bot) staff
+      if (role.id === message.guild.id || role.managed) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Role Not Allowed',
+            `${role} cannot be used as a bot role, Master.`)]
+        });
+      }
+
+      if (listType) {
+        return addListRole(message, guild, listType, role);
+      }
+
+      // Sus/new-account roles are given to joining members automatically, so they must not carry
+      // powerful permissions or sit above the configurer (an alt account would otherwise gain them)
+      const roleError = getAssignableRoleError(role, message.member);
+      if (roleError) {
+        return message.reply({ embeds: [await errorEmbed(guildId, 'Role Not Allowed', roleError)] });
+      }
+
+      await Guild.updateGuild(guildId, {
+        $set: Object.fromEntries(singleType.paths.map(path => [path, role.id]))
+      });
+
+      return message.reply({
+        embeds: [await successEmbed(guildId, 'Role Configured',
+          `${GLYPHS.SUCCESS} **${singleType.label}** role set to ${role}.`)]
+      });
+    } catch (error) {
+      console.error('[SetRole] Error:', error);
+      return message.reply({
+        embeds: [await errorEmbed(guildId, 'Configuration Error',
+          'The role could not be saved, Master. Please try again.')]
+      }).catch(() => null);
     }
-
-    // Apply the update
-    await Guild.updateGuild(message.guild.id, { $set: updateData });
-
-    return message.reply({
-      embeds: [await successEmbed(message.guild.id, 'Role Configured', `${GLYPHS.SUCCESS} ${responseText}`)]
-    });
   }
 };
 
-async function showRoleList(message, guild) {
+async function showUsage(message, prefix) {
+  const embed = await errorEmbed(message.guild.id, 'Invalid Usage',
+    `${GLYPHS.ARROW_RIGHT} Usage: \`${prefix}setrole <type> <@role|role_id>\``);
+  embed.addFields(
+    {
+      name: `${GLYPHS.ARROW_RIGHT} Types`,
+      value:
+        `\`admin\` - Can configure the bot (multiple allowed)\n` +
+        `\`mod\` - Can use moderation commands (multiple allowed)\n` +
+        `\`staff\` - Staff access (multiple allowed)\n` +
+        `\`sus\` - Given to suspicious members\n` +
+        `\`newaccount\` - Given to new accounts\n` +
+        `\`muted\` - Given to muted members`
+    },
+    {
+      name: `${GLYPHS.ARROW_RIGHT} Other Commands`,
+      value:
+        `\`${prefix}setrole remove <admin|mod|staff> <@role|role_id>\` - Remove a role\n` +
+        `\`${prefix}setrole list\` - Show all configured roles`
+    }
+  );
+  return message.reply({ embeds: [embed] });
+}
+
+async function addListRole(message, guild, listType, role) {
+  const guildId = message.guild.id;
+
+  // Only the owner or a real Administrator may create more bot admins/moderators
+  if (listType.field !== 'staffRoles' && !isServerAdmin(message.member)) {
+    return message.reply({
+      embeds: [await errorEmbed(guildId, 'Permission Denied',
+        'Only the server owner or an Administrator can grant bot admin or moderator roles, Master.')]
+    });
+  }
+
+  if ((guild.roles?.[listType.field] || []).includes(role.id)) {
+    return message.reply({
+      embeds: [await infoEmbed(guildId, 'Already Added',
+        `${GLYPHS.INFO} ${role} is already a **${listType.label}** role.`)]
+    });
+  }
+
+  await Guild.updateGuild(guildId, { $addToSet: { [`roles.${listType.field}`]: role.id } });
+
+  return message.reply({
+    embeds: [await successEmbed(guildId, 'Role Configured',
+      `${GLYPHS.SUCCESS} ${role} has been added as a **${listType.label}** role ` +
+      `(${LIST_DESCRIPTIONS[listType.field]}).`)]
+  });
+}
+
+async function showRoleList(message, guild, prefix) {
+  const formatList = (ids) => ids.length
+    ? ids.slice(0, 15).map(id => `${GLYPHS.DOT} ${describeRole(message.guild, id)}`).join('\n') +
+      (ids.length > 15 ? `\n${GLYPHS.DOT} +${ids.length - 15} more` : '')
+    : `${GLYPHS.DOT} None configured`;
+  const formatSingle = (id) => id ? describeRole(message.guild, id) : 'Not set';
+
   const adminRoles = guild.roles?.adminRoles || [];
   const modRoles = guild.roles?.moderatorRoles || [];
   const staffRoles = guild.roles?.staffRoles || [];
 
-  let description = '**Admin Roles** (can configure bot):\n';
-  if (adminRoles.length === 0) {
-    description += `${GLYPHS.DOT} None configured\n`;
-  } else {
-    for (const roleId of adminRoles) {
-      const role = message.guild.roles.cache.get(roleId);
-      description += `${GLYPHS.DOT} ${role || `<@&${roleId}> (deleted)`}\n`;
+  const embed = await infoEmbed(message.guild.id, 'Configured Roles',
+    `${GLYPHS.INFO} Roles the bot recognises in **${message.guild.name}**.`);
+  embed.addFields(
+    { name: `${GLYPHS.ARROW_RIGHT} Admin Roles (can configure the bot)`, value: formatList(adminRoles) },
+    { name: `${GLYPHS.ARROW_RIGHT} Moderator Roles (can use mod commands)`, value: formatList(modRoles) },
+    { name: `${GLYPHS.ARROW_RIGHT} Staff Roles`, value: formatList(staffRoles) },
+    {
+      name: `${GLYPHS.ARROW_RIGHT} Other Roles`,
+      value:
+        `${GLYPHS.DOT} Sus Role: ${formatSingle(guild.roles?.susRole)}\n` +
+        `${GLYPHS.DOT} New Account Role: ${formatSingle(guild.roles?.newAccountRole)}\n` +
+        `${GLYPHS.DOT} Muted Role: ${formatSingle(guild.roles?.mutedRole)}`
     }
+  );
+
+  const hasDeleted = [...adminRoles, ...modRoles, ...staffRoles].some(id => !message.guild.roles.cache.has(id));
+  if (hasDeleted) {
+    embed.addFields({
+      name: `${GLYPHS.WARNING} Deleted Roles`,
+      value: `Remove them with \`${prefix}setrole remove <admin|mod|staff> <role_id>\`.`
+    });
   }
 
-  description += '\n**Moderator Roles** (can use mod commands):\n';
-  if (modRoles.length === 0) {
-    description += `${GLYPHS.DOT} None configured\n`;
-  } else {
-    for (const roleId of modRoles) {
-      const role = message.guild.roles.cache.get(roleId);
-      description += `${GLYPHS.DOT} ${role || `<@&${roleId}> (deleted)`}\n`;
-    }
-  }
-
-  description += '\n**Staff Roles**:\n';
-  if (staffRoles.length === 0) {
-    description += `${GLYPHS.DOT} None configured\n`;
-  } else {
-    for (const roleId of staffRoles) {
-      const role = message.guild.roles.cache.get(roleId);
-      description += `${GLYPHS.DOT} ${role || `<@&${roleId}> (deleted)`}\n`;
-    }
-  }
-
-  description += '\n**Other Roles**:\n';
-  description += `${GLYPHS.DOT} Sus Role: ${guild.roles?.susRole ? `<@&${guild.roles.susRole}>` : 'Not set'}\n`;
-  description += `${GLYPHS.DOT} New Account Role: ${guild.roles?.newAccountRole ? `<@&${guild.roles.newAccountRole}>` : 'Not set'}\n`;
-  description += `${GLYPHS.DOT} Muted Role: ${guild.roles?.mutedRole ? `<@&${guild.roles.mutedRole}>` : 'Not set'}`;
-
-  const { infoEmbed } = await import('../../utils/embeds.js');
-  return message.reply({
-    embeds: [await infoEmbed(message.guild.id, '『 Configured Roles 』', description)]
-  });
+  return message.reply({ embeds: [embed] });
 }
 
-async function removeRole(message, guild, type, roleId) {
-  const { successEmbed, errorEmbed, GLYPHS } = await import('../../utils/embeds.js');
+async function removeRole(message, guild, listType, roleId) {
+  const guildId = message.guild.id;
 
-  let updateData = {};
-  let fieldName = '';
-
-  switch (type) {
-    case 'admin':
-    case 'administrator': {
-      const adminRoles = guild.roles?.adminRoles || [];
-      if (!adminRoles.includes(roleId)) {
-        return message.reply({
-          embeds: [await errorEmbed(message.guild.id, 'Not Found',
-            `${GLYPHS.WARNING} That role is not in the admin roles list.`)]
-        });
-      }
-      updateData = { 'roles.adminRoles': adminRoles.filter(id => id !== roleId) };
-      fieldName = 'Admin';
-      break;
-    }
-
-    case 'mod':
-    case 'moderator': {
-      const modRoles = guild.roles?.moderatorRoles || [];
-      if (!modRoles.includes(roleId)) {
-        return message.reply({
-          embeds: [await errorEmbed(message.guild.id, 'Not Found',
-            `${GLYPHS.WARNING} That role is not in the moderator roles list.`)]
-        });
-      }
-      updateData = { 'roles.moderatorRoles': modRoles.filter(id => id !== roleId) };
-      fieldName = 'Moderator';
-      break;
-    }
-
-    case 'staff': {
-      const staffRoles = guild.roles?.staffRoles || [];
-      if (!staffRoles.includes(roleId)) {
-        return message.reply({
-          embeds: [await errorEmbed(message.guild.id, 'Not Found',
-            `${GLYPHS.WARNING} That role is not in the staff roles list.`)]
-        });
-      }
-      updateData = { 'roles.staffRoles': staffRoles.filter(id => id !== roleId) };
-      fieldName = 'Staff';
-      break;
-    }
-
-    default:
-      return message.reply({
-        embeds: [await errorEmbed(message.guild.id, 'Invalid Type',
-          `${GLYPHS.WARNING} Can only remove from: admin, mod, staff`)]
-      });
+  if (!(guild.roles?.[listType.field] || []).includes(roleId)) {
+    return message.reply({
+      embeds: [await errorEmbed(guildId, 'Not Found',
+        `${GLYPHS.WARNING} That role is not in the **${listType.label}** roles list.`)]
+    });
   }
 
-  await Guild.updateGuild(message.guild.id, { $set: updateData });
+  await Guild.updateGuild(guildId, { $pull: { [`roles.${listType.field}`]: roleId } });
 
-  const role = message.guild.roles.cache.get(roleId);
   return message.reply({
-    embeds: [await successEmbed(message.guild.id, 'Role Removed',
-      `${GLYPHS.SUCCESS} ${role || `<@&${roleId}>`} has been removed from **${fieldName}** roles.`)]
+    embeds: [await successEmbed(guildId, 'Role Removed',
+      `${GLYPHS.SUCCESS} ${describeRole(message.guild, roleId)} has been removed from **${listType.label}** roles.`)]
   });
 }

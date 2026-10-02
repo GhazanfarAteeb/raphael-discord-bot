@@ -275,7 +275,7 @@ async function sendWelcomeMessage(member, guildConfig) {
         if (welcome.embedEnabled !== false) {
           const dmEmbed = new EmbedBuilder()
             .setColor(welcome.embedColor || guildConfig.embedStyle?.color || '#5865F2')
-            .setTitle(`👋 Welcome to ${member.guild.name}!`)
+            .setTitle(`『 Welcome to ${member.guild.name} 』`)
             .setDescription(dmMsg)
             .setThumbnail(member.guild.iconURL({ dynamic: true, size: 256 }))
             .setTimestamp();

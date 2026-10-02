@@ -20,7 +20,7 @@ const guildSchema = new mongoose.Schema({
     },
     memberTracking: {
       enabled: { type: Boolean, default: true },
-      susThreshold: { type: Number, default: 4 }, // Join count threshold
+      susThreshold: { type: Number, default: 4 }, // Suspicion score at which a member is flagged
       susRole: String, // Role ID for suspicious members
       alertChannel: String // Channel ID for alerts
     },
@@ -88,10 +88,10 @@ const guildSchema = new mongoose.Schema({
       enabled: { type: Boolean, default: true },
       channel: String,
       role: String, // Birthday role
-      message: { type: String, default: '🎂 Happy Birthday {user}! 🎉' },
+      message: { type: String, default: 'Happy Birthday {user}!' },
       embedEnabled: { type: Boolean, default: true },
       embedColor: { type: String, default: '#FF69B4' },
-      embedTitle: { type: String, default: '🎂 Happy Birthday!' },
+      embedTitle: { type: String, default: 'Happy Birthday!' },
       bannerUrl: String,
       thumbnailType: { type: String, enum: ['avatar', 'server', 'custom', null], default: 'avatar' },
       thumbnailUrl: String,
@@ -110,7 +110,7 @@ const guildSchema = new mongoose.Schema({
       maxXpPerMessage: { type: Number, default: 25 },
       xpCooldown: { type: Number, default: 60 }, // seconds between XP gains
       levelUpChannel: String,
-      levelUpMessage: { type: String, default: '🎉 Congratulations {user}! You reached level {level}!' },
+      levelUpMessage: { type: String, default: 'Congratulations {user}! You reached level {level}!' },
       announceLevelUp: { type: Boolean, default: true },
       embedEnabled: { type: Boolean, default: true },
       embedColor: { type: String, default: '#FFD700' },
@@ -163,7 +163,7 @@ const guildSchema = new mongoose.Schema({
     boostSystem: {
       enabled: { type: Boolean, default: false },
       channel: String,
-      message: { type: String, default: 'Thank you {user} for boosting {server}! 🎉' },
+      message: { type: String, default: 'Thank you {user} for boosting {server}!' },
       embedEnabled: { type: Boolean, default: true },
       embedColor: { type: String, default: '#f47fff' },
       embedTitle: String,
@@ -173,7 +173,7 @@ const guildSchema = new mongoose.Schema({
       footerText: String,
       showTimestamp: { type: Boolean, default: true },
       mentionUser: { type: Boolean, default: true },
-      greetingText: { type: String, default: '💎 {user} just boosted the server!' },
+      greetingText: { type: String, default: '{user} just boosted the server!' },
       authorType: { type: String, enum: ['username', 'displayname', 'server', 'none'], default: 'username' },
       // Boost tier rewards - roles assigned based on number of boosts
       tierRewards: [{
@@ -185,10 +185,10 @@ const guildSchema = new mongoose.Schema({
       // Booster Perks Announcement - separate channel for tier info announcement
       perksAnnouncement: {
         channel: String, // Channel for booster perks announcement (different from boost notification)
-        message: { type: String, default: 'Check out the amazing perks for our server boosters! 💎' },
+        message: { type: String, default: 'Check out the perks for our server boosters!' },
         embedEnabled: { type: Boolean, default: true },
         embedColor: { type: String, default: '#f47fff' },
-        embedTitle: { type: String, default: '💎 Booster Perks & Rewards' },
+        embedTitle: { type: String, default: 'Booster Perks & Rewards' },
         bannerUrl: String,
         thumbnailType: { type: String, enum: ['server', 'custom', 'none', null], default: 'server' },
         thumbnailUrl: String,
@@ -239,7 +239,7 @@ const guildSchema = new mongoose.Schema({
     colorRoles: {
       channelId: String,
       messageId: String,
-      title: { type: String, default: '🎨 Color Roles' },
+      title: { type: String, default: 'Color Roles' },
       description: { type: String, default: '**React to get a color role!**\nYou can only have one color at a time.' },
       embedColor: { type: String, default: '#667eea' },
       image: String,
@@ -352,7 +352,7 @@ const guildSchema = new mongoose.Schema({
   rulesSystem: {
     rules: [String], // Array of rule strings
     channel: String, // Default channel to send rules
-    title: { type: String, default: '📜 Server Rules' },
+    title: { type: String, default: 'Server Rules' },
     embedColor: { type: String, default: '#5865F2' },
     footer: String,
     bannerUrl: String
@@ -376,7 +376,7 @@ const guildSchema = new mongoose.Schema({
   autoRole: {
     enabled: { type: Boolean, default: false },
     roles: [String], // Role IDs to give on join
-    delay: { type: Number, default: 0 }, // Seconds delay before giving role
+    delay: { type: Number, default: 0 }, // Milliseconds to wait before giving the role
     botRoles: [String], // Different roles for bots
     requireVerification: { type: Boolean, default: false }
   },
@@ -417,7 +417,7 @@ const guildSchema = new mongoose.Schema({
       enabled: { type: Boolean, default: false },
       channelId: String,
       messageId: String,
-      title: { type: String, default: '🎨 Color Roles' },
+      title: { type: String, default: 'Color Roles' },
       description: { type: String, default: '**React to get a color role!**\nYou can only have one color at a time.' },
       embedColor: { type: String, default: '#667eea' },
       image: String,

@@ -1,5 +1,8 @@
 import Guild from '../../models/Guild.js';
 import { EmbedBuilder } from 'discord.js';
+import { COLORS, GLYPHS } from '../../utils/embeds.js';
+import { getRandomFooter } from '../../utils/raphael.js';
+import { getAssignableRoleError } from '../../utils/helpers.js';
 
 export default {
   name: 'guildMemberAdd',
@@ -17,9 +20,8 @@ export default {
     try {
       const guildConfig = await Guild.getGuild(member.guild.id, member.guild.name);
 
-      // Check if auto role is enabled (check both possible config locations due to legacy/slash command differences)
-      const autoRoleConfig = guildConfig.autoRole || guildConfig.autorole;
-      if (!autoRoleConfig?.enabled) return;
+      // Roles may sit under autoRole (prefix command) or the legacy autorole key; either can enable the system
+      if (!guildConfig.autoRole?.enabled && !guildConfig.autorole?.enabled) return;
 
       // Get roles based on whether the member is a bot or user
       // Combine roles from both possible config locations
@@ -36,19 +38,25 @@ export default {
           ...(guildConfig.autorole?.humanRoles || [])
         ];
       }
-      
+
       // Remove duplicates
       rolesToAssign = [...new Set(rolesToAssign)];
 
       if (rolesToAssign.length === 0) return;
 
+      const me = member.guild.members.me;
+
       // Filter valid roles
       const validRoles = rolesToAssign.filter(roleId => {
         const role = member.guild.roles.cache.get(roleId);
         if (!role) return false;
-        // Check if bot can assign this role
-        if (role.position >= member.guild.members.me.roles.highest.position) return false;
-        if (role.managed) return false;
+        // Re-check at join time: a role configured earlier may since have moved above the bot,
+        // become managed, or been given moderation/admin permissions
+        const roleError = getAssignableRoleError(role, me);
+        if (roleError) {
+          console.log(`[AutoRole] Skipping role "${role.name}" in ${member.guild.name}: ${roleError}`);
+          return false;
+        }
         // Skip color roles - they should never be auto-assigned
         // Color roles are meant to be selected via reaction roles panel
         if (role.name.startsWith('🎨 ')) {
@@ -60,7 +68,7 @@ export default {
 
       if (validRoles.length === 0) return;
 
-      // Assign roles after delay (check both config locations)
+      // Delay is stored in milliseconds (check both config locations)
       const delay = guildConfig.autoRole?.delay || guildConfig.autorole?.delay || 0;
 
       const assignRoles = async () => {
@@ -72,24 +80,22 @@ export default {
           // Add all roles
           await freshMember.roles.add(validRoles, 'Auto Role on Join');
 
-          // Log the action
-          const roleNames = validRoles
-            .map(id => member.guild.roles.cache.get(id)?.name || 'Unknown')
-            .join(', ');
-
           // Log to member log channel if configured
-          if (guildConfig.channels?.memberLog) {
-            const logChannel = member.guild.channels.cache.get(guildConfig.channels.memberLog);
-            if (logChannel) {
-              const embed = new EmbedBuilder()
-                .setTitle('🎭 Auto Role Assigned')
-                .setDescription(`**Member:** ${freshMember.user.tag}\n**Roles:** ${roleNames}`)
-                .setColor('#00FF00')
-                .setTimestamp();
-              logChannel.send({ embeds: [embed] }).catch(() => {});
-            }
+          const logChannel = guildConfig.channels?.memberLog
+            ? member.guild.channels.cache.get(guildConfig.channels.memberLog)
+            : null;
+          if (logChannel) {
+            const embed = new EmbedBuilder()
+              .setTitle('『 Auto Role Assigned 』')
+              .setDescription(
+                `${GLYPHS.ARROW_RIGHT} **Member:** ${freshMember.user.tag} (${freshMember})\n` +
+                `${GLYPHS.ARROW_RIGHT} **Roles:** ${validRoles.map(id => `<@&${id}>`).join(', ')}`
+              )
+              .setColor(COLORS.RAPHAEL_SUCCESS)
+              .setFooter({ text: getRandomFooter() })
+              .setTimestamp();
+            logChannel.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => {});
           }
-
         } catch (error) {
           console.error(`[AutoRole] Failed to assign roles to ${member.user.tag}:`, error.message);
         }
