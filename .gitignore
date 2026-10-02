@@ -35,3 +35,6 @@ build/
 .cache/
 .temp/
 *.pem
+
+# Generated card emojis (recreate with: npm run cards)
+assets/cards/

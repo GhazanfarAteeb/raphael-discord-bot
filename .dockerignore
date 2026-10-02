@@ -26,3 +26,7 @@ logs/
 
 # Docker override files
 docker-compose.override.yml
+
+# Card emoji assets are only needed to upload emojis, not at runtime
+assets/cards/
+assets/source/

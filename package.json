@@ -10,7 +10,8 @@
     "build": "node debug-voice-deps.js && echo 'Build completed'",
     "test": "echo \"Error: no test specified\" && exit 1",
     "test-encryption": "node test-encryption.js",
-    "debug-voice": "node debug-voice-deps.js"
+    "debug-voice": "node debug-voice-deps.js",
+    "cards": "node scripts/generate-cards.js"
   },
   "repository": {
     "type": "git",
@@ -44,5 +45,8 @@
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "gifenc": "^1.0.3"
   }
 }

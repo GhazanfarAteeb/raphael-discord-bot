@@ -4,6 +4,7 @@ import Guild from '../../models/Guild.js';
 import { errorEmbed, GLYPHS } from '../../utils/embeds.js';
 import { getPrefix, formatNumber } from '../../utils/helpers.js';
 import { getRandomFooter } from '../../utils/raphael.js';
+import { getCardEmojis, cardEmoji, cardBackEmoji } from '../../utils/cardEmojis.js';
 
 // Card suits and values
 const SUITS = ['♠️', '♥️', '♦️', '♣️'];
@@ -59,22 +60,11 @@ function calculateHand(hand) {
   return value;
 }
 
-// Format hand display
-function formatHand(hand, hideSecond = false) {
-  if (hideSecond && hand.length >= 2) {
-    return `${hand[0].value}${hand[0].suit} 🎴`;
-  }
-  return hand.map(card => `${card.value}${card.suit}`).join(' ');
-}
-
-// Get hand display with visual cards
-function getHandDisplay(hand, hideSecond = false) {
-  const cards = hand.map((card, i) => {
-    if (hideSecond && i === 1) return '🎴';
-    const isRed = card.suit === '♥️' || card.suit === '♦️';
-    return `\`${card.value}${card.suit}\``;
-  });
-  return cards.join(' ');
+// Get hand display with card emojis (text cards until the emojis are uploaded)
+function getHandDisplay(hand, emojis, hideSecond = false) {
+  return hand
+    .map((card, i) => (hideSecond && i === 1 ? cardBackEmoji(emojis) : cardEmoji(card, emojis)))
+    .join(' ');
 }
 
 // Create game embed
@@ -91,14 +81,14 @@ function createGameEmbed(game, guildConfig, showResult = false) {
   if (showResult) {
     embed.addFields({
       name: `▸ Dealer (${dealerValue})`,
-      value: getHandDisplay(game.dealerHand),
+      value: getHandDisplay(game.dealerHand, game.cardEmojis),
       inline: false
     });
   } else {
     const hiddenValue = getCardValue(game.dealerHand[0]);
     embed.addFields({
       name: `▸ Dealer (${hiddenValue}+?)`,
-      value: getHandDisplay(game.dealerHand, true),
+      value: getHandDisplay(game.dealerHand, game.cardEmojis, true),
       inline: false
     });
   }
@@ -106,7 +96,7 @@ function createGameEmbed(game, guildConfig, showResult = false) {
   // Player's hand
   embed.addFields({
     name: `▸ ${game.playerName} (${playerValue})`,
-    value: getHandDisplay(game.playerHand),
+    value: getHandDisplay(game.playerHand, game.cardEmojis),
     inline: false
   });
 
@@ -271,7 +261,8 @@ export default {
       deck,
       playerHand: [deck.pop(), deck.pop()],
       dealerHand: [deck.pop(), deck.pop()],
-      doubled: false
+      doubled: false,
+      cardEmojis: await getCardEmojis(client)
     };
 
     activeGames.set(message.author.id, game);
@@ -363,7 +354,7 @@ export default {
           } else {
             // Continue game
             const gameEmbed = createGameEmbed(game, guildConfig);
-            gameEmbed.setDescription(`${GLYPHS.INFO} You drew **${game.playerHand[game.playerHand.length - 1].value}${game.playerHand[game.playerHand.length - 1].suit}**`);
+            gameEmbed.setDescription(`${GLYPHS.INFO} You drew ${cardEmoji(game.playerHand[game.playerHand.length - 1], game.cardEmojis)}`);
 
             // Disable double down after first hit
             const newButtons = new ActionRowBuilder()
