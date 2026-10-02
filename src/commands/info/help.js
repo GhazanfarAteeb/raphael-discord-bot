@@ -1,132 +1,40 @@
-import { EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
+import { EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, ButtonBuilder, ButtonStyle, PermissionsBitField, MessageFlags } from 'discord.js';
+import { readdirSync } from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { GLYPHS, COLORS } from '../../utils/embeds.js';
-import { getPrefix } from '../../utils/helpers.js';
-import { getRandomFooter, Raphael } from '../../utils/raphael.js';
+import { getPrefix, truncate } from '../../utils/helpers.js';
+import { getRandomFooter } from '../../utils/raphael.js';
 import Guild from '../../models/Guild.js';
 
-// Accurate command lists based on actual files
-const COMMANDS_BY_CATEGORY = {
-  admin: ['deployment', 'award', 'botlogs'],
-  config: [
-    'setup', 'config', 'feature', 'setprefix', 'setchannel', 'setrole', 'setcoin', 'setoverlay',
-    'automod', 'automodignore', 'welcome', 'goodbye', 'boost', 'boostperks', 'antinuke', 'autopublish', 'autorole', 'cmdchannels',
-    'manageshop', 'colorroles', 'levelroles', 'levelup', 'noxp', 'reactionroles', 'xpmultiplier', 'cleanup', 'logs', 'rules',
-    'starboard', 'onboarding', 'birthdayconfig', 'fixlogs'
-  ],
-  moderation: ['warn', 'kick', 'ban', 'purge', 'userhistory', 'timeout', 'untimeout', 'lockdown', 'verify'],
-  economy: [
-    'daily', 'balance', 'level', 'profile', 'shop', 'inventory', 'setprofile', 'setbackground',
-    'adventure', 'rep', 'claim'
-  ],
-  gambling: ['coinflip', 'slots', 'dice', 'roulette', 'blackjack'],
-  music: [
-    'play', 'pause', 'resume', 'skip', 'stop', 'queue', 'nowplaying', 'volume',
-    'shuffle', 'loop', 'seek', 'remove', 'clearqueue', 'skipto'
-  ],
-  community: [
-    'setbirthday', 'birthdays', 'removebirthday', 'birthdaypreference', 'birthdayconfig', 'mybirthday',
-    'requestbirthday', 'approvebday', 'rejectbday', 'birthdayrequests', 'cancelbirthday',
-    'createevent', 'events', 'joinevent', 'cancelevent', 'giveaway', 'starboard', 'confession'
-  ],
-  social: ['marry', 'divorce', 'badges'],
-  fun: ['tictactoe', 'trivia'],
-  info: ['help', 'ping', 'serverinfo', 'userinfo', 'checkuser', 'roleinfo', 'channelinfo'],
-  utility: [
-    'leaderboard', 'top', 'stats', 'embed', 'embedset', 'embedhelp', 'afk', 'gif', 'meme',
-    'react', 'remind', 'tempvc', 'avatar', 'banner', 'steal', 'firstmessage', 'poll', 'ticket'
-  ]
-};
+const COMMANDS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-// Slash commands available
-const SLASH_COMMANDS = [
-  // Moderation
-  'ban', 'kick', 'warn', 'timeout', 'purge', 'userhistory', 'untimeout', 'verify', 'lockdown',
-  // Config
-  'welcome', 'goodbye', 'boost', 'boostperks', 'autorole', 'noxp', 'automod', 'cmdchannels', 'logs', 'feature',
-  'setrole', 'setchannel', 'config', 'setup', 'manageshop', 'setprefix', 'xpmultiplier',
-  'levelroles', 'levelup', 'starboard', 'rules', 'autopublish', 'cleanup', 'onboarding',
-  // Admin
-  'giveaway', 'award', 'deployment', 'botlogs',
-  // Music
-  'play', 'pause', 'resume', 'skip', 'stop', 'queue', 'nowplaying', 'volume', 'shuffle', 'loop', 'seek', 'remove', 'clearqueue', 'skipto',
-  // Economy
-  'balance', 'daily', 'level', 'profile', 'shop', 'inventory', 'rep', 'coinflip', 'slots', 'dice', 'roulette', 'blackjack', 'adventure',
-  // Community
-  'confession', 'birthday', 'event', 'starboard',
-  // Info
-  'help', 'ping', 'serverinfo', 'userinfo', 'channelinfo', 'roleinfo'
-];
+const MAIN_MENU_TIMEOUT_MS = 5 * 60 * 1000;
+const DETAIL_TIMEOUT_MS = 60 * 1000;
+const FIELD_VALUE_LIMIT = 1024;
+// Discord rejects embeds over 6000 characters in total; leave room for the footer
+const EMBED_TEXT_BUDGET = 5800;
+const SHORT_DESCRIPTION_LENGTH = 50;
+const FALLBACK_CATEGORY = 'misc';
+const SLASH_MARKER = '`/`';
 
+// Display names for known categories, in menu order. Any other category a command
+// declares is still listed, under its capitalised key.
 const CATEGORY_INFO = {
-  admin: {
-    emoji: '👑',
-    name: 'Admin',
-    description: 'Bot owner and administrator commands',
-    color: '#FF6B6B'
-  },
-  config: {
-    emoji: '⚙️',
-    name: 'Configuration',
-    description: 'Server setup, automod, and configuration',
-    color: '#4ECDC4'
-  },
-  moderation: {
-    emoji: '🛡️',
-    name: 'Moderation',
-    description: 'Keep your server safe and moderated',
-    color: '#FF8C00'
-  },
-  economy: {
-    emoji: '💰',
-    name: 'Economy',
-    description: 'Earn coins, level up, and customize profiles',
-    color: '#FFD700'
-  },
-  gambling: {
-    emoji: '🎰',
-    name: 'Gambling',
-    description: 'Test your luck with casino games',
-    color: '#9B59B6'
-  },
-  music: {
-    emoji: '🎵',
-    name: 'Music',
-    description: 'Play and control music in voice channels',
-    color: '#1DB954'
-  },
-  community: {
-    emoji: '🎉',
-    name: 'Community',
-    description: 'Birthdays, events, giveaways, and more',
-    color: '#E91E63'
-  },
-  social: {
-    emoji: '💕',
-    name: 'Social',
-    description: 'Marriage and social interaction features',
-    color: '#FF69B4'
-  },
-  fun: {
-    emoji: '🎮',
-    name: 'Fun & Games',
-    description: 'Interactive games and entertainment',
-    color: '#00CED1'
-  },
-  info: {
-    emoji: 'ℹ️',
-    name: 'Information',
-    description: 'Bot and server information commands',
-    color: '#5865F2'
-  },
-  utility: {
-    emoji: '🔧',
-    name: 'Utility',
-    description: 'Handy tools and utility commands',
-    color: '#95A5A6'
-  }
+  admin: { name: 'Admin', description: 'Bot owner and administrator commands' },
+  config: { name: 'Configuration', description: 'Server setup, automod, and configuration' },
+  moderation: { name: 'Moderation', description: 'Keep your server safe and moderated' },
+  economy: { name: 'Economy', description: 'Coins, levels, profiles, and games of chance' },
+  music: { name: 'Music', description: 'Play and control music in voice channels' },
+  community: { name: 'Community', description: 'Birthdays, events, giveaways, and more' },
+  social: { name: 'Social', description: 'Marriage and social interaction features' },
+  fun: { name: 'Fun & Games', description: 'Interactive games and entertainment' },
+  info: { name: 'Information', description: 'Bot and server information commands' },
+  utility: { name: 'Utility', description: 'Handy tools and utility commands' },
+  misc: { name: 'Miscellaneous', description: 'Skills without a declared category' }
 };
 
-// Command examples for detailed help
+// Examples for commands that do not declare their own (written without the prefix)
 const COMMAND_EXAMPLES = {
   // Moderation
   ban: ['ban @user', 'ban @user spamming', 'ban @user raiding --delete'],
@@ -138,7 +46,7 @@ const COMMAND_EXAMPLES = {
   lockdown: ['lockdown', 'lockdown #channel', 'lockdown unlock'],
   verify: ['verify setup', 'verify panel', 'verify manual @user', 'verify config type button', 'verify config role @Verified', 'verify config unverifiedrole @Unverified', 'verify config channel #verify', 'verify config enable', 'verify config disable', 'verify status'],
   userhistory: ['userhistory @user', 'userhistory 123456789'],
-  
+
   // Music
   play: ['play never gonna give you up', 'play https://youtube.com/watch?v=...', 'play lofi hip hop'],
   skip: ['skip', 'skip 3'],
@@ -147,7 +55,7 @@ const COMMAND_EXAMPLES = {
   loop: ['loop track', 'loop queue', 'loop off'],
   remove: ['remove 3'],
   skipto: ['skipto 5'],
-  
+
   // Economy
   daily: ['daily'],
   balance: ['balance', 'balance @user'],
@@ -160,111 +68,260 @@ const COMMAND_EXAMPLES = {
   rep: ['rep @user'],
   claim: ['claim'],
   adventure: ['adventure'],
-  
-  // Gambling
   coinflip: ['coinflip heads 100', 'coinflip tails 500'],
   blackjack: ['blackjack 100', 'blackjack 1000'],
   slots: ['slots 50', 'slots 200'],
   dice: ['dice 100', 'dice 500 high'],
   roulette: ['roulette 100 red', 'roulette 500 black', 'roulette 200 7'],
-  
+
   // Config - AutoMod
   automod: ['automod enable', 'automod disable', 'automod status', 'automod badwords add word1,word2', 'automod antispam on', 'automod antiraid on'],
   automodignore: ['automodignore add channel #general', 'automodignore remove channel #general', 'automodignore add role @Moderator', 'automodignore list'],
   antinuke: ['antinuke enable', 'antinuke disable', 'antinuke whitelist @user', 'antinuke status'],
-  
+
   // Config - Welcome/Goodbye
-  welcome: ['welcome enable', 'welcome disable', 'welcome channel #welcome', 'welcome message Welcome {user} to {server}!', 'welcome title ✦ Welcome ✦', 'welcome color #5432A6', 'welcome image <url>', 'welcome thumbnail avatar', 'welcome author username', 'welcome mention on', 'welcome greet Hey {user}!', 'welcome role @Member', 'welcome status', 'welcome test', 'welcome reset'],
+  welcome: ['welcome enable', 'welcome disable', 'welcome channel #welcome', 'welcome message Welcome {user} to {server}!', 'welcome title Welcome', 'welcome color #5432A6', 'welcome image <url>', 'welcome thumbnail avatar', 'welcome author username', 'welcome mention on', 'welcome greet Hey {user}!', 'welcome role @Member', 'welcome status', 'welcome test', 'welcome reset'],
   goodbye: ['goodbye enable', 'goodbye disable', 'goodbye channel #goodbye', 'goodbye message Goodbye {user}!', 'goodbye status', 'goodbye test', 'goodbye reset'],
-  
+
   // Config - Boost
-  boost: ['boost status', 'boost channel #boosts', 'boost message Thanks {user} for boosting!', 'boost title 💎 New Booster!', 'boost color #f47fff', 'boost embed on', 'boost mention on', 'boost image <url>', 'boost thumbnail avatar', 'boost author username', 'boost test', 'boost preview', 'boost reset', 'boost role @BoosterRole', 'boost give @user', 'boost take @user', 'boost duration 24', 'boost list', 'boost addtier 1 @Tier1Role', 'boost removetier 1', 'boost listtiers', 'boost cleartiers'],
-  boostperks: ['boostperks status', 'boostperks channel #perks', 'boostperks message Check out our booster perks!', 'boostperks title 💎 Booster Perks', 'boostperks color #f47fff', 'boostperks image <url>', 'boostperks preview', 'boostperks publish', 'boostperks reset'],
-  
+  boost: ['boost status', 'boost channel #boosts', 'boost message Thanks {user} for boosting!', 'boost title New Booster', 'boost color #f47fff', 'boost embed on', 'boost mention on', 'boost image <url>', 'boost thumbnail avatar', 'boost author username', 'boost test', 'boost preview', 'boost reset', 'boost role @BoosterRole', 'boost give @user', 'boost take @user', 'boost duration 24', 'boost list', 'boost addtier 1 @Tier1Role', 'boost removetier 1', 'boost listtiers', 'boost cleartiers'],
+
   // Config - Auto Role
   autorole: ['autorole enable', 'autorole disable', 'autorole add @Member', 'autorole remove @Member', 'autorole delay 5', 'autorole bot add @BotRole', 'autorole bot remove @BotRole', 'autorole list'],
-  
+
   // Config - Logs
-  logs: ['logs', 'logs set mod #mod-logs', 'logs set message #message-logs', 'logs set voice #voice-logs', 'logs set member #member-logs', 'logs set server #server-logs', 'logs set join #join-logs', 'logs set leave #leave-logs', 'logs set alert #alert-logs', 'logs disable mod', 'logs all #all-logs', 'logs list'],
-  
+  setlogs: ['setlogs', 'setlogs set mod #mod-logs', 'setlogs set message #message-logs', 'setlogs set voice #voice-logs', 'setlogs set member #member-logs', 'setlogs disable mod', 'setlogs all #all-logs', 'setlogs list'],
+
   // Config - Levels
   levelroles: ['levelroles add 5 @Level5', 'levelroles remove 5', 'levelroles list'],
   levelup: ['levelup channel #level-up', 'levelup message Congrats {user}! Level {level}!', 'levelup status'],
   noxp: ['noxp add #channel', 'noxp remove #channel', 'noxp list', 'noxp clear'],
   xpmultiplier: ['xpmultiplier set @Booster 1.5', 'xpmultiplier remove @Booster', 'xpmultiplier list'],
-  
+
   // Config - Other
   setoverlay: ['setoverlay color #FF5733', 'setoverlay opacity 0.7', 'setoverlay color #000000 opacity 0.5', 'setoverlay reset'],
-  feature: ['feature economy enable', 'feature gambling disable', 'feature aichat enable', 'feature boost enable', 'feature list'],
+  feature: ['feature enable economy', 'feature disable gambling', 'feature status economy', 'feature list'],
   setup: ['setup'],
-  config: ['config prefix !', 'config status'],
+  config: ['config', 'config susthreshold 5', 'config embedcolor #00CED1'],
   setprefix: ['setprefix !', 'setprefix ?'],
   setchannel: ['setchannel modlog #mod-logs', 'setchannel welcome #welcome'],
   setrole: ['setrole admin @Admin', 'setrole mod @Moderator', 'setrole muted @Muted'],
   cmdchannels: ['cmdchannels add economy #bot-commands', 'cmdchannels remove economy #bot-commands', 'cmdchannels list'],
   colorroles: ['colorroles setup #color-roles', 'colorroles list'],
   reactionroles: ['reactionroles create', 'reactionroles add', 'reactionroles list'],
-  starboard: ['starboard channel #starboard', 'starboard threshold 3', 'starboard status'],
+  starboard: ['starboard', 'starboard channel #starboard', 'starboard threshold 3', 'starboard enable', 'starboard stats'],
   rules: ['rules set 1 No spamming', 'rules remove 5', 'rules list', 'rules post #rules'],
   manageshop: ['manageshop add "Cool Badge" 1000 badge', 'manageshop remove 1', 'manageshop list'],
-  
-  // Community - Birthdays
-  setbirthday: ['setbirthday 25 12', 'setbirthday 01 01 2000'],
+
+  // Community - Birthdays (dates are month then day)
+  setbirthday: ['setbirthday @user 12 25', 'setbirthday @user 12 25 2000', 'setbirthday @user 12 25 2000 --showage', 'setbirthday @user 12 25 --fake'],
   mybirthday: ['mybirthday'],
-  birthdays: ['birthdays', 'birthdays january'],
-  removebirthday: ['removebirthday @user'],
+  birthdays: ['birthdays', 'birthdays 7', 'birthdays 90'],
+  removebirthday: ['removebirthday'],
   cancelbirthday: ['cancelbirthday'],
-  birthdaypreference: ['birthdaypreference dm on', 'birthdaypreference ping off'],
-  birthdayconfig: ['birthdayconfig channel #birthdays', 'birthdayconfig role @Birthday', 'birthdayconfig message Happy Birthday {user}!', 'birthdayconfig status'],
-  requestbirthday: ['requestbirthday 25 12'],
-  approvebday: ['approvebday @user'],
-  rejectbday: ['rejectbday @user'],
-  birthdayrequests: ['birthdayrequests'],
-  
+  birthdaypreference: ['birthdaypreference status', 'birthdaypreference channel #birthdays', 'birthdaypreference role @Birthday', 'birthdaypreference message Happy Birthday {user}!', 'birthdaypreference enable'],
+  birthdayconfig: ['birthdayconfig status', 'birthdayconfig channel #birthdays', 'birthdayconfig role @Birthday', 'birthdayconfig message Happy Birthday {user}!', 'birthdayconfig preview'],
+  requestbirthday: ['requestbirthday 12 25', 'requestbirthday 12 25 2000', 'requestbirthday 12 25 2000 My birthday was entered incorrectly'],
+  approvebday: ['approvebday 1', 'approvebday #0001'],
+  rejectbday: ['rejectbday 1 Invalid date', 'rejectbday #0001 Please provide proof'],
+  birthdayrequests: ['birthdayrequests', 'birthdayrequests all', 'birthdayrequests approved'],
+
   // Community - Events & Giveaways
-  giveaway: ['giveaway 1h 1 Discord Nitro', 'giveaway 24h 3 Steam Gift Card'],
-  createevent: ['createevent "Movie Night" 2h Join us for a movie!'],
+  giveaway: ['giveaway start 1h 1 Discord Nitro', 'giveaway start 1d 3 Steam Gift Card', 'giveaway end <messageId>', 'giveaway reroll <messageId>', 'giveaway list'],
+  createevent: ['createevent 2h | Movie Night | Join us in VC!', 'createevent 1d12h | Tournament | Registration required', 'createevent 30m | Quick Meeting'],
   events: ['events'],
-  joinevent: ['joinevent 1'],
-  cancelevent: ['cancelevent 1'],
-  confession: ['confession I love this server'],
-  
+  joinevent: ['joinevent <event_id>'],
+  cancelevent: ['cancelevent <event_id>'],
+
   // Utility
-  top: ['top coins', 'top level', 'top rep'],
   leaderboard: ['leaderboard coins', 'leaderboard level'],
   avatar: ['avatar', 'avatar @user'],
   banner: ['banner', 'banner @user'],
-  poll: ['poll "Should we have movie night?"', 'poll "Best color?" Red Blue Green'],
+  poll: ['poll Should we have movie night? | Yes | No', 'poll Best color? | Red | Blue | Green'],
   afk: ['afk', 'afk brb dinner'],
   remind: ['remind 1h Check the oven', 'remind 30m Meeting'],
-  tempvc: ['tempvc create Gaming', 'tempvc limit 5', 'tempvc rename Chill Zone'],
+  tempvc: ['tempvc setup', 'tempvc limit 5', 'tempvc name Chill Zone'],
   ticket: ['ticket create', 'ticket close', 'ticket add @user'],
   embed: ['embed create', 'embed edit <messageId>'],
   steal: ['steal :emoji:'],
-  
+
   // Info
   help: ['help', 'help ban', 'help economy', 'help config'],
   serverinfo: ['serverinfo'],
   userinfo: ['userinfo', 'userinfo @user'],
-  roleinfo: ['roleinfo @Role'],
-  channelinfo: ['channelinfo #channel'],
+  roleinfo: ['roleinfo @Role', 'roleinfo Moderator'],
+  channelinfo: ['channelinfo', 'channelinfo #channel'],
   checkuser: ['checkuser @user', 'checkuser 123456789'],
   ping: ['ping'],
-  
+
   // Social
   marry: ['marry @user'],
   divorce: ['divorce'],
   badges: ['badges', 'badges @user'],
-  
+
   // Fun
   tictactoe: ['tictactoe @user'],
   trivia: ['trivia', 'trivia science'],
   meme: ['meme'],
-  gif: ['gif cat', 'gif dance'],
-  
-  // AI Chat
-  aichat: ['@Raphael hello!', '@Raphael what is the weather?', 'Reply to bot messages']
+  gif: ['gif cat', 'gif dance']
 };
+
+// ---------------------------------------------------------------------------
+// Command metadata
+// ---------------------------------------------------------------------------
+
+// File name -> folder, for commands that do not declare a category (read once)
+let folderCategories = null;
+function getFolderCategories() {
+  if (folderCategories) return folderCategories;
+  folderCategories = new Map();
+  try {
+    for (const folder of readdirSync(COMMANDS_DIR, { withFileTypes: true })) {
+      if (!folder.isDirectory()) continue;
+      for (const file of readdirSync(path.join(COMMANDS_DIR, folder.name))) {
+        if (file.endsWith('.js')) folderCategories.set(file.slice(0, -3).toLowerCase(), folder.name);
+      }
+    }
+  } catch (error) {
+    console.error('[help] Could not read the command folders:', error);
+  }
+  return folderCategories;
+}
+
+function categoryOf(cmd) {
+  // The Command base class defaults to "general" when a class command declares nothing
+  const declared = cmd.category && cmd.category !== 'general' ? cmd.category : null;
+  return (declared || getFolderCategories().get(cmd.name) || FALLBACK_CATEGORY).toLowerCase();
+}
+
+function categoryInfo(key) {
+  return CATEGORY_INFO[key] || { name: key.charAt(0).toUpperCase() + key.slice(1), description: 'Additional skills' };
+}
+
+// Class-based commands keep their text under description.content/usage/examples
+function descriptionOf(cmd) {
+  const text = typeof cmd.description === 'string' ? cmd.description : cmd.description?.content;
+  return text && text !== 'No description provided' ? text : 'No description available';
+}
+
+function usageOf(cmd) {
+  const raw = typeof cmd.usage === 'string' ? cmd.usage : cmd.description?.usage;
+  if (!raw || raw === 'No usage provided') return '';
+  // Some usage strings repeat the command name ("setbirthday <@user> ..."); drop it
+  return raw.replace(new RegExp(`^${cmd.name}\\b\\s*`, 'i'), '').trim();
+}
+
+function examplesOf(cmd) {
+  const declared = (cmd.examples || cmd.description?.examples || []).filter(Boolean);
+  return declared.length > 0 ? declared : (COMMAND_EXAMPLES[cmd.name] || []);
+}
+
+function permissionNames(value) {
+  if (value === undefined || value === null) return [];
+  try {
+    return new PermissionsBitField(value).toArray();
+  } catch {
+    return [].concat(value).map(String);
+  }
+}
+
+// Array form: Discord permissions, or a configured staff role (as the dispatcher checks).
+// Object form: { user } permissions the member must hold.
+function requiredPermissions(cmd) {
+  const perms = cmd.permissions;
+  if (!perms) return { names: [], staffRoleAccepted: false };
+  if (Array.isArray(perms) || typeof perms !== 'object') {
+    return { names: permissionNames(perms), staffRoleAccepted: Array.isArray(perms) };
+  }
+  return { names: permissionNames(perms.user), staffRoleAccepted: false };
+}
+
+function isOwner(userId) {
+  return Boolean(process.env.BOT_OWNER_ID) && userId === process.env.BOT_OWNER_ID;
+}
+
+// Unique commands the viewer may use (owner-only tools are hidden from everyone else)
+function visibleCommands(client, userId) {
+  const seen = new Set();
+  const result = [];
+  for (const cmd of client.commands.values()) {
+    if (!cmd?.name || seen.has(cmd.name)) continue;
+    if (cmd.ownerOnly && !isOwner(userId)) continue;
+    seen.add(cmd.name);
+    result.push(cmd);
+  }
+  return result;
+}
+
+function groupByCategory(commands) {
+  const groups = new Map();
+  for (const cmd of commands) {
+    const key = categoryOf(cmd);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(cmd);
+  }
+  for (const list of groups.values()) list.sort((a, b) => a.name.localeCompare(b.name));
+
+  const order = Object.keys(CATEGORY_INFO);
+  const rank = (key) => (order.includes(key) ? order.indexOf(key) : order.length);
+  return new Map([...groups.entries()].sort(([a], [b]) => rank(a) - rank(b) || a.localeCompare(b)));
+}
+
+function findCommand(client, name) {
+  const key = name.toLowerCase();
+  return client.commands.get(key) ||
+    client.commands.get(client.aliases?.get(key)) ||
+    client.commands.find(cmd => cmd.aliases?.includes(key));
+}
+
+function resolveCategoryKey(groups, input) {
+  const key = input.toLowerCase();
+  if (groups.has(key)) return key;
+  for (const candidate of groups.keys()) {
+    if (categoryInfo(candidate).name.toLowerCase() === key) return candidate;
+  }
+  return null;
+}
+
+// Names of the slash commands actually registered (src/utils/slashCommands.js); loaded once
+let slashNamesPromise = null;
+function getSlashNames() {
+  slashNamesPromise ??= import('../../utils/slashCommands.js')
+    .then(mod => new Set(mod.getSlashCommands().map(cmd => cmd.name)))
+    .catch((error) => {
+      console.error('[help] Could not read the registered slash commands:', error);
+      return new Set();
+    });
+  return slashNamesPromise;
+}
+
+// Pack items into field values of at most 1024 characters, remembering how many items each holds
+function packItems(items, separator = '\n', limit = FIELD_VALUE_LIMIT) {
+  const chunks = [];
+  let current = null;
+  for (const item of items) {
+    const safe = truncate(item, limit);
+    if (current && current.text.length + separator.length + safe.length <= limit) {
+      current.text += separator + safe;
+      current.count++;
+    } else {
+      current = { text: safe, count: 1 };
+      chunks.push(current);
+    }
+  }
+  return chunks;
+}
+
+function embedTextLength(embed) {
+  const data = embed.data;
+  return (data.title?.length || 0) + (data.description?.length || 0) +
+    (data.author?.name?.length || 0) + (data.footer?.text?.length || 0) +
+    (data.fields || []).reduce((sum, f) => sum + f.name.length + f.value.length, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Command
+// ---------------------------------------------------------------------------
 
 export default {
   name: 'help',
@@ -276,103 +333,100 @@ export default {
   examples: ['help', 'help ban', 'help economy'],
 
   async execute(message, args, client) {
-    const prefix = await getPrefix(message.guild.id);
-    const guildData = await Guild.getGuild(message.guild.id);
-    const disabledCommands = guildData?.textCommands?.disabledCommands || [];
+    try {
+      const prefix = await getPrefix(message.guild.id);
+      const guildData = await Guild.getGuild(message.guild.id);
+      const ctx = {
+        message,
+        prefix,
+        client,
+        disabledCommands: guildData?.textCommands?.disabledCommands || [],
+        commands: visibleCommands(client, message.author.id),
+        slashNames: await getSlashNames()
+      };
+      ctx.groups = groupByCategory(ctx.commands);
 
-    // If specific command or category is requested
-    if (args[0]) {
-      // Check if it's a category
-      const categoryKey = args[0].toLowerCase();
-      if (CATEGORY_INFO[categoryKey]) {
-        const embed = await createCategoryEmbed(categoryKey, prefix, client, disabledCommands);
-        return message.reply({ embeds: [embed] });
+      if (args[0]) {
+        const categoryKey = resolveCategoryKey(ctx.groups, args[0]);
+        if (categoryKey) {
+          return message.reply({ embeds: [createCategoryEmbed(ctx, categoryKey)] });
+        }
+        return showCommandDetail(ctx, args[0]);
       }
-      // Otherwise show command detail
-      return showCommandDetail(message, args[0], prefix, client, disabledCommands);
-    }
 
-    // Show main help menu
-    await showMainHelp(message, prefix, client, disabledCommands);
+      return showMainHelp(ctx);
+    } catch (error) {
+      console.error('[help] Error:', error);
+      return message.reply({
+        embeds: [new EmbedBuilder()
+          .setColor(COLORS.RAPHAEL_ERROR)
+          .setTitle('『 Alert 』')
+          .setDescription('**Warning:** The skill archive could not be displayed, Master.')
+          .setFooter({ text: getRandomFooter() })]
+      });
+    }
   }
 };
 
-async function showMainHelp(message, prefix, client, disabledCommands) {
-  const embed = createMainHelpEmbed(message, prefix, client, disabledCommands);
+function notYourMenu(interaction) {
+  return interaction.reply({
+    content: '**Notice:** Only the member who opened this menu can use it, Master.',
+    flags: MessageFlags.Ephemeral
+  });
+}
+
+async function showMainHelp(ctx) {
+  const { message } = ctx;
 
   const selectMenu = new StringSelectMenuBuilder()
     .setCustomId('help_category')
     .setPlaceholder('◈ Select a skill category, Master...')
     .addOptions(
-      Object.entries(CATEGORY_INFO).map(([key, info]) => ({
-        label: info.name,
-        description: `${COMMANDS_BY_CATEGORY[key].length} skills • ${info.description.slice(0, 50)}`,
-        value: key,
-        emoji: info.emoji
-      }))
+      [...ctx.groups.entries()].slice(0, 25).map(([key, commands]) => {
+        const info = categoryInfo(key);
+        return {
+          label: info.name,
+          description: truncate(`${commands.length} skills • ${info.description}`, 100),
+          value: key
+        };
+      })
     );
 
   const row1 = new ActionRowBuilder().addComponents(selectMenu);
-
   const row2 = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId('help_home')
-      .setLabel('Home')
-      .setStyle(ButtonStyle.Primary)
-      .setEmoji('🏠'),
-    new ButtonBuilder()
-      .setCustomId('help_slash')
-      .setLabel('Slash Commands')
-      .setStyle(ButtonStyle.Secondary)
-      .setEmoji('⌨️'),
-    new ButtonBuilder()
-      .setCustomId('help_features')
-      .setLabel('Features')
-      .setStyle(ButtonStyle.Secondary)
-      .setEmoji('✨'),
-    new ButtonBuilder()
-      .setLabel('Support')
-      .setStyle(ButtonStyle.Link)
-      .setURL('https://github.com/GhazanfarAteeb/jura-bot')
-      .setEmoji('💬')
+    new ButtonBuilder().setCustomId('help_home').setLabel('Home').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId('help_slash').setLabel('Slash Commands').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('help_features').setLabel('Features').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setLabel('Support').setStyle(ButtonStyle.Link).setURL('https://github.com/GhazanfarAteeb/jura-bot')
   );
 
   const reply = await message.reply({
-    embeds: [embed],
+    embeds: [createMainHelpEmbed(ctx)],
     components: [row1, row2]
   });
 
-  // Create collector
-  const collector = reply.createMessageComponentCollector({
-    filter: (i) => i.user.id === message.author.id,
-    time: 300000 // 5 minutes
-  });
+  const collector = reply.createMessageComponentCollector({ time: MAIN_MENU_TIMEOUT_MS });
 
   collector.on('collect', async (interaction) => {
-    await interaction.deferUpdate();
+    try {
+      if (interaction.user.id !== message.author.id) return notYourMenu(interaction);
 
-    if (interaction.isStringSelectMenu()) {
-      const category = interaction.values[0];
-      const categoryEmbed = await createCategoryEmbed(category, prefix, interaction.client, disabledCommands);
-      await interaction.editReply({ embeds: [categoryEmbed] });
-    } else if (interaction.isButton()) {
-      switch (interaction.customId) {
-        case 'help_home': {
-          const homeEmbed = createMainHelpEmbed(message, prefix, interaction.client, disabledCommands);
-          await interaction.editReply({ embeds: [homeEmbed] });
-          break;
-        }
-        case 'help_slash': {
-          const slashEmbed = createSlashCommandsEmbed(prefix, interaction.client);
-          await interaction.editReply({ embeds: [slashEmbed] });
-          break;
-        }
-        case 'help_features': {
-          const featuresEmbed = createFeaturesEmbed(prefix, interaction.client);
-          await interaction.editReply({ embeds: [featuresEmbed] });
-          break;
-        }
+      await interaction.deferUpdate();
+
+      let embed = null;
+      if (interaction.isStringSelectMenu()) {
+        embed = createCategoryEmbed(ctx, interaction.values[0]);
+      } else if (interaction.customId === 'help_home') {
+        embed = createMainHelpEmbed(ctx);
+      } else if (interaction.customId === 'help_slash') {
+        embed = createSlashCommandsEmbed(ctx);
+      } else if (interaction.customId === 'help_features') {
+        embed = createFeaturesEmbed(ctx);
       }
+
+      if (embed) await interaction.editReply({ embeds: [embed] });
+    } catch (error) {
+      console.error('[help] Menu error:', error);
     }
   });
 
@@ -380,69 +434,52 @@ async function showMainHelp(message, prefix, client, disabledCommands) {
     const disabledRow1 = ActionRowBuilder.from(row1);
     const disabledRow2 = ActionRowBuilder.from(row2);
     disabledRow1.components[0].setDisabled(true);
-    disabledRow2.components.forEach((btn, i) => {
-      if (i < 3) btn.setDisabled(true); // Don't disable link button
+    disabledRow2.components.forEach((btn) => {
+      if (btn.data.style !== ButtonStyle.Link) btn.setDisabled(true);
     });
     reply.edit({ components: [disabledRow1, disabledRow2] }).catch(() => { });
   });
 }
 
-function createMainHelpEmbed(message, prefix, client, disabledCommands) {
-  const totalCommands = client.commands.size;
-  const categoryCount = Object.keys(CATEGORY_INFO).length;
-  const enabledCommands = totalCommands - disabledCommands.length;
+function createMainHelpEmbed(ctx) {
+  const { message, prefix, client } = ctx;
+  const totalCommands = ctx.commands.length;
+  const disabledCount = ctx.commands.filter(cmd => ctx.disabledCommands.includes(cmd.name)).length;
 
   const embed = new EmbedBuilder()
-    .setColor('#00CED1')
+    .setColor(COLORS.RAPHAEL)
     .setAuthor({
-      name: `『 Raphael • Skill Archive 』`,
+      name: '『 Raphael • Skill Archive 』',
       iconURL: client.user.displayAvatarURL({ dynamic: true })
     })
     .setDescription(
-      `**Answer:** I am Raphael, the Ultimate Skill serving as your assistant, Master.\n\n` +
-      `I possess numerous capabilities to aid you. Below is a summary of my available functions.\n\n` +
+      '**Answer:** I am Raphael, the Ultimate Skill serving as your assistant, Master.\n\n' +
+      'I possess numerous capabilities to aid you. Below is a summary of my available functions.\n\n' +
       `▸ **Activation Prefix:** \`${prefix}\`\n` +
-      `▸ **Available Skills:** \`${enabledCommands}\` active / \`${totalCommands}\` total\n` +
-      `▸ **Skill Categories:** \`${categoryCount}\`\n\n` +
-      `**Quick Reference:**\n` +
-      `◈ Use the selection menu below to browse categories\n` +
+      `▸ **Available Skills:** \`${totalCommands - disabledCount}\` active / \`${totalCommands}\` total\n` +
+      `▸ **Skill Categories:** \`${ctx.groups.size}\`\n\n` +
+      '**Quick Reference:**\n' +
+      '◈ Use the selection menu below to browse categories\n' +
       `◈ Command \`${prefix}help <skill>\` for detailed analysis\n` +
       `◈ Command \`${prefix}help <category>\` for category overview`
     )
     .setThumbnail(client.user.displayAvatarURL({ dynamic: true, size: 256 }));
 
-  // Add category overview in a compact format
-  const categories = Object.entries(CATEGORY_INFO);
-  const leftColumn = categories.slice(0, Math.ceil(categories.length / 2));
-  const rightColumn = categories.slice(Math.ceil(categories.length / 2));
-
-  const formatCategory = ([key, info]) => {
-    const count = COMMANDS_BY_CATEGORY[key].length;
-    return `${info.emoji} **${info.name}** (${count})`;
-  };
+  const categories = [...ctx.groups.entries()].map(([key, commands]) => `${GLYPHS.ARROW_RIGHT} **${categoryInfo(key).name}** (${commands.length})`);
+  const half = Math.ceil(categories.length / 2);
 
   embed.addFields(
+    { name: '◈ Skill Categories', value: categories.slice(0, half).join('\n') || 'None', inline: true },
+    { name: '\u200b', value: categories.slice(half).join('\n') || '\u200b', inline: true },
     {
-      name: '◈ Skill Categories',
-      value: leftColumn.map(formatCategory).join('\n'),
-      inline: true
-    },
-    {
-      name: '\u200b',
-      value: rightColumn.map(formatCategory).join('\n'),
-      inline: true
+      name: '◈ Advisory',
+      value:
+        `◇ Skills marked ${SLASH_MARKER} can also be activated as slash commands\n` +
+        `◇ Use \`${prefix}feature\` to toggle system modules\n` +
+        `◇ Use \`${prefix}setup\` for initial configuration protocol`,
+      inline: false
     }
   );
-
-  // Quick tips - Raphael style
-  embed.addFields({
-    name: '◈ Advisory',
-    value:
-      `◇ Skills marked with ⌨️ support slash command activation\n` +
-      `◇ Use \`${prefix}feature\` to toggle system modules\n` +
-      `◇ Use \`${prefix}setup\` for initial configuration protocol`,
-    inline: false
-  });
 
   embed.setFooter({
     text: `${getRandomFooter()} • Requested by ${message.author.displayName}`,
@@ -453,324 +490,257 @@ function createMainHelpEmbed(message, prefix, client, disabledCommands) {
   return embed;
 }
 
-async function createCategoryEmbed(category, prefix, client, disabledCommands) {
-  const info = CATEGORY_INFO[category];
-  const commands = COMMANDS_BY_CATEGORY[category];
+function createCategoryEmbed(ctx, categoryKey) {
+  const { prefix, client } = ctx;
+  const info = categoryInfo(categoryKey);
+  const commands = ctx.groups.get(categoryKey) || [];
 
   const embed = new EmbedBuilder()
-    .setColor(info.color || COLORS.PRIMARY)
+    .setColor(COLORS.RAPHAEL)
     .setAuthor({
-      name: `${info.emoji} ${info.name} Commands`,
+      name: `『 ${info.name} Skills 』`,
       iconURL: client.user.displayAvatarURL({ dynamic: true })
     })
     .setDescription(
-      `${info.description}\n\n` +
-      `**Total Skills:** ${commands.length} • ` +
-      `Use \`${prefix}help <skill>\` for detailed analysis`
-    );
+      `**Analysis:** ${info.description}.\n\n` +
+      `**Total Skills:** ${commands.length} • Use \`${prefix}help <skill>\` for detailed analysis`
+    )
+    .setFooter({ text: `${getRandomFooter()} • ${info.name} • ${commands.length} skills` })
+    .setTimestamp();
 
-  // Build command list with status indicators - Raphael style
-  const commandList = commands.map(cmdName => {
-    const cmd = client.commands.get(cmdName);
-    const isDisabled = disabledCommands.includes(cmdName);
-    const hasSlash = SLASH_COMMANDS.includes(cmdName);
-
-    let indicators = '';
-    if (hasSlash) indicators += ' ⌨️';
-    if (isDisabled) indicators += ' ○';
-
-    const name = isDisabled ? `~~${cmdName}~~` : `**${cmdName}**`;
-    const desc = cmd?.description || 'No description available';
-    const shortDesc = desc.length > 40 ? desc.slice(0, 40) + '...' : desc;
-
-    return `▸ ${name}${indicators}\n◇ ${shortDesc}`;
+  const lines = commands.map(cmd => {
+    const isDisabled = ctx.disabledCommands.includes(cmd.name);
+    const name = isDisabled ? `~~${cmd.name}~~` : `**${cmd.name}**`;
+    const slash = ctx.slashNames.has(cmd.name) ? ` ${SLASH_MARKER}` : '';
+    return `▸ ${name}${slash}\n◇ ${truncate(descriptionOf(cmd), SHORT_DESCRIPTION_LENGTH)}`;
   });
 
-  // Split into chunks of 6 commands per field
-  const chunkSize = 6;
-  for (let i = 0; i < commandList.length; i += chunkSize) {
-    const chunk = commandList.slice(i, i + chunkSize);
-    const fieldName = i === 0 ? '◈ Available Skills' : '\u200b';
-    embed.addFields({
-      name: fieldName,
-      value: chunk.join('\n'),
-      inline: false
-    });
+  const legend = { name: '◈ Status Indicators', value: `${SLASH_MARKER} Slash command available • ~~struck~~ Currently deactivated` };
+  const moreNoteReserve = 40;
+  let shown = 0;
+
+  for (const [i, chunk] of packItems(lines).entries()) {
+    const field = { name: i === 0 ? '◈ Available Skills' : '\u200b', value: chunk.text };
+    const projected = embedTextLength(embed) + field.name.length + field.value.length +
+      legend.name.length + legend.value.length + moreNoteReserve;
+    if (projected > EMBED_TEXT_BUDGET) break;
+    embed.addFields(field);
+    shown += chunk.count;
   }
 
-  // Legend - Raphael style
-  embed.addFields({
-    name: '◈ Status Indicators',
-    value: '⌨️ Slash command compatible • ○ Currently deactivated',
-    inline: false
-  });
+  if (shown < lines.length) {
+    embed.addFields({ name: '\u200b', value: `+${lines.length - shown} more skills` });
+  }
 
-  embed.setFooter({
-    text: `${getRandomFooter()} • ${info.name} • ${commands.length} skills`
-  });
-  embed.setTimestamp();
-
+  embed.addFields(legend);
   return embed;
 }
 
-function createSlashCommandsEmbed(prefix, client) {
+function createSlashCommandsEmbed(ctx) {
+  const { prefix, client } = ctx;
+
   const embed = new EmbedBuilder()
-    .setColor('#00CED1')
+    .setColor(COLORS.RAPHAEL)
     .setAuthor({
       name: '『 Slash Command Registry 』',
       iconURL: client.user.displayAvatarURL({ dynamic: true })
     })
     .setDescription(
-      `**Analysis:** These skills support slash command activation.\n\n` +
-      `Slash commands provide enhanced input validation and autocomplete functionality.\n\n` +
-      `*Tip: Input \`/\` in the chat interface to view all available slash commands, Master.*`
+      '**Analysis:** These skills are registered as slash commands.\n\n' +
+      'Slash commands provide enhanced input validation and autocomplete functionality.\n\n' +
+      '*Tip: Input `/` in the chat interface to view all available slash commands, Master.*'
     );
 
-  // Group slash commands by category
-  const slashByCategory = {};
-  for (const cmd of SLASH_COMMANDS) {
-    for (const [category, commands] of Object.entries(COMMANDS_BY_CATEGORY)) {
-      if (commands.includes(cmd)) {
-        if (!slashByCategory[category]) slashByCategory[category] = [];
-        slashByCategory[category].push(cmd);
-        break;
-      }
-    }
+  // Group registered slash commands by the category of the matching prefix command
+  const byCategory = new Map();
+  for (const name of [...ctx.slashNames].sort()) {
+    const cmd = ctx.client.commands.get(name);
+    const key = cmd ? categoryOf(cmd) : 'slash-only';
+    if (!byCategory.has(key)) byCategory.set(key, []);
+    byCategory.get(key).push(`\`/${name}\``);
   }
 
-  for (const [category, commands] of Object.entries(slashByCategory)) {
-    const info = CATEGORY_INFO[category];
-    if (info && commands.length > 0) {
-      embed.addFields({
-        name: `${info.emoji} ${info.name}`,
-        value: commands.map(c => `\`/${c}\``).join(' '),
-        inline: true
-      });
-    }
+  for (const [key, names] of groupByCategoryOrder(byCategory)) {
+    const label = key === 'slash-only' ? 'Slash Only' : categoryInfo(key).name;
+    packItems(names, ' ').forEach((chunk, i) => {
+      embed.addFields({ name: i === 0 ? `▸ ${label}` : '\u200b', value: chunk.text, inline: true });
+    });
+  }
+
+  if (ctx.slashNames.size === 0) {
+    embed.addFields({ name: '▸ Registry', value: 'No slash commands could be read at this time.' });
   }
 
   embed.addFields({
     name: '◈ Notice',
-    value: `Additional slash commands are being developed.\nMost skills remain accessible via the \`${prefix}\` prefix.`,
+    value: `Most skills remain accessible via the \`${prefix}\` prefix.`,
     inline: false
   });
 
-  embed.setFooter({ text: `${getRandomFooter()} • ${SLASH_COMMANDS.length} slash commands registered` });
+  embed.setFooter({ text: `${getRandomFooter()} • ${ctx.slashNames.size} slash commands registered` });
   embed.setTimestamp();
 
   return embed;
 }
 
-function createFeaturesEmbed(prefix, client) {
+// Same ordering as the category menu for any map keyed by category
+function groupByCategoryOrder(map) {
+  const order = Object.keys(CATEGORY_INFO);
+  const rank = (key) => (order.includes(key) ? order.indexOf(key) : order.length);
+  return [...map.entries()].sort(([a], [b]) => rank(a) - rank(b) || a.localeCompare(b));
+}
+
+function createFeaturesEmbed(ctx) {
+  const { prefix, client } = ctx;
+
   const embed = new EmbedBuilder()
-    .setColor('#00CED1')
+    .setColor(COLORS.RAPHAEL)
     .setAuthor({
       name: '『 System Capabilities 』',
       iconURL: client.user.displayAvatarURL({ dynamic: true })
     })
     .setDescription(
-      `**Report:** The following modules are available for this server.\n\n` +
+      '**Report:** The following modules are available for this server.\n\n' +
       `Use \`${prefix}setup\` to initiate configuration protocol.`
     );
 
   const features = [
-    {
-      name: '▸ Moderation & AutoMod',
-      value: 'Bans, kicks, warnings, timeouts, anti-spam, anti-raid, anti-nuke, bad word filter, and more.'
-    },
-    {
-      name: '▸ Economy System',
-      value: 'Daily rewards, coins, leveling, XP multipliers, profiles, backgrounds, and shop system.'
-    },
-    {
-      name: '▸ Gambling Games',
-      value: 'Coinflip, slots, dice, roulette, and blackjack with customizable betting.'
-    },
-    {
-      name: '▸ Music Player',
-      value: 'High-quality music from YouTube, Spotify, and more with queue management.'
-    },
-    {
-      name: '▸ Community Features',
-      value: 'Birthdays, events, giveaways, starboard, tickets, and welcome messages.'
-    },
-    {
-      name: '▸ Customization',
-      value: 'Custom prefix, autoroles, reaction roles, color roles, and embed styling.'
-    },
-    {
-      name: '▸ Logging',
-      value: 'Message logs, member logs, moderation logs, and voice channel logs.'
-    },
-    {
-      name: '▸ Security',
-      value: 'Verification system, anti-nuke protection, and permission management.'
-    }
+    { name: '▸ Moderation & AutoMod', value: 'Bans, kicks, warnings, timeouts, anti-spam, anti-raid, anti-nuke, bad word filter, and more.' },
+    { name: '▸ Economy System', value: 'Daily rewards, coins, leveling, XP multipliers, profiles, backgrounds, and shop system.' },
+    { name: '▸ Games of Chance', value: 'Coinflip, slots, dice, roulette, and blackjack with customizable betting.' },
+    { name: '▸ Music Player', value: 'High-quality music from YouTube, Spotify, and more with queue management.' },
+    { name: '▸ Community Features', value: 'Birthdays, events, giveaways, starboard, confessions, tickets, and welcome messages.' },
+    { name: '▸ Customization', value: 'Custom prefix, autoroles, reaction roles, color roles, and embed styling.' },
+    { name: '▸ Logging', value: 'Message logs, member logs, moderation logs, and voice channel logs.' },
+    { name: '▸ Security', value: 'Verification system, anti-nuke protection, and permission management.' }
   ];
 
-  for (const feature of features) {
-    embed.addFields({
-      name: feature.name,
-      value: feature.value,
-      inline: true
-    });
-  }
-
-  embed.setFooter({ text: `Use ${prefix}help <category> to explore commands` });
+  embed.addFields(features.map(feature => ({ ...feature, inline: true })));
+  embed.setFooter({ text: `${getRandomFooter()} • ${prefix}help <category> to explore skills` });
   embed.setTimestamp();
 
   return embed;
 }
 
-async function showCommandDetail(message, commandName, prefix, client, disabledCommands) {
-  const command = client.commands.get(commandName.toLowerCase()) ||
-    client.commands.find(cmd => cmd.aliases && cmd.aliases.includes(commandName.toLowerCase()));
+async function showCommandDetail(ctx, commandName) {
+  const { message, prefix, client } = ctx;
+  const command = findCommand(client, commandName);
 
-  if (!command) {
+  if (!command || (command.ownerOnly && !isOwner(message.author.id))) {
     const embed = new EmbedBuilder()
-      .setColor(COLORS.ERROR)
+      .setColor(COLORS.RAPHAEL_ERROR)
+      .setTitle('『 Skill Not Found 』')
       .setDescription(
-        `${GLYPHS.ERROR} **Command not found:** \`${commandName}\`\n\n` +
-        `${GLYPHS.ARROW_RIGHT} Use \`${prefix}help\` to see all available commands.\n` +
+        `${GLYPHS.ERROR} **No skill matches** \`${truncate(commandName, 50)}\`, Master.\n\n` +
+        `${GLYPHS.ARROW_RIGHT} Use \`${prefix}help\` to see all available skills.\n` +
         `${GLYPHS.ARROW_RIGHT} Try \`${prefix}help <category>\` to browse by category.`
-      );
+      )
+      .setFooter({ text: getRandomFooter() });
     return message.reply({ embeds: [embed] });
   }
 
-  const isDisabled = disabledCommands.includes(command.name);
-  const hasSlash = SLASH_COMMANDS.includes(command.name);
-  const categoryInfo = CATEGORY_INFO[command.category];
+  const isDisabled = ctx.disabledCommands.includes(command.name);
+  const hasSlash = ctx.slashNames.has(command.name);
+  const categoryKey = categoryOf(command);
+  const info = categoryInfo(categoryKey);
 
   const embed = new EmbedBuilder()
-    .setColor(isDisabled ? COLORS.MUTED : (categoryInfo?.color || COLORS.PRIMARY))
+    .setColor(isDisabled ? COLORS.MUTED : COLORS.RAPHAEL)
     .setAuthor({
       name: `『 Skill Analysis: ${command.name} 』`,
       iconURL: client.user.displayAvatarURL({ dynamic: true })
     })
     .setDescription(
-      (isDisabled ? `**Warning:** This skill is currently deactivated.\n\n` : '') +
-      `**Analysis:** ${command.description || 'No analysis data available.'}`
+      (isDisabled ? '**Warning:** This skill is currently deactivated.\n\n' : '') +
+      `**Analysis:** ${descriptionOf(command)}`
     );
 
-  // Status badges
   const badges = [];
-  if (hasSlash) badges.push('⌨️ Slash');
-  if (isDisabled) badges.push('◎ Deactivated');
+  if (hasSlash) badges.push(`${SLASH_MARKER} Slash`);
+  if (isDisabled) badges.push('◇ Deactivated');
   if (command.cooldown) badges.push(`◈ ${command.cooldown}s cooldown`);
 
   if (badges.length > 0) {
-    embed.addFields({
-      name: '▸ Status Indicators',
-      value: badges.join(' • '),
-      inline: false
-    });
+    embed.addFields({ name: '▸ Status Indicators', value: badges.join(' • '), inline: false });
   }
 
-  // Usage
-  const usage = command.usage ? `${prefix}${command.name} ${command.usage}` : `${prefix}${command.name}`;
+  const usage = usageOf(command);
   embed.addFields({
     name: '▸ Activation Syntax',
-    value: `\`\`\`${usage}\`\`\``,
+    value: `\`\`\`${truncate(`${prefix}${command.name}${usage ? ` ${usage}` : ''}`, 1000)}\`\`\``,
     inline: false
   });
 
-  // Aliases
-  if (command.aliases && command.aliases.length > 0) {
+  if (command.aliases?.length > 0) {
     embed.addFields({
       name: '▸ Alternative Triggers',
-      value: command.aliases.map(a => `\`${prefix}${a}\``).join(', '),
+      value: truncate(command.aliases.map(a => `\`${prefix}${a}\``).join(', '), 1024),
       inline: true
     });
   }
 
-  // Category
-  if (categoryInfo) {
-    embed.addFields({
-      name: '▸ Classification',
-      value: `${categoryInfo.emoji} ${categoryInfo.name}`,
-      inline: true
-    });
-  }
+  embed.addFields({ name: '▸ Classification', value: info.name, inline: true });
 
-  // Permissions
-  if (command.permissions && command.permissions.length > 0) {
+  const { names: permissions, staffRoleAccepted } = requiredPermissions(command);
+  if (permissions.length > 0) {
     embed.addFields({
       name: '▸ Required Authorization',
-      value: command.permissions.map(p => `\`${p}\``).join(', '),
+      value: truncate(
+        permissions.map(p => `\`${p}\``).join(', ') + (staffRoleAccepted ? '\n◇ or a configured staff or moderator role' : ''),
+        1024
+      ),
       inline: false
     });
   }
 
-  // Examples
-  const examples = command.examples || COMMAND_EXAMPLES[command.name];
-  if (examples && examples.length > 0) {
-    const formattedExamples = examples.map(ex => {
-      // If example already has prefix, use as is
-      if (ex.startsWith(command.name)) {
-        return `\`${prefix}${ex}\``;
-      }
-      return `\`${prefix}${ex}\``;
-    });
-    embed.addFields({
-      name: '▸ Usage Examples',
-      value: formattedExamples.join('\n'),
-      inline: false
-    });
+  const examples = examplesOf(command);
+  if (examples.length > 0) {
+    const formatted = examples.map(ex => (ex.startsWith('@') ? `\`${ex}\`` : `\`${prefix}${ex}\``));
+    embed.addFields({ name: '▸ Usage Examples', value: packItems(formatted)[0].text, inline: false });
   }
 
-  // Slash command tip
   if (hasSlash) {
-    embed.addFields({
-      name: '▸ Slash Command',
-      value: `This skill also responds to \`/${command.name}\`, Master.`,
-      inline: false
-    });
+    embed.addFields({ name: '▸ Slash Command', value: `This skill also responds to \`/${command.name}\`, Master.`, inline: false });
   }
 
-  embed.setFooter({
-    text: `${getRandomFooter()} • Use ${prefix}help for skill archive`
-  });
+  embed.setFooter({ text: `${getRandomFooter()} • Use ${prefix}help for skill archive` });
   embed.setTimestamp();
 
-  // Add quick action buttons
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
-      .setCustomId(`help_category_${command.category}`)
-      .setLabel(`View ${categoryInfo?.name || 'Category'}`)
-      .setStyle(ButtonStyle.Secondary)
-      .setEmoji(categoryInfo?.emoji || '📂'),
+      .setCustomId(`help_category_${categoryKey}`)
+      .setLabel(truncate(`View ${info.name}`, 80))
+      .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId('help_home_detail')
       .setLabel('All Categories')
       .setStyle(ButtonStyle.Primary)
-      .setEmoji('🏠')
   );
 
   const reply = await message.reply({ embeds: [embed], components: [row] });
 
-  const collector = reply.createMessageComponentCollector({
-    filter: (i) => i.user.id === message.author.id,
-    time: 60000
-  });
+  const collector = reply.createMessageComponentCollector({ time: DETAIL_TIMEOUT_MS });
 
   collector.on('collect', async (interaction) => {
-    await interaction.deferUpdate();
+    try {
+      if (interaction.user.id !== message.author.id) return notYourMenu(interaction);
 
-    if (interaction.customId.startsWith('help_category_')) {
-      const cat = interaction.customId.replace('help_category_', '');
-      if (CATEGORY_INFO[cat]) {
-        const catEmbed = await createCategoryEmbed(cat, prefix, client, disabledCommands);
-        await interaction.editReply({ embeds: [catEmbed], components: [] });
-      }
-    } else if (interaction.customId === 'help_home_detail') {
-      const mainEmbed = createMainHelpEmbed(message, prefix, client, disabledCommands);
-      await interaction.editReply({ embeds: [mainEmbed], components: [] });
+      await interaction.deferUpdate();
+
+      const next = interaction.customId === 'help_home_detail'
+        ? createMainHelpEmbed(ctx)
+        : createCategoryEmbed(ctx, interaction.customId.replace('help_category_', ''));
+
+      // The buttons are removed here, so the end handler must not put them back
+      await interaction.editReply({ embeds: [next], components: [] });
+      collector.stop('navigated');
+    } catch (error) {
+      console.error('[help] Detail button error:', error);
     }
-
-    collector.stop();
   });
 
-  collector.on('end', () => {
+  collector.on('end', (_collected, reason) => {
+    if (reason === 'navigated') return;
     row.components.forEach(btn => btn.setDisabled(true));
     reply.edit({ components: [row] }).catch(() => { });
   });

@@ -1,155 +1,167 @@
-import { PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
+import { PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags } from 'discord.js';
 import { BirthdayRequest } from '../../models/Birthday.js';
 import Guild from '../../models/Guild.js';
-import { errorEmbed, infoEmbed, GLYPHS } from '../../utils/embeds.js';
-import { MONTH_NAMES } from './requestbirthday.js';
+import { errorEmbed, COLORS } from '../../utils/embeds.js';
+import { getPrefix } from '../../utils/helpers.js';
+import { getRandomFooter } from '../../utils/raphael.js';
+import { formatDate } from './requestbirthday.js';
+
+const FILTERS = ['open', 'approved', 'rejected', 'cancelled', 'all'];
+const FILTER_LABELS = { open: 'Open', approved: 'Approved', rejected: 'Rejected', cancelled: 'Cancelled', all: 'All' };
+const STATUS_GLYPHS = { open: '◇', approved: '◉', rejected: '◆', cancelled: '—' };
+const PRIORITY_LABELS = { low: '◇ Low', normal: '◈ Normal', high: '◆ High' };
+const TICKETS_SHOWN = 10;
+const BUTTON_TIMEOUT_MS = 2 * 60 * 1000;
+
+// Priority is stored as a string, so sort on an explicit rank: high first, then normal, then low
+const PRIORITY_RANK = {
+  $switch: {
+    branches: [
+      { case: { $eq: ['$priority', 'high'] }, then: 0 },
+      { case: { $eq: ['$priority', 'low'] }, then: 2 }
+    ],
+    default: 1
+  }
+};
+
+async function buildDashboard(guildId, filter, prefix, client) {
+  const match = filter === 'all' ? { guildId } : { guildId, status: filter };
+
+  const [requests, total, stats] = await Promise.all([
+    BirthdayRequest.aggregate([
+      { $match: match },
+      { $addFields: { priorityRank: PRIORITY_RANK } },
+      { $sort: { priorityRank: 1, createdAt: -1 } },
+      { $limit: TICKETS_SHOWN }
+    ]),
+    BirthdayRequest.countDocuments(match),
+    BirthdayRequest.aggregate([
+      { $match: { guildId } },
+      { $group: { _id: '$status', count: { $sum: 1 } } }
+    ])
+  ]);
+
+  const statCounts = { open: 0, approved: 0, rejected: 0, cancelled: 0 };
+  stats.forEach(s => { statCounts[s._id] = s.count; });
+
+  const embed = new EmbedBuilder()
+    .setColor(COLORS.RAPHAEL)
+    .setTitle('『 Birthday Ticket Dashboard 』')
+    .setDescription(
+      '**Analysis:** Birthday ticket overview, Master.\n\n' +
+      `${STATUS_GLYPHS.open} Open: **${statCounts.open}** • ` +
+      `${STATUS_GLYPHS.approved} Approved: **${statCounts.approved}** • ` +
+      `${STATUS_GLYPHS.rejected} Rejected: **${statCounts.rejected}** • ` +
+      `${STATUS_GLYPHS.cancelled} Cancelled: **${statCounts.cancelled}**\n\n` +
+      `Currently showing: **${FILTER_LABELS[filter]}** (${total} ticket${total === 1 ? '' : 's'})`
+    )
+    .setFooter({ text: `${getRandomFooter()} • ${prefix}birthdayrequests <${FILTERS.join('|')}>` })
+    .setTimestamp();
+
+  if (requests.length === 0) {
+    embed.addFields({ name: '▸ No Tickets', value: `No ${filter === 'all' ? '' : `${filter} `}birthday tickets found.` });
+  } else {
+    const users = await Promise.all(requests.map(r => client.users.fetch(r.userId).catch(() => null)));
+
+    requests.forEach((request, i) => {
+      const ticketNum = `#${String(request.ticketNumber).padStart(4, '0')}`;
+      let value = `**Birthday:** ${formatDate(request.requestedBirthday)}\n` +
+        `**Status:** ${STATUS_GLYPHS[request.status] || '◇'} ${request.status}\n` +
+        `**Priority:** ${PRIORITY_LABELS[request.priority] || PRIORITY_LABELS.normal}`;
+
+      if (request.status !== 'open' && request.reviewedBy) {
+        value += `\n**Reviewer:** <@${request.reviewedBy}>`;
+      }
+      if (request.staffNotes?.length > 0) {
+        value += `\n**Notes:** ${request.staffNotes.length}`;
+      }
+
+      embed.addFields({
+        name: `${ticketNum} — ${users[i]?.tag || 'Unknown User'}`,
+        value,
+        inline: true
+      });
+    });
+
+    if (total > requests.length) {
+      embed.addFields({ name: '▸ More Tickets', value: `+${total - requests.length} more not shown.` });
+    }
+  }
+
+  const row = new ActionRowBuilder().addComponents(
+    FILTERS.map(f => new ButtonBuilder()
+      .setCustomId(`bday_list_${f}`)
+      .setLabel(f === 'all' ? 'All' : `${FILTER_LABELS[f]} (${statCounts[f]})`)
+      .setStyle(f === filter ? ButtonStyle.Primary : ButtonStyle.Secondary))
+  );
+
+  return { embeds: [embed], components: [row] };
+}
 
 export default {
   name: 'birthdayrequests',
   description: 'View birthday tickets',
-  usage: 'birthdayrequests [open|all|approved|rejected]',
+  usage: '[open|approved|rejected|cancelled|all]',
   aliases: ['bdayrequests', 'bdaytickets', 'birthdaytickets'],
   category: 'community',
   permissions: [PermissionFlagsBits.ManageRoles],
   execute: async (message, args) => {
     const guildId = message.guild.id;
 
-    // Check permissions
-    const guildConfig = await Guild.getGuild(guildId, message.guild.name);
-    const isStaff = message.member.permissions.has(PermissionFlagsBits.ManageRoles) ||
-      message.member.permissions.has(PermissionFlagsBits.Administrator) ||
-      (guildConfig.roles?.staffRoles && guildConfig.roles.staffRoles.some(roleId =>
-        message.member.roles.cache.has(roleId)
-      ));
-
-    if (!isStaff) {
-      return message.reply({
-        embeds: [await errorEmbed(guildId, 'You need staff permissions to use this command!')]
-      });
-    }
-
-    const filter = args[0]?.toLowerCase() || 'open';
-    const validFilters = ['open', 'all', 'approved', 'rejected', 'cancelled'];
-    
-    if (!validFilters.includes(filter)) {
-      return message.reply({
-        embeds: [await errorEmbed(guildId, 
-          `Invalid filter! Use: \`${validFilters.join('`, `')}\``)]
-      });
-    }
-
     try {
-      const query = filter === 'all' 
-        ? { guildId } 
-        : { guildId, status: filter };
+      const guildConfig = await Guild.getGuild(guildId, message.guild.name);
+      const isStaff = message.member.permissions.has(PermissionFlagsBits.ManageRoles) ||
+        message.member.permissions.has(PermissionFlagsBits.Administrator) ||
+        (guildConfig?.roles?.staffRoles || []).some(roleId => message.member.roles.cache.has(roleId));
 
-      const requests = await BirthdayRequest.find(query)
-        .sort({ priority: -1, createdAt: -1 })
-        .limit(25);
-
-      // Count stats
-      const stats = await BirthdayRequest.aggregate([
-        { $match: { guildId } },
-        { $group: { _id: '$status', count: { $sum: 1 } } }
-      ]);
-
-      const statCounts = { open: 0, approved: 0, rejected: 0, cancelled: 0 };
-      stats.forEach(s => { statCounts[s._id] = s.count; });
-
-      const embed = new EmbedBuilder()
-        .setColor(0x5865F2)
-        .setTitle('🎫 Birthday Ticket Dashboard')
-        .setDescription(
-          `**Status Filters:**\n` +
-          `🎫 Open: **${statCounts.open}** | ` +
-          `✅ Approved: **${statCounts.approved}** | ` +
-          `❌ Rejected: **${statCounts.rejected}** | ` +
-          `🚫 Cancelled: **${statCounts.cancelled}**\n\n` +
-          `Currently showing: **${filter.toUpperCase()}** (${requests.length} tickets)`
-        );
-
-      if (requests.length === 0) {
-        embed.addFields({
-          name: '📭 No Tickets',
-          value: `No ${filter} birthday tickets found.`,
-          inline: false
+      if (!isStaff) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Permission Denied', 'Staff permissions are required for this skill, Master.')]
         });
-      } else {
-        const priorityOrder = { high: 1, normal: 2, low: 3 };
-        const sortedRequests = requests.sort((a, b) => 
-          (priorityOrder[a.priority] || 2) - (priorityOrder[b.priority] || 2)
-        );
-
-        for (const request of sortedRequests.slice(0, 10)) {
-          const user = await message.client.users.fetch(request.userId).catch(() => null);
-          const { month, day, year } = request.requestedBirthday;
-          const dateStr = `${MONTH_NAMES[month - 1]} ${day}${year ? `, ${year}` : ''}`;
-          const ticketNum = request.getFormattedTicketNumber();
-          
-          const statusEmoji = { open: '🎫', approved: '✅', rejected: '❌', cancelled: '🚫' };
-          const priorityEmoji = { low: '🟢', normal: '🟡', high: '🔴' };
-          
-          let fieldValue = `**Birthday:** ${dateStr}\n` +
-            `**Status:** ${statusEmoji[request.status] || '❓'} ${request.status}\n` +
-            `**Priority:** ${priorityEmoji[request.priority] || '🟡'} ${request.priority || 'normal'}`;
-
-          if (request.status !== 'open' && request.reviewedBy) {
-            fieldValue += `\n**Reviewer:** <@${request.reviewedBy}>`;
-          }
-
-          if (request.staffNotes && request.staffNotes.length > 0) {
-            fieldValue += `\n**Notes:** ${request.staffNotes.length}`;
-          }
-
-          embed.addFields({
-            name: `${ticketNum} - ${user?.tag || 'Unknown User'}`,
-            value: fieldValue,
-            inline: true
-          });
-        }
-
-        if (requests.length > 10) {
-          embed.addFields({
-            name: '📄 More Tickets',
-            value: `And ${requests.length - 10} more...`,
-            inline: false
-          });
-        }
       }
 
-      embed.setFooter({ text: `Use !birthdayrequests <open|approved|rejected|all> to filter` });
-      embed.setTimestamp();
+      const prefix = await getPrefix(guildId);
+      const filter = args[0]?.toLowerCase() || 'open';
 
-      const row = new ActionRowBuilder()
-        .addComponents(
-          new ButtonBuilder()
-            .setCustomId('bday_list_open')
-            .setLabel(`Open (${statCounts.open})`)
-            .setEmoji('🎫')
-            .setStyle(filter === 'open' ? ButtonStyle.Primary : ButtonStyle.Secondary),
-          new ButtonBuilder()
-            .setCustomId('bday_list_approved')
-            .setLabel(`Approved (${statCounts.approved})`)
-            .setEmoji('✅')
-            .setStyle(filter === 'approved' ? ButtonStyle.Primary : ButtonStyle.Secondary),
-          new ButtonBuilder()
-            .setCustomId('bday_list_rejected')
-            .setLabel(`Rejected (${statCounts.rejected})`)
-            .setEmoji('❌')
-            .setStyle(filter === 'rejected' ? ButtonStyle.Primary : ButtonStyle.Secondary),
-          new ButtonBuilder()
-            .setCustomId('bday_list_all')
-            .setLabel('All')
-            .setEmoji('📋')
-            .setStyle(filter === 'all' ? ButtonStyle.Primary : ButtonStyle.Secondary)
-        );
+      if (!FILTERS.includes(filter)) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Invalid Filter',
+            `Please use one of: \`${FILTERS.join('`, `')}\`, Master.\n\n**Usage:** \`${prefix}birthdayrequests [filter]\``)]
+        });
+      }
 
-      message.reply({ embeds: [embed], components: [row] });
+      const reply = await message.reply(await buildDashboard(guildId, filter, prefix, message.client));
+
+      // The filter buttons switch the dashboard in place for the member who ran the command
+      const collector = reply.createMessageComponentCollector({ time: BUTTON_TIMEOUT_MS });
+
+      collector.on('collect', async (interaction) => {
+        try {
+          if (interaction.user.id !== message.author.id) {
+            return interaction.reply({
+              content: '**Notice:** Only the member who opened this dashboard can use these buttons, Master.',
+              flags: MessageFlags.Ephemeral
+            });
+          }
+
+          const nextFilter = interaction.customId.replace('bday_list_', '');
+          if (!FILTERS.includes(nextFilter)) return interaction.deferUpdate();
+
+          await interaction.deferUpdate();
+          await interaction.editReply(await buildDashboard(guildId, nextFilter, prefix, message.client));
+        } catch (error) {
+          console.error('[birthdayrequests] Button error:', error);
+        }
+      });
+
+      collector.on('end', () => {
+        reply.edit({ components: [] }).catch(() => { });
+      });
 
     } catch (error) {
-      console.error('Error fetching birthday tickets:', error);
-      message.reply({
-        embeds: [await errorEmbed(guildId, 'Failed to fetch birthday tickets.')]
+      console.error('[birthdayrequests] Error:', error);
+      return message.reply({
+        embeds: [await errorEmbed(guildId, 'Operation Failed', 'I was unable to load the birthday tickets, Master.')]
       });
     }
   }

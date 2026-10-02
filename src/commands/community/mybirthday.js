@@ -1,66 +1,61 @@
 import { EmbedBuilder } from 'discord.js';
-import Birthday from '../../models/Birthday.js';
-import { errorEmbed, infoEmbed } from '../../utils/embeds.js';
-import { getPrefix } from '../../utils/helpers.js';
+import Birthday, { nextBirthdayOccurrence } from '../../models/Birthday.js';
+import { errorEmbed, infoEmbed, COLORS, GLYPHS } from '../../utils/embeds.js';
+import { getPrefix, truncate } from '../../utils/helpers.js';
+import { formatDate } from './requestbirthday.js';
+
+const CELEBRATION_LABELS = {
+  public: 'Public announcement',
+  dm: 'Direct message only',
+  role: 'Role assignment',
+  none: 'No celebration'
+};
 
 export default {
   name: 'mybirthday',
   description: 'View your registered birthday',
-  usage: 'mybirthday',
+  usage: '',
   aliases: ['mybday', 'checkbirthday', 'viewbirthday'],
   category: 'community',
-  execute: async (message, args) => {
+  execute: async (message) => {
     const guildId = message.guild.id;
     const userId = message.author.id;
 
     try {
+      const prefix = await getPrefix(guildId);
       const birthday = await Birthday.findOne({ guildId, userId });
 
       if (!birthday) {
-        const prefix = await getPrefix(guildId);
         return message.reply({
-          embeds: [await infoEmbed(guildId, '🎂 No Birthday Set',
-            'You don\'t have a birthday registered!\n\n' +
-            '**To set your birthday:**\n' +
-            `• Ask a staff member to set it using \`${prefix}setbirthday\`\n` +
-            `• Or submit a request using \`${prefix}requestbirthday <month> <day> [year]\``)]
+          embeds: [await infoEmbed(guildId, 'No Birthday Set',
+            'You do not have a birthday registered, Master.\n\n' +
+            '**To register it:**\n' +
+            `${GLYPHS.DOT} Submit a request with \`${prefix}requestbirthday <month> <day> [year]\`\n` +
+            `${GLYPHS.DOT} Or ask a staff member to set it with \`${prefix}setbirthday\``)]
         });
       }
 
       const { month, day, year } = birthday.birthday;
-      const monthNames = ['January', 'February', 'March', 'April', 'May', 'June',
-        'July', 'August', 'September', 'October', 'November', 'December'];
-      
-      const dateStr = `${monthNames[month - 1]} ${day}${year ? `, ${year}` : ''}`;
-      
-      // Calculate days until birthday
-      const today = new Date();
-      const currentYear = today.getFullYear();
-      let birthdayDate = new Date(currentYear, month - 1, day);
-      
-      if (birthdayDate < today) {
-        birthdayDate.setFullYear(currentYear + 1);
-      }
-      
-      const daysUntil = Math.ceil((birthdayDate - today) / (1000 * 60 * 60 * 24));
-      
+      const { daysUntil } = nextBirthdayOccurrence(month, day);
+
       const embed = new EmbedBuilder()
-        .setColor(0xFF69B4)
-        .setTitle('🎂 Your Birthday')
+        .setColor(COLORS.RAPHAEL)
+        .setTitle('『 Your Birthday 』')
+        .setDescription(`**Analysis:** Birthday record for ${message.author}, Master.`)
         .setThumbnail(message.author.displayAvatarURL({ dynamic: true, size: 256 }))
         .addFields(
-          { name: '📅 Birthday', value: dateStr, inline: true },
-          { name: '⏳ Days Until', value: daysUntil === 0 ? '🎉 **Today!**' : `${daysUntil} days`, inline: true }
+          { name: '▸ Birthday', value: formatDate({ month, day, year }), inline: true },
+          { name: '▸ Days Until', value: daysUntil === 0 ? '**Today**' : `${daysUntil} day${daysUntil === 1 ? '' : 's'}`, inline: true }
         );
 
       // Age info
       if (year && birthday.showAge) {
         const age = birthday.getAge();
         if (age !== null) {
-          embed.addFields({ name: '🎈 Age', value: `${age} (turning ${age + 1})`, inline: true });
+          embed.addFields({ name: '▸ Age', value: daysUntil === 0 ? `${age} (today)` : `${age} (turning ${age + 1})`, inline: true });
         }
-      } else if (year && !birthday.showAge) {
-        embed.addFields({ name: '🔒 Age', value: 'Hidden', inline: true });
+      } else if (year) {
+        embed.addFields({ name: '▸ Age', value: 'Hidden', inline: true });
       }
 
       // Source info
@@ -71,40 +66,32 @@ export default {
       } else if (birthday.source === 'request') {
         sourceText = 'Approved request';
       }
-      
-      embed.addFields({ name: '📋 Source', value: sourceText, inline: true });
 
-      // Verification status
+      embed.addFields({ name: '▸ Source', value: sourceText, inline: true });
+
       if (birthday.verified) {
-        embed.addFields({ name: '✅ Status', value: 'Verified', inline: true });
+        embed.addFields({ name: '▸ Status', value: '◉ Verified', inline: true });
       }
 
-      // Celebration preference
-      const prefMap = {
-        'public': '📢 Public announcement',
-        'dm': '📬 DM only',
-        'role': '🎭 Role assignment',
-        'none': '🔕 No celebration'
-      };
-      embed.addFields({ 
-        name: '🎊 Celebration', 
-        value: prefMap[birthday.celebrationPreference] || 'Public', 
-        inline: true 
+      embed.addFields({
+        name: '▸ Celebration',
+        value: CELEBRATION_LABELS[birthday.celebrationPreference] || CELEBRATION_LABELS.public,
+        inline: true
       });
 
-      // Custom message
       if (birthday.customMessage) {
-        embed.addFields({ name: '💬 Custom Message', value: birthday.customMessage, inline: false });
+        embed.addFields({ name: '▸ Custom Message', value: truncate(birthday.customMessage, 1024), inline: false });
       }
 
-      embed.setFooter({ text: 'Use !birthdaypreference to change settings' });
+      // Members change their birthday through a request; birthdaypreference is an admin setting
+      embed.setFooter({ text: `${prefix}requestbirthday to request a change • ${prefix}removebirthday to remove it` });
 
-      message.reply({ embeds: [embed] });
+      return message.reply({ embeds: [embed] });
 
     } catch (error) {
-      console.error('Error fetching birthday:', error);
-      message.reply({
-        embeds: [await errorEmbed(guildId, 'Failed to fetch your birthday. Please try again.')]
+      console.error('[mybirthday] Error:', error);
+      return message.reply({
+        embeds: [await errorEmbed(guildId, 'Operation Failed', 'I was unable to fetch your birthday. Please try again, Master.')]
       });
     }
   }

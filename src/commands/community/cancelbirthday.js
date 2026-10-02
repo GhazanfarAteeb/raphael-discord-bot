@@ -1,81 +1,72 @@
 import { EmbedBuilder } from 'discord.js';
 import { BirthdayRequest } from '../../models/Birthday.js';
-import Guild from '../../models/Guild.js';
-import { successEmbed, errorEmbed, infoEmbed } from '../../utils/embeds.js';
-import { createTicketEmbed, createTicketButtons } from './requestbirthday.js';
+import { errorEmbed, infoEmbed, COLORS } from '../../utils/embeds.js';
 import { getPrefix } from '../../utils/helpers.js';
+import { getRandomFooter } from '../../utils/raphael.js';
+import { createTicketEmbed, createTicketButtons } from './requestbirthday.js';
 
 export default {
   name: 'cancelbirthday',
   description: 'Cancel your pending birthday request',
-  usage: 'cancelbirthday',
+  usage: '',
   aliases: ['cancelbday', 'cancelticket'],
   category: 'community',
-  execute: async (message, args) => {
+  execute: async (message) => {
     const guildId = message.guild.id;
     const userId = message.author.id;
 
     try {
-      // Find user's open request
-      const request = await BirthdayRequest.findOne({
-        userId,
-        guildId,
-        status: 'open'
-      });
+      const prefix = await getPrefix(guildId);
+
+      // Cancel atomically so a cancellation cannot race a staff approval
+      const request = await BirthdayRequest.findOneAndUpdate(
+        { userId, guildId, status: 'open' },
+        { $set: { status: 'cancelled', reviewedAt: new Date() } },
+        { new: true }
+      );
 
       if (!request) {
         return message.reply({
           embeds: [await infoEmbed(guildId, 'No Open Ticket',
-            'You don\'t have an open birthday request to cancel.')]
+            'You do not have an open birthday request to cancel, Master.')]
         });
       }
 
       const ticketNum = request.getFormattedTicketNumber();
 
-      // Update status
-      request.status = 'cancelled';
-      request.reviewedAt = new Date();
-      await request.save();
-
       // Update ticket message if it exists
       if (request.ticketMessageId && request.ticketChannelId) {
         try {
           const channel = message.guild.channels.cache.get(request.ticketChannelId);
-          if (channel) {
-            const ticketMsg = await channel.messages.fetch(request.ticketMessageId).catch(() => null);
-            if (ticketMsg) {
-              const updatedEmbed = createTicketEmbed(request, message.author, request.currentBirthday);
-              const updatedButtons = createTicketButtons(request, false);
-              
-              await ticketMsg.edit({
-                content: `🚫 **Ticket Cancelled** by user`,
-                embeds: [updatedEmbed],
-                components: updatedButtons
-              });
-            }
+          const ticketMsg = await channel?.messages.fetch(request.ticketMessageId).catch(() => null);
+          if (ticketMsg) {
+            await ticketMsg.edit({
+              content: '**Ticket Cancelled** by the requester',
+              embeds: [createTicketEmbed(request, message.author, request.currentBirthday)],
+              components: createTicketButtons(request, false)
+            });
           }
         } catch (err) {
-          console.error('Failed to update ticket message:', err);
+          console.error('[cancelbirthday] Failed to update ticket message:', err);
         }
       }
 
-      const prefix = await getPrefix(guildId);
       const embed = new EmbedBuilder()
-        .setColor(0x95A5A6)
-        .setTitle(`🚫 Ticket Cancelled ${ticketNum}`)
+        .setColor(COLORS.RAPHAEL)
+        .setTitle(`『 Ticket ${ticketNum} Cancelled 』`)
         .setDescription(
-          `Your birthday request has been cancelled.\n\n` +
-          `You can submit a new request anytime using \`${prefix}requestbirthday\`.`
+          '**Confirmed.** Your birthday request has been cancelled, Master.\n\n' +
+          `You may submit a new request at any time with \`${prefix}requestbirthday <month> <day> [year]\`.`
         )
-        .setFooter({ text: 'Birthday Ticket System' })
+        .setFooter({ text: getRandomFooter() })
         .setTimestamp();
 
-      message.reply({ embeds: [embed] });
+      return message.reply({ embeds: [embed] });
 
     } catch (error) {
-      console.error('Error cancelling birthday request:', error);
-      message.reply({
-        embeds: [await errorEmbed(guildId, 'Failed to cancel request. Please try again.')]
+      console.error('[cancelbirthday] Error:', error);
+      return message.reply({
+        embeds: [await errorEmbed(guildId, 'Operation Failed', 'I was unable to cancel your request. Please try again, Master.')]
       });
     }
   }

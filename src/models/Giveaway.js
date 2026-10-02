@@ -67,37 +67,36 @@ giveawaySchema.statics.getGuildGiveaways = async function (guildId, includeEnded
   return await this.find(query).sort({ endsAt: 1 });
 };
 
-// Method to add participant
+// Add a participant atomically (concurrent clicks cannot overwrite each other).
+// Resolves to the updated giveaway, or null if the giveaway ended or the user had already entered.
 giveawaySchema.methods.addParticipant = async function (userId) {
-  if (!this.participants.includes(userId)) {
-    this.participants.push(userId);
-    await this.save();
-    return true;
-  }
-  return false;
+  return this.constructor.findOneAndUpdate(
+    { _id: this._id, ended: false, participants: { $ne: userId } },
+    { $addToSet: { participants: userId } },
+    { new: true }
+  );
 };
 
-// Method to remove participant
+// Remove a participant atomically. Resolves to the updated giveaway, or null if nothing changed.
 giveawaySchema.methods.removeParticipant = async function (userId) {
-  const index = this.participants.indexOf(userId);
-  if (index > -1) {
-    this.participants.splice(index, 1);
-    await this.save();
-    return true;
-  }
-  return false;
+  return this.constructor.findOneAndUpdate(
+    { _id: this._id, ended: false, participants: userId },
+    { $pull: { participants: userId } },
+    { new: true }
+  );
 };
 
-// Method to pick winners
-giveawaySchema.methods.pickWinners = function () {
+// Pick up to `count` random participants, skipping anyone in `exclude`.
+// By default previous winners are skipped, so a reroll never redraws someone who already won.
+giveawaySchema.methods.pickWinners = function (count = this.winners, exclude = this.winnerIds || []) {
+  const excluded = new Set(exclude);
+  const pool = this.participants.filter(id => !excluded.has(id));
   const winners = [];
-  const participants = [...this.participants];
-
-  const winnerCount = Math.min(this.winners, participants.length);
+  const winnerCount = Math.min(count, pool.length);
 
   for (let i = 0; i < winnerCount; i++) {
-    const randomIndex = Math.floor(Math.random() * participants.length);
-    winners.push(participants.splice(randomIndex, 1)[0]);
+    const randomIndex = Math.floor(Math.random() * pool.length);
+    winners.push(pool.splice(randomIndex, 1)[0]);
   }
 
   return winners;

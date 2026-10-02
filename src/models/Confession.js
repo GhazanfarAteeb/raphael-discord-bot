@@ -82,8 +82,7 @@ const confessionSchema = new mongoose.Schema({
   }
 });
 
-// Index for faster queries
-confessionSchema.index({ guildId: 1 });
+// guildId is already indexed by its `unique` option; a second index declaration only triggers a duplicate-index warning
 
 const Confession = mongoose.model('Confession', confessionSchema);
 

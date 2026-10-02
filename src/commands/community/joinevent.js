@@ -1,86 +1,99 @@
+import mongoose from 'mongoose';
 import Event from '../../models/Event.js';
-import { successEmbed, errorEmbed, GLYPHS } from '../../utils/embeds.js';
+import { successEmbed, errorEmbed } from '../../utils/embeds.js';
 import { getPrefix } from '../../utils/helpers.js';
+
+// Statuses of events that have not started yet ("notified" means the reminder already went out)
+const JOINABLE_STATUSES = ['scheduled', 'notified'];
 
 export default {
   name: 'joinevent',
   aliases: ['eventjoin', 'rsvp'],
   description: 'Join an event to get notified',
-  usage: 'joinevent <event_id>',
+  usage: '<event_id>',
   category: 'community',
   execute: async (message, args) => {
     const guildId = message.guild.id;
     const userId = message.author.id;
 
-    if (!args[0]) {
-      const prefix = await getPrefix(guildId);
-      return message.reply({
-        embeds: [await errorEmbed(guildId, `Please provide an event ID!\n\nUsage: \`${prefix}joinevent <event_id>\`\n\nFind event IDs with: \`${prefix}events\``)]
-      });
-    }
-
-    const eventId = args[0];
-
     try {
+      const prefix = await getPrefix(guildId);
+      const eventId = args[0];
+
+      if (!eventId) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Event ID Required',
+            `Please provide an event ID, Master.\n\n**Usage:** \`${prefix}joinevent <event_id>\`\n\nFind event IDs with \`${prefix}events\`.`)]
+        });
+      }
+
+      if (!mongoose.isValidObjectId(eventId)) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Invalid Event ID',
+            `\`${eventId.slice(0, 40)}\` is not a valid event ID, Master. Find event IDs with \`${prefix}events\`.`)]
+        });
+      }
+
       const event = await Event.findOne({ _id: eventId, guildId });
 
       if (!event) {
         return message.reply({
-          embeds: [await errorEmbed(guildId, 'Event not found! Make sure you\'re using the correct ID.')]
+          embeds: [await errorEmbed(guildId, 'Event Not Found', 'No event matches that ID, Master.')]
         });
       }
 
-      if (event.status !== 'scheduled') {
+      if (!JOINABLE_STATUSES.includes(event.status)) {
         return message.reply({
-          embeds: [await errorEmbed(guildId, 'This event is no longer accepting participants.')]
+          embeds: [await errorEmbed(guildId, 'Event Closed', 'This event is no longer accepting participants, Master.')]
         });
       }
 
       if (event.eventDate < new Date()) {
         return message.reply({
-          embeds: [await errorEmbed(guildId, 'This event has already started!')]
+          embeds: [await errorEmbed(guildId, 'Event Started', 'This event has already started, Master.')]
         });
       }
 
-      const alreadyJoined = event.participants.some(p => p.userId === userId);
-      if (alreadyJoined) {
+      if (event.participants.some(p => p.userId === userId)) {
         return message.reply({
-          embeds: [await errorEmbed(guildId, 'You\'re already signed up for this event!')]
+          embeds: [await errorEmbed(guildId, 'Already Joined', 'You are already signed up for this event, Master.')]
         });
       }
 
-      event.participants.push({
-        userId: userId,
-        username: message.author.username,
-        joinedAt: new Date()
-      });
-      await event.save();
+      if (event.maxParticipants && event.participants.length >= event.maxParticipants) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Event Full', 'This event has reached its participant limit, Master.')]
+        });
+      }
 
-      const embed = await successEmbed(
-        guildId,
-        `${GLYPHS.SUCCESS} Joined Event!`,
-        `You've been added to **${event.title}**!`
+      // Atomic push guarded against double sign-ups from rapid repeats
+      const updated = await Event.findOneAndUpdate(
+        { _id: event._id, 'participants.userId': { $ne: userId } },
+        { $push: { participants: { userId, username: message.author.username, joinedAt: new Date() } } },
+        { new: true }
       );
+
+      if (!updated) {
+        return message.reply({
+          embeds: [await errorEmbed(guildId, 'Already Joined', 'You are already signed up for this event, Master.')]
+        });
+      }
+
+      const unix = Math.floor(updated.eventDate.getTime() / 1000);
+      const count = updated.participants.length;
+      const embed = await successEmbed(guildId, 'Event Joined', `You have been added to **${updated.title}**, Master.`);
 
       embed.addFields(
-        {
-          name: 'When',
-          value: `<t:${Math.floor(event.eventDate.getTime() / 1000)}:F> (<t:${Math.floor(event.eventDate.getTime() / 1000)}:R>)`,
-          inline: false
-        },
-        {
-          name: 'Participants',
-          value: `${event.participants.length} member${event.participants.length !== 1 ? 's' : ''}`,
-          inline: true
-        }
+        { name: '▸ When', value: `<t:${unix}:F> (<t:${unix}:R>)`, inline: false },
+        { name: '▸ Participants', value: `${count} member${count !== 1 ? 's' : ''}`, inline: true }
       );
 
-      message.reply({ embeds: [embed] });
+      return message.reply({ embeds: [embed] });
 
     } catch (error) {
-      console.error('Error joining event:', error);
-      message.reply({
-        embeds: [await errorEmbed(guildId, 'Failed to join event. Please try again.')]
+      console.error('[joinevent] Error:', error);
+      return message.reply({
+        embeds: [await errorEmbed(guildId, 'Operation Failed', 'I was unable to add you to the event. Please try again, Master.')]
       });
     }
   }

@@ -1,5 +1,27 @@
 import mongoose from 'mongoose';
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// Midnight at the start of the given day (local time)
+function startOfDay(date = new Date()) {
+    const start = new Date(date);
+    start.setHours(0, 0, 0, 0);
+    return start;
+}
+
+/**
+ * Next date (today included) on which a month/day birthday falls, and how many days away it is.
+ * Compares against today's midnight so a birthday happening today counts as today, not next year.
+ */
+export function nextBirthdayOccurrence(month, day, from = new Date()) {
+    const today = startOfDay(from);
+    const date = new Date(today.getFullYear(), month - 1, day);
+    if (date < today) date.setFullYear(today.getFullYear() + 1);
+    // Rounded so a daylight-saving shift between the two dates does not lose a day
+    const daysUntil = Math.round((date - today) / DAY_MS);
+    return { date, daysUntil };
+}
+
 // Counter schema for ticket numbers
 const birthdayTicketCounterSchema = new mongoose.Schema({
     guildId: { type: String, required: true, unique: true },
@@ -198,27 +220,19 @@ birthdaySchema.statics.getTodaysBirthdays = async function(guildId) {
     });
 };
 
-// Static method to get upcoming birthdays (next 7 days)
+// Static method to get upcoming birthdays (today through the next `days` days)
 birthdaySchema.statics.getUpcomingBirthdays = async function(guildId, days = 7) {
     const birthdays = await this.find({ guildId, displayBirthday: true });
-    const today = new Date();
     const upcoming = [];
     
     for (const birthday of birthdays) {
-        const thisYear = today.getFullYear();
-        const birthdayDate = new Date(thisYear, birthday.birthday.month - 1, birthday.birthday.day);
+        const { date, daysUntil } = nextBirthdayOccurrence(birthday.birthday.month, birthday.birthday.day);
         
-        // If birthday already passed this year, check next year
-        if (birthdayDate < today) {
-            birthdayDate.setFullYear(thisYear + 1);
-        }
-        
-        const daysUntil = Math.floor((birthdayDate - today) / (1000 * 60 * 60 * 24));
-        
-        if (daysUntil >= 0 && daysUntil <= days) {
+        if (daysUntil <= days) {
             upcoming.push({
                 birthday,
-                daysUntil
+                daysUntil,
+                date
             });
         }
     }
