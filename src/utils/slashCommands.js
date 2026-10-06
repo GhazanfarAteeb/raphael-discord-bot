@@ -991,7 +991,7 @@ const slashCommands = [
         .setDescription('Start a new giveaway')
         .addStringOption(option =>
           option.setName('duration')
-            .setDescription('Duration (e.g., 1h, 1d, 1w)')
+            .setDescription('How long entries stay open')
             .setRequired(true)
             .addChoices(
               { name: '10 minutes', value: '10m' },
@@ -1001,7 +1001,9 @@ const slashCommands = [
               { name: '12 hours', value: '12h' },
               { name: '1 day', value: '1d' },
               { name: '3 days', value: '3d' },
-              { name: '1 week', value: '1w' }
+              { name: '1 week', value: '1w' },
+              { name: '2 weeks', value: '2w' },
+              { name: '30 days (maximum)', value: '30d' }
             ))
         .addIntegerOption(option =>
           option.setName('winners')
@@ -1016,21 +1018,21 @@ const slashCommands = [
             .setMaxLength(256))
         .addRoleOption(option =>
           option.setName('required_role')
-            .setDescription('Role required to enter (optional)')
+            .setDescription('Role required to enter and to win (optional)')
             .setRequired(false)))
     .addSubcommand(subcommand =>
       subcommand.setName('end')
         .setDescription('End a giveaway early')
         .addStringOption(option =>
           option.setName('message_id')
-            .setDescription('The giveaway message ID')
+            .setDescription('Giveaway message ID or message link (see /giveaway list)')
             .setRequired(true)))
     .addSubcommand(subcommand =>
       subcommand.setName('reroll')
         .setDescription('Pick new winner(s) for an ended giveaway')
         .addStringOption(option =>
           option.setName('message_id')
-            .setDescription('The giveaway message ID')
+            .setDescription('Giveaway message ID or message link (see /giveaway list)')
             .setRequired(true))
         .addIntegerOption(option =>
           option.setName('count')
@@ -1040,13 +1042,13 @@ const slashCommands = [
             .setMaxValue(20)))
     .addSubcommand(subcommand =>
       subcommand.setName('list')
-        .setDescription('View all active giveaways'))
+        .setDescription('View active and recently ended giveaways, with their message IDs'))
     .addSubcommand(subcommand =>
       subcommand.setName('delete')
         .setDescription('Cancel and delete a giveaway')
         .addStringOption(option =>
           option.setName('message_id')
-            .setDescription('The giveaway message ID')
+            .setDescription('Giveaway message ID or message link (see /giveaway list)')
             .setRequired(true)))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
@@ -1535,7 +1537,7 @@ const slashCommands = [
         .setDescription('Preview boost message in current channel'))
     .addSubcommand(subcommand =>
       subcommand.setName('reset')
-        .setDescription('Reset all boost settings to default'))
+        .setDescription('Reset boost message settings (also disables boost messages)'))
     .addSubcommand(subcommand =>
       subcommand.setName('channel')
         .setDescription('Designate boost message channel')
@@ -1543,7 +1545,7 @@ const slashCommands = [
           option.setName('channel')
             .setDescription('Target channel for boost messages')
             .setRequired(true)
-            .addChannelTypes(TEXT_CHANNELS)))
+            .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
     .addSubcommand(subcommand =>
       subcommand.setName('message')
         .setDescription('Configure boost message content')
@@ -1677,6 +1679,111 @@ const slashCommands = [
     .addSubcommand(subcommand =>
       subcommand.setName('clearrole')
         .setDescription('Clear temporary booster role configuration'))
+    .addSubcommand(subcommand =>
+      subcommand.setName('toggle')
+        .setDescription('Turn boost thank you messages on or off')
+        .addBooleanOption(option =>
+          option.setName('enabled')
+            .setDescription('Announce new boosts?')
+            .setRequired(true)))
+    .addSubcommandGroup(group =>
+      group.setName('tier')
+        .setDescription('Boost tier reward roles')
+        .addSubcommand(subcommand =>
+          subcommand.setName('add')
+            .setDescription('Add or replace a tier reward (only 1-boost tiers are granted automatically)')
+            .addIntegerOption(option =>
+              option.setName('count').setDescription('Boosts required').setRequired(true).setMinValue(1).setMaxValue(100))
+            .addRoleOption(option =>
+              option.setName('role').setDescription('Reward role').setRequired(true))
+            .addBooleanOption(option =>
+              option.setName('stackable').setDescription('Keep lower tier roles (default: on)').setRequired(false)))
+        .addSubcommand(subcommand =>
+          subcommand.setName('remove')
+            .setDescription('Remove a tier reward')
+            .addIntegerOption(option =>
+              option.setName('count').setDescription('Boosts required by the tier').setRequired(true).setMinValue(1).setMaxValue(100)))
+        .addSubcommand(subcommand =>
+          subcommand.setName('list')
+            .setDescription('List the tier rewards'))
+        .addSubcommand(subcommand =>
+          subcommand.setName('clear')
+            .setDescription('Remove all tier rewards'))
+        .addSubcommand(subcommand =>
+          subcommand.setName('stackable')
+            .setDescription('Set whether a tier keeps lower tier roles')
+            .addIntegerOption(option =>
+              option.setName('count').setDescription('Boosts required by the tier').setRequired(true).setMinValue(1).setMaxValue(100))
+            .addBooleanOption(option =>
+              option.setName('enabled').setDescription('Keep lower tier roles?').setRequired(true)))
+        .addSubcommand(subcommand =>
+          subcommand.setName('message')
+            .setDescription('Show the earned tier role in the boost message')
+            .addBooleanOption(option =>
+              option.setName('enabled').setDescription('Show the tier reward line?').setRequired(true))))
+    .addSubcommandGroup(group =>
+      group.setName('perks')
+        .setDescription('Booster perks announcement')
+        .addSubcommand(subcommand =>
+          subcommand.setName('status')
+            .setDescription('Show the perks announcement settings'))
+        .addSubcommand(subcommand =>
+          subcommand.setName('channel')
+            .setDescription('Set the perks announcement channel')
+            .addChannelOption(option =>
+              option.setName('channel').setDescription('Text or announcement channel').setRequired(true)
+                .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)))
+        .addSubcommand(subcommand =>
+          subcommand.setName('message')
+            .setDescription('Set the perks message')
+            .addStringOption(option =>
+              option.setName('text').setDescription('Message or "reset". Variables: {server}, {boostcount}, {boostlevel}, {membercount}')
+                .setRequired(true).setMaxLength(MESSAGE_TEXT_MAX)))
+        .addSubcommand(subcommand =>
+          subcommand.setName('title')
+            .setDescription('Set the perks title')
+            .addStringOption(option =>
+              option.setName('text').setDescription('Title text or "reset"').setRequired(true).setMaxLength(TITLE_MAX)))
+        .addSubcommand(subcommand =>
+          subcommand.setName('color')
+            .setDescription('Set the perks embed color')
+            .addStringOption(option =>
+              option.setName('hex').setDescription('Hex color code (e.g., #f47fff) or "reset"').setRequired(true)))
+        .addSubcommand(subcommand =>
+          subcommand.setName('image')
+            .setDescription('Set the perks banner image')
+            .addStringOption(option =>
+              option.setName('url').setDescription('Image URL or "remove"').setRequired(true)))
+        .addSubcommand(subcommand =>
+          subcommand.setName('thumbnail')
+            .setDescription('Set the perks thumbnail')
+            .addStringOption(option =>
+              option.setName('value').setDescription('"server", "remove" or an image URL').setRequired(true)))
+        .addSubcommand(subcommand =>
+          subcommand.setName('footer')
+            .setDescription('Set the perks footer')
+            .addStringOption(option =>
+              option.setName('text').setDescription('Footer text or "reset" for the default').setRequired(true).setMaxLength(MESSAGE_TEXT_MAX)))
+        .addSubcommand(subcommand =>
+          subcommand.setName('tierlist')
+            .setDescription('Include the tier rewards list')
+            .addBooleanOption(option =>
+              option.setName('enabled').setDescription('Show the tier list?').setRequired(true)))
+        .addSubcommand(subcommand =>
+          subcommand.setName('preview')
+            .setDescription('Preview the perks announcement here'))
+        .addSubcommand(subcommand =>
+          subcommand.setName('publish')
+            .setDescription('Post the perks announcement, or update the last one')
+            .addStringOption(option =>
+              option.setName('mode').setDescription('Update the last announcement (default) or post a new one').setRequired(false)
+                .addChoices(
+                  { name: 'Update the last announcement', value: 'update' },
+                  { name: 'Post a new announcement', value: 'new' }
+                )))
+        .addSubcommand(subcommand =>
+          subcommand.setName('reset')
+            .setDescription('Reset all perks announcement settings')))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
 
   // ============================================

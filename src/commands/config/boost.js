@@ -6,15 +6,18 @@ import { hasModPerms, getPrefix, getAssignableRoleError } from '../../utils/help
 import { getRandomFooter } from '../../utils/raphael.js';
 import {
   parseBoostMessage,
-  buildBoostEmbed,
+  buildBoostMessage,
   getBoostMessageTemplate,
   getBoostGreetingTemplate,
+  getGrantableTierRoles,
+  getMissingSendPermissions,
+  toImageUrl,
   DEFAULT_BOOST_COLOR,
   DETECTABLE_BOOST_COUNT
 } from '../../events/client/boostHandler.js';
 
 // Discord limits for values saved here and later shown in boost/perks embeds
-const LIMITS = { title: 256, footer: 2048, content: 2000 };
+const LIMITS = { title: 256, description: 4096, footer: 2048, content: 2000, embed: 6000 };
 // Leaves room for the tier reward line appended to the boost message
 const BOOST_MESSAGE_MAX = 4000;
 // Leaves room for the tier list appended to the perks announcement
@@ -38,7 +41,7 @@ const TOGGLE_VALUES = new Map([
 
 const BOOST_DETECTION_NOTE =
   'Discord reports that a member boosts, not how many times, so only 1-boost tiers are granted automatically. ' +
-  'Higher tiers must be assigned manually.';
+  'Higher tiers must be assigned manually. Tier roles are removed when the member stops boosting.';
 
 export default {
   name: 'boost',
@@ -94,6 +97,16 @@ async function runBoostCommand(message, args) {
     case 'disable':
     case 'off':
       return setBoostEnabled(message, false, guildConfig, prefix);
+
+    // "toggle on|off", the form /boost toggle arrives in
+    case 'toggle': {
+      const enable = parseToggle(args[1]);
+      if (enable === null) {
+        return replyError(message, 'Invalid Option',
+          `Use \`${prefix}boost toggle on\` or \`${prefix}boost toggle off\`, Master.`);
+      }
+      return setBoostEnabled(message, enable, guildConfig, prefix);
+    }
 
     case 'channel':
       return setBoostChannel(message, args, prefix);
@@ -161,6 +174,15 @@ async function runBoostCommand(message, args) {
         describe: (on) => `The timestamp is now **${on ? 'enabled' : 'disabled'}**.`
       });
 
+    case 'tiermessage':
+    case 'tierline':
+      return setBoostToggle(message, args[1], prefix, {
+        path: 'features.boostSystem.showTierInMessage',
+        command: 'boost tiermessage',
+        title: 'Tier Reward Line Updated',
+        describe: (on) => `The tier reward line in the boost message is now **${on ? 'shown' : 'hidden'}**.`
+      });
+
     case 'reset':
       return resetBoostMessage(message);
 
@@ -220,7 +242,7 @@ async function runBoostCommand(message, args) {
 
     case 'publish':
     case 'send':
-      return publishPerksAnnouncement(message, guildConfig, prefix);
+      return publishPerksAnnouncement(message, args[1], guildConfig, prefix);
 
     default:
       return replyError(message, 'Unknown Option',
@@ -264,8 +286,9 @@ function parseWholeNumber(value) {
   return /^\d+$/.test(String(value ?? '')) ? Number(value) : NaN;
 }
 
+// Same check the embed builder applies, so a saved URL can never break the announcement
 function isHttpUrl(value) {
-  return /^https?:\/\/\S+$/i.test(value ?? '');
+  return toImageUrl(value) !== null;
 }
 
 function isKeyword(value, keywords) {
@@ -307,23 +330,35 @@ function describeThumbnail(boost) {
   return 'User avatar';
 }
 
-function cannotSendIn(channel, me) {
-  return !channel.permissionsFor(me)?.has([
-    PermissionFlagsBits.ViewChannel,
-    PermissionFlagsBits.SendMessages,
-    PermissionFlagsBits.EmbedLinks
-  ]);
+// "" when the bot can post in the channel, otherwise a sentence naming what is missing
+function describeSendProblem(channel, guild, withEmbed = true) {
+  const missing = getMissingSendPermissions(channel, guild.members.me, withEmbed);
+  return missing.length ? `I am missing ${missing.join(', ')} in ${channel}.` : '';
 }
 
+// The member named by `arg` (mention or ID); the first mentioned member when arg names none
 async function resolveMember(message, arg) {
-  const mentioned = message.mentions.members?.first();
-  if (mentioned) return mentioned;
-
   // members.fetch(undefined) would fetch the whole guild, so only fetch real IDs
   const id = String(arg ?? '').replace(/^<@!?(\d+)>$/, '$1');
-  if (!/^\d{17,20}$/.test(id)) return null;
-  return message.guild.members.fetch(id).catch(() => null);
+  if (/^\d{17,20}$/.test(id)) {
+    return message.mentions.members?.get(id) ?? message.guild.members.fetch(id).catch(() => null);
+  }
+  return message.mentions.members?.first() ?? null;
 }
+
+// The role named by `arg` (mention or ID); the first mentioned role when arg names none
+function resolveRole(message, arg) {
+  const id = String(arg ?? '').replace(/^<@&(\d+)>$/, '$1');
+  return message.guild.roles.cache.get(id) ?? message.mentions.roles?.first() ?? null;
+}
+
+// The channel named by `arg` (mention or ID); the first mentioned channel when arg names none
+function resolveChannel(message, arg) {
+  const id = String(arg ?? '').replace(/^<#(\d+)>$/, '$1');
+  return message.guild.channels.cache.get(id) ?? message.mentions.channels?.first() ?? null;
+}
+
+const ANNOUNCEMENT_CHANNEL_TYPES = [ChannelType.GuildText, ChannelType.GuildAnnouncement];
 
 function getTiers(guildConfig) {
   // Copy: guildConfig is the cached object and must not be mutated
@@ -339,33 +374,41 @@ async function setBoostEnabled(message, enable, guildConfig, prefix) {
     $set: { 'features.boostSystem.enabled': enable }
   });
 
-  const channelId = guildConfig.features?.boostSystem?.channel;
-  const needsChannel = enable && !(channelId && message.guild.channels.cache.has(channelId));
+  const boost = guildConfig.features?.boostSystem || {};
+  const channel = boost.channel ? message.guild.channels.cache.get(boost.channel) : null;
+  let note = '';
+  if (enable && !channel) {
+    note = `\n\n${GLYPHS.WARNING} No usable boost channel is set, so nothing will be announced yet. ` +
+      `Use \`${prefix}boost channel #channel\` to set one.`;
+  } else if (enable) {
+    const problem = describeSendProblem(channel, message.guild, boost.embedEnabled !== false);
+    if (problem) note = `\n\n${GLYPHS.WARNING} ${problem} Boosts cannot be announced until this is fixed.`;
+  }
 
   return replySuccess(message, `Boost Messages ${enable ? 'Enabled' : 'Disabled'}`,
-    `${GLYPHS.SUCCESS} Boost thank you messages are now **${enable ? 'enabled' : 'disabled'}**.` +
-    (needsChannel ? `\n\nNo usable boost channel is set. Use \`${prefix}boost channel #channel\` to set one.` : ''));
+    `${GLYPHS.SUCCESS} Boost thank you messages are now **${enable ? 'enabled' : 'disabled'}**.` + note);
 }
 
 async function setBoostChannel(message, args, prefix) {
-  const channel = message.mentions.channels.first() ||
-    message.guild.channels.cache.get(args[1]);
+  const channel = resolveChannel(message, args[1]);
 
   if (!channel) {
     return replyError(message, 'No Channel',
       `Please mention a channel or provide a channel ID, Master.\n\n**Usage:** \`${prefix}boost channel #channel\``);
   }
 
-  if (channel.type !== ChannelType.GuildText) {
-    return replyError(message, 'Invalid Channel', 'Please select a text channel, Master.');
+  if (!ANNOUNCEMENT_CHANNEL_TYPES.includes(channel.type)) {
+    return replyError(message, 'Invalid Channel', 'Please select a text or announcement channel, Master.');
   }
 
   await Guild.updateGuild(message.guild.id, {
     $set: { 'features.boostSystem.channel': channel.id }
   });
 
+  const problem = describeSendProblem(channel, message.guild);
   return replySuccess(message, 'Boost Channel Set',
-    `${GLYPHS.SUCCESS} Boost thank you messages will be sent to ${channel}.`);
+    `${GLYPHS.SUCCESS} Boost thank you messages will be sent to ${channel}.` +
+    (problem ? `\n\n${GLYPHS.WARNING} ${problem} Boosts cannot be announced until this is fixed.` : ''));
 }
 
 async function setBoostMessage(message, args, guildConfig, prefix) {
@@ -695,13 +738,52 @@ async function resetBoostMessage(message) {
       'features.boostSystem.showTimestamp': true,
       'features.boostSystem.mentionUser': true,
       'features.boostSystem.greetingText': null,
-      'features.boostSystem.authorType': 'username'
+      'features.boostSystem.authorType': 'username',
+      'features.boostSystem.showTierInMessage': true
     }
   });
 
   return replySuccess(message, 'Boost Message Reset',
-    `${GLYPHS.SUCCESS} All boost message settings have been reset to defaults.\n\n` +
+    `${GLYPHS.SUCCESS} All boost message settings have been reset to defaults. ` +
+    `Boost messages are now disabled and the boost channel was cleared.\n\n` +
     `Tier rewards, the perks announcement and the temporary booster role were kept.`);
+}
+
+// Problems that would stop boosts from being announced or rewarded, one line each
+function collectBoostProblems(guild, guildConfig) {
+  const boost = guildConfig.features?.boostSystem || {};
+  const roleSystem = guildConfig.features?.boosterRoleSystem || {};
+  const me = guild.members.me;
+  const problems = [];
+
+  if (boost.enabled) {
+    const channel = boost.channel ? guild.channels.cache.get(boost.channel) : null;
+    if (!boost.channel) problems.push('Boost messages are on, but no boost channel is set.');
+    else if (!channel) problems.push('The boost channel no longer exists.');
+    else {
+      const problem = describeSendProblem(channel, guild, boost.embedEnabled !== false);
+      if (problem) problems.push(problem);
+    }
+  }
+
+  for (const tier of boost.tierRewards || []) {
+    const role = guild.roles.cache.get(tier.roleId);
+    if (!role) {
+      problems.push(`The ${tier.boostCount}-boost tier role no longer exists.`);
+      continue;
+    }
+    const roleError = me ? getAssignableRoleError(role, me) : null;
+    if (roleError) problems.push(`${tier.boostCount}-boost tier: ${roleError}`);
+  }
+
+  if (roleSystem.roleId) {
+    const role = guild.roles.cache.get(roleSystem.roleId);
+    const roleError = role && me ? getAssignableRoleError(role, me) : null;
+    if (!role) problems.push('The temporary booster role no longer exists.');
+    else if (roleError) problems.push(`Temporary booster role: ${roleError}`);
+  }
+
+  return problems;
 }
 
 async function showStatus(message, guildConfig, prefix) {
@@ -709,6 +791,9 @@ async function showStatus(message, guildConfig, prefix) {
   const boosterRole = guildConfig.features?.boosterRoleSystem || {};
   const role = boosterRole.roleId ? message.guild.roles.cache.get(boosterRole.roleId) : null;
   const roleText = role ? `${role}` : (boosterRole.roleId ? `${GLYPHS.ERROR} No longer exists` : 'Not set');
+  const tiers = boost.tierRewards || [];
+  const manualTiers = tiers.filter(tier => tier.boostCount > DETECTABLE_BOOST_COUNT).length;
+  const problems = collectBoostProblems(message.guild, guildConfig);
 
   const embed = new EmbedBuilder()
     .setColor(COLORS.RAPHAEL)
@@ -722,7 +807,8 @@ async function showStatus(message, guildConfig, prefix) {
           `Channel: ${describeChannel(message.guild, boost.channel)}`,
           `Embed mode: ${flag(boost.embedEnabled !== false)}`,
           `Mention user: ${flag(boost.mentionUser !== false)}`,
-          `Timestamp: ${flag(boost.showTimestamp !== false)}`
+          `Timestamp: ${flag(boost.showTimestamp !== false)}`,
+          `Tier reward line: ${flag(boost.showTierInMessage !== false)}`
         ].join('\n'),
         inline: true
       },
@@ -743,13 +829,22 @@ async function showStatus(message, guildConfig, prefix) {
         value: [
           `Temporary role: ${roleText}`,
           `Role duration: ${boosterRole.duration || DEFAULT_ROLE_HOURS} hours`,
-          `Tier rewards: ${(boost.tierRewards || []).length} (only 1-boost tiers are detected automatically)`
+          `Tier rewards: ${tiers.length}` +
+            (manualTiers ? ` (${manualTiers} above 1 boost must be assigned manually)` : '')
         ].join('\n'),
         inline: false
       },
       { name: '▸ Current Message', value: codeBlock(getBoostMessageTemplate(boost), 300), inline: false }
     )
     .setFooter({ text: getRandomFooter() });
+
+  if (problems.length > 0) {
+    embed.addFields({
+      name: '▸ Needs Attention',
+      value: clampText(problems.map(problem => `${GLYPHS.ERROR} ${problem}`).join('\n'), 1024),
+      inline: false
+    });
+  }
 
   return message.reply({ embeds: [embed] });
 }
@@ -764,7 +859,7 @@ async function showHelp(message, prefix) {
       {
         name: '▸ Setup',
         value: [
-          `\`${p} enable\` / \`${p} disable\` - Toggle boost messages`,
+          `\`${p} enable\` / \`${p} disable\` - Toggle boost messages (also \`${p} toggle on/off\`)`,
           `\`${p} channel #channel\` - Set boost channel`,
           `\`${p} test\` / \`${p} preview\` - Try the message`,
           `\`${p} reset\` - Reset message settings`
@@ -784,7 +879,7 @@ async function showHelp(message, prefix) {
           `\`${p} color #HEX\` / \`${p} image <url>\``,
           `\`${p} thumbnail <url|avatar|server|remove>\``,
           `\`${p} author <username|displayname|server|none>\``,
-          `\`${p} embed|mention|timestamp on/off\``
+          `\`${p} embed|mention|timestamp|tiermessage on/off\``
         ].join('\n')
       },
       {
@@ -792,7 +887,8 @@ async function showHelp(message, prefix) {
         value: [
           `\`${p} role @role\` / \`${p} clearrole\``,
           `\`${p} give @user [reason]\` / \`${p} take @user\``,
-          `\`${p} duration <hours>\` / \`${p} list\``
+          `\`${p} duration <hours>\` / \`${p} list\``,
+          '› Given by staff, removed automatically within about a minute of expiring.'
         ].join('\n')
       },
       {
@@ -808,7 +904,8 @@ async function showHelp(message, prefix) {
         value: [
           `\`${p} perks\` - Status, \`${p} perks help\` - All options`,
           `\`${p} perks channel #channel\` / \`${p} perks preview\``,
-          `\`${p} publish\` - Send the announcement`
+          `\`${p} publish\` - Post, or update the last posted announcement`,
+          `\`${p} publish new\` - Always post a new announcement`
         ].join('\n')
       },
       {
@@ -822,14 +919,27 @@ async function showHelp(message, prefix) {
   return message.reply({ embeds: [embed] });
 }
 
+// The message a real boost by `member` would produce, without pinging anyone. Shows the tier
+// reward line a 1-boost member would get.
+function buildSampleBoostMessage(member, boost) {
+  return buildBoostMessage(member, boost, {
+    tierRewards: getGrantableTierRoles(member.guild, boost),
+    silent: true
+  });
+}
+
 async function showPreview(message, guildConfig) {
   const boost = guildConfig.features?.boostSystem || {};
-  const { embed, content } = buildBoostEmbed(message.member, boost, guildConfig);
+  const payload = buildSampleBoostMessage(message.member, boost);
+
+  if (!message.channel) {
+    return replyError(message, 'Preview Failed', 'I cannot post in this channel, Master.');
+  }
 
   await replyInfo(message, 'Boost Preview', 'Here is how your boost message will look, Master:');
 
   try {
-    await message.channel.send(embed ? { content, embeds: [embed] } : { content });
+    await message.channel.send(payload);
   } catch (error) {
     console.error('[Boost] Preview failed:', error);
     return replyError(message, 'Preview Failed',
@@ -849,24 +959,32 @@ async function sendTestBoost(message, guildConfig, prefix) {
     }
   }
 
-  if (cannotSendIn(channel, message.guild.members.me)) {
-    return replyError(message, 'Missing Permissions',
-      `I cannot send messages with embeds in ${channel}, Master.`);
+  const problem = channel
+    ? describeSendProblem(channel, message.guild, boost.embedEnabled !== false)
+    : 'I cannot post in this channel.';
+  if (problem) {
+    return replyError(message, 'Missing Permissions', `${problem} Please fix this first, Master.`);
   }
 
-  const { embed, content } = buildBoostEmbed(message.member, boost, guildConfig);
-
   try {
-    await channel.send(embed ? { content, embeds: [embed] } : { content });
+    await channel.send(buildSampleBoostMessage(message.member, boost));
   } catch (error) {
     console.error('[Boost] Test message failed:', error);
     return replyError(message, 'Test Failed',
       `The test message could not be sent to ${channel}, Master: ${error.message}`);
   }
 
+  const notes = [];
+  if (!boost.channel) {
+    notes.push(`No boost channel is set, so it was sent here. Use \`${prefix}boost channel #channel\` to set one.`);
+  }
+  if (!boost.enabled) {
+    notes.push(`Boost messages are disabled, so real boosts are not announced yet. Use \`${prefix}boost enable\`.`);
+  }
+
   return replySuccess(message, 'Test Sent',
     `${GLYPHS.SUCCESS} Test boost message sent to ${channel}.` +
-    (boost.channel ? '' : `\n\nNo boost channel is set, so it was sent here. Use \`${prefix}boost channel #channel\` to set one.`));
+    (notes.length ? `\n\n${notes.join('\n')}` : ''));
 }
 
 // ============================================
@@ -874,7 +992,7 @@ async function sendTestBoost(message, guildConfig, prefix) {
 // ============================================
 
 async function setBoosterRole(message, args, guildConfig, prefix) {
-  const role = message.mentions.roles.first() || message.guild.roles.cache.get(args[1]);
+  const role = resolveRole(message, args[1]);
 
   if (!role) {
     return replyError(message, 'Role Not Found',
@@ -929,29 +1047,45 @@ async function giveBoosterRole(message, args, guildConfig, prefix) {
       `${GLYPHS.ERROR} The configured booster role no longer exists. Please set a new one, Master.`);
   }
 
+  // Checked again here: the role may have been moved or given new permissions since it was set,
+  // and the member giving it must be allowed to hand it out
+  const roleError = getAssignableRoleError(role, message.member);
+  if (roleError) {
+    return replyError(message, 'Role Not Allowed', roleError);
+  }
+
   const duration = (roleSystem.duration || DEFAULT_ROLE_HOURS) * 60 * 60 * 1000;
   const reason = args.slice(2).join(' ') || null;
 
-  // Already has the role: extend the expiry time
+  // Already has the role: start the duration again from now
   if (member.roles.cache.has(boosterRoleId)) {
-    await BoosterRole.addBoosterRole(message.guild.id, member.id, boosterRoleId, duration, message.author.id, reason);
-
-    const expiresAt = new Date(Date.now() + duration);
-    return replyInfo(message, 'Role Extended',
-      `${GLYPHS.INFO} ${member}'s booster role duration has been extended.\n\n` +
-      `**Expires:** <t:${Math.floor(expiresAt.getTime() / 1000)}:R>`);
+    const entry = await BoosterRole.addBoosterRole(message.guild.id, member.id, boosterRoleId, duration, message.author.id, reason);
+    const expiresAt = Math.floor(new Date(entry.expiresAt).getTime() / 1000);
+    return replyInfo(message, 'Role Renewed',
+      `${GLYPHS.INFO} ${member} already has ${role}. It will now be removed <t:${expiresAt}:R>.\n\n` +
+      `**Expires:** <t:${expiresAt}:F>`);
   }
 
   try {
-    await member.roles.add(role);
-    await BoosterRole.addBoosterRole(message.guild.id, member.id, boosterRoleId, duration, message.author.id, reason);
+    await member.roles.add(role, `Temporary booster role given by ${message.author.tag}`);
   } catch (error) {
-    console.error('Error giving booster role:', error);
+    console.error('[Boost] Error giving booster role:', error);
     return replyError(message, 'Error',
       `${GLYPHS.ERROR} Failed to give the booster role. Make sure I have the proper permissions, Master.`);
   }
 
-  const expiresAt = Math.floor((Date.now() + duration) / 1000);
+  let entry;
+  try {
+    entry = await BoosterRole.addBoosterRole(message.guild.id, member.id, boosterRoleId, duration, message.author.id, reason);
+  } catch (error) {
+    // Without a record the role would never expire, so take it back
+    console.error('[Boost] Error saving booster role expiry:', error);
+    await member.roles.remove(role, 'Temporary booster role could not be tracked').catch(() => { });
+    return replyError(message, 'Error',
+      `${GLYPHS.ERROR} I could not save the expiry time, so the role was not given. Please try again, Master.`);
+  }
+
+  const expiresAt = Math.floor(new Date(entry.expiresAt).getTime() / 1000);
   return replySuccess(message, 'Booster Role Given',
     `${GLYPHS.SUCCESS} Successfully gave ${role} to ${member}.\n\n` +
     `**Expires:** <t:${expiresAt}:F> (<t:${expiresAt}:R>)` +
@@ -960,11 +1094,6 @@ async function giveBoosterRole(message, args, guildConfig, prefix) {
 
 async function removeBoosterRole(message, args, guildConfig, prefix) {
   const boosterRoleId = guildConfig.features?.boosterRoleSystem?.roleId;
-
-  if (!boosterRoleId) {
-    return replyError(message, 'No Role Configured', `${GLYPHS.ERROR} No booster role has been configured, Master.`);
-  }
-
   const member = await resolveMember(message, args[1]);
 
   if (!member) {
@@ -972,60 +1101,88 @@ async function removeBoosterRole(message, args, guildConfig, prefix) {
       `${GLYPHS.ERROR} Please mention a valid user, Master.\n\n**Usage:** \`${prefix}boost take @user\``);
   }
 
-  if (!member.roles.cache.has(boosterRoleId)) {
-    return replyError(message, 'No Role', `${GLYPHS.ERROR} ${member} does not have the booster role.`);
+  // The configured role plus any temporary role still tracked for the member (the configured
+  // role may have changed since it was given)
+  const entries = await BoosterRole.find({ guildId: message.guild.id, userId: member.id }).lean();
+  const roleIds = new Set(entries.map(entry => entry.roleId));
+  if (boosterRoleId) roleIds.add(boosterRoleId);
+  const heldRoles = [...roleIds]
+    .filter(roleId => member.roles.cache.has(roleId))
+    .map(roleId => message.guild.roles.cache.get(roleId))
+    .filter(Boolean);
+
+  if (heldRoles.length === 0 && entries.length === 0) {
+    return replyError(message, boosterRoleId ? 'No Role' : 'No Role Configured', boosterRoleId
+      ? `${GLYPHS.ERROR} ${member} does not have the booster role.`
+      : `${GLYPHS.ERROR} No booster role has been configured, Master.`);
   }
 
-  const role = message.guild.roles.cache.get(boosterRoleId);
-
   try {
-    if (role) {
-      await member.roles.remove(role);
+    for (const role of heldRoles) {
+      await member.roles.remove(role, `Temporary booster role taken by ${message.author.tag}`);
     }
-    await BoosterRole.removeBoosterRole(message.guild.id, member.id, boosterRoleId);
   } catch (error) {
-    console.error('Error removing booster role:', error);
+    console.error('[Boost] Error removing booster role:', error);
     return replyError(message, 'Error',
       `${GLYPHS.ERROR} Failed to remove the booster role. Make sure I have the proper permissions, Master.`);
   }
 
-  return replySuccess(message, 'Booster Role Removed',
-    `${GLYPHS.SUCCESS} Successfully removed the booster role from ${member}.`);
+  await BoosterRole.removeBoosterRole(message.guild.id, member.id);
+
+  return replySuccess(message, 'Booster Role Removed', heldRoles.length > 0
+    ? `${GLYPHS.SUCCESS} Removed ${heldRoles.join(', ')} from ${member}.`
+    : `${GLYPHS.SUCCESS} ${member} no longer had the booster role. Its pending expiry was cleared.`);
 }
 
 async function listActiveBoosterRoles(message) {
-  const activeRoles = await BoosterRole.getGuildBoosterRoles(message.guild.id);
+  const entries = await BoosterRole.getGuildEntries(message.guild.id);
 
-  if (activeRoles.length === 0) {
+  if (entries.length === 0) {
     return replyInfo(message, 'No Active Booster Roles',
       `${GLYPHS.INFO} There are no active temporary booster roles in this server.`);
   }
 
-  const shown = activeRoles.slice(0, MAX_LISTED_ROLES);
-  const fields = [];
-  for (const entry of shown) {
-    const member = await message.guild.members.fetch(entry.userId).catch(() => null);
-    const role = message.guild.roles.cache.get(entry.roleId);
-    const expiresTimestamp = Math.floor(entry.expiresAt.getTime() / 1000);
+  const shown = entries.slice(0, MAX_LISTED_ROLES);
+  const members = await message.guild.members.fetch({ user: shown.map(entry => entry.userId) })
+    .catch(() => message.guild.members.cache);
+  const now = Date.now();
 
-    fields.push({
-      name: member ? member.user.tag : `User ID: ${entry.userId}`,
-      value: `**Role:** ${role ? role.toString() : 'Unknown'}\n` +
-        `**Expires:** <t:${expiresTimestamp}:R>` +
-        (entry.reason ? `\n**Reason:** ${clampText(entry.reason, 200)}` : ''),
+  const fields = shown.map(entry => {
+    const member = members.get(entry.userId);
+    const role = message.guild.roles.cache.get(entry.roleId);
+    const expiresAt = new Date(entry.expiresAt).getTime();
+    const expiresTimestamp = Math.floor(expiresAt / 1000);
+    const expiry = expiresAt > now
+      ? `**Expires:** <t:${expiresTimestamp}:R>`
+      : `**Expired:** <t:${expiresTimestamp}:R>, removal pending` +
+        (entry.lastError ? ` (last attempt failed: ${clampText(entry.lastError, 80)})` : '');
+
+    return {
+      name: clampText(member ? member.user.tag : `User ID: ${entry.userId}`, 64),
+      value: `**Role:** ${role ? role.toString() : 'Deleted role'}\n${expiry}` +
+        (entry.reason ? `\n**Reason:** ${clampText(entry.reason, 80)}` : ''),
       inline: true
-    });
+    };
+  });
+
+  // Stay under Discord's 6000 character embed limit (title, description and footer use < 400)
+  const listed = [];
+  let size = 400;
+  for (const field of fields) {
+    size += field.name.length + field.value.length;
+    if (size > LIMITS.embed) break;
+    listed.push(field);
   }
 
-  const countText = activeRoles.length > shown.length
-    ? `Showing ${shown.length} of ${activeRoles.length} active booster roles.`
-    : `Showing ${activeRoles.length} active booster role(s).`;
+  const countText = entries.length > listed.length
+    ? `Showing ${listed.length} of ${entries.length} temporary booster roles.`
+    : `Showing ${entries.length} temporary booster role(s).`;
 
   const embed = new EmbedBuilder()
     .setTitle('『 Active Booster Roles 』')
     .setColor(COLORS.RAPHAEL)
-    .setDescription(`**Analysis:** ${countText}\nRoles are removed automatically when they expire.`)
-    .addFields(fields)
+    .setDescription(`**Analysis:** ${countText}\nRoles are removed automatically within about a minute of expiring.`)
+    .addFields(listed)
     .setFooter({ text: getRandomFooter() });
 
   return message.reply({ embeds: [embed] });
@@ -1079,6 +1236,17 @@ async function handleBoostTiers(message, args, guildConfig, prefix) {
       return removeBoostTier(message, args.slice(1), guildConfig, prefix);
     case 'clear':
       return clearBoostTiers(message, guildConfig);
+    case 'stackable':
+      return setTierStackable(message, args.slice(1), guildConfig, prefix);
+    // "tier message on|off": the tier reward line in the boost message
+    case 'message':
+    case 'line':
+      return setBoostToggle(message, args[2], prefix, {
+        path: 'features.boostSystem.showTierInMessage',
+        command: 'boost tier message',
+        title: 'Tier Reward Line Updated',
+        describe: (on) => `The tier reward line in the boost message is now **${on ? 'shown' : 'hidden'}**.`
+      });
     default:
       return showTierHelp(message, prefix);
   }
@@ -1088,7 +1256,7 @@ async function addBoostTier(message, args, guildConfig, prefix) {
   // Usage: boost addtier <boost_count> @role [stackable]
   // or: boost tier add <boost_count> @role [stackable]
   const boostCount = parseWholeNumber(args[1]);
-  const role = message.mentions.roles.first() || message.guild.roles.cache.get(args[2]);
+  const role = resolveRole(message, args[2]);
 
   if (Number.isNaN(boostCount) || boostCount < 1 || boostCount > MAX_TIER_BOOSTS) {
     return replyError(message, 'Invalid Boost Count',
@@ -1128,7 +1296,7 @@ async function addBoostTier(message, args, guildConfig, prefix) {
 
   const detectionNote = boostCount > DETECTABLE_BOOST_COUNT
     ? `\n\n${GLYPHS.WARNING} ${BOOST_DETECTION_NOTE}`
-    : `\n\nMembers receive this role when they boost.`;
+    : `\n\nMembers receive this role when they boost and lose it when they stop boosting.`;
 
   return replySuccess(message, 'Boost Tier Added',
     `${GLYPHS.SUCCESS} **Tier ${boostCount}** reward has been ${existingIndex !== -1 ? 'updated' : 'added'}.\n\n` +
@@ -1281,7 +1449,8 @@ async function showTierHelp(message, prefix) {
           `\`${p} removetier <count>\` - Remove a tier reward`,
           `\`${p} listtiers\` - View all configured tiers`,
           `\`${p} cleartiers\` - Remove all tier rewards`,
-          `\`${p} stackable <count> <on/off>\` - Set whether tier roles stack`
+          `\`${p} stackable <count> <on/off>\` - Set whether tier roles stack`,
+          `\`${p} tiermessage <on/off>\` - Show the earned tier in the boost message`
         ].join('\n')
       },
       { name: '▸ Example', value: `\`${p} addtier 1 @Booster\`` },
@@ -1298,11 +1467,11 @@ async function showTierHelp(message, prefix) {
 // ============================================
 
 function getPerksTitle(perks) {
-  return perks.embedTitle && !SCHEMA_DEFAULT_PERKS_TITLES.has(perks.embedTitle) ? perks.embedTitle : DEFAULT_PERKS_TITLE;
+  return perks.embedTitle?.trim() && !SCHEMA_DEFAULT_PERKS_TITLES.has(perks.embedTitle) ? perks.embedTitle : DEFAULT_PERKS_TITLE;
 }
 
 function getPerksMessage(perks) {
-  return perks.message && !SCHEMA_DEFAULT_PERKS_MESSAGES.has(perks.message) ? perks.message : DEFAULT_PERKS_MESSAGE;
+  return perks.message?.trim() && !SCHEMA_DEFAULT_PERKS_MESSAGES.has(perks.message) ? perks.message : DEFAULT_PERKS_MESSAGE;
 }
 
 async function handlePerksCommand(message, args, guildConfig, prefix) {
@@ -1336,7 +1505,7 @@ async function handlePerksCommand(message, args, guildConfig, prefix) {
       return previewPerksAnnouncement(message, guildConfig);
     case 'publish':
     case 'send':
-      return publishPerksAnnouncement(message, guildConfig, prefix);
+      return publishPerksAnnouncement(message, args[2], guildConfig, prefix);
     case 'tierlist':
     case 'showtiers':
       return togglePerksTierList(message, args.slice(1), prefix);
@@ -1380,20 +1549,22 @@ async function showPerksStatus(message, guildConfig, prefix) {
         ].join('\n'),
         inline: true
       },
-      { name: '▸ Current Message', value: codeBlock(getPerksMessage(perks), 300), inline: false }
+      { name: '▸ Current Message', value: codeBlock(getPerksMessage(perks), 300), inline: false },
+      {
+        name: '▸ Last Published',
+        value: perks.lastPublished
+          ? `<t:${Math.floor(new Date(perks.lastPublished).getTime() / 1000)}:F>`
+          : 'Never published',
+        inline: false
+      }
     )
-    .setFooter({
-      text: perks.lastPublished
-        ? `Last published: ${new Date(perks.lastPublished).toLocaleDateString()}`
-        : 'Never published'
-    });
+    .setFooter({ text: getRandomFooter() });
 
   return message.reply({ embeds: [embed] });
 }
 
 async function setPerksChannel(message, args, prefix) {
-  const channel = message.mentions.channels.first() ||
-    message.guild.channels.cache.get(args[1]);
+  const channel = resolveChannel(message, args[1]);
 
   if (!channel) {
     return replyError(message, 'No Channel',
@@ -1401,7 +1572,7 @@ async function setPerksChannel(message, args, prefix) {
       `**Usage:** \`${prefix}boost perks channel #booster-perks\``);
   }
 
-  if (channel.type !== ChannelType.GuildText && channel.type !== ChannelType.GuildAnnouncement) {
+  if (!ANNOUNCEMENT_CHANNEL_TYPES.includes(channel.type)) {
     return replyError(message, 'Invalid Channel', 'Please select a text or announcement channel, Master.');
   }
 
@@ -1409,9 +1580,11 @@ async function setPerksChannel(message, args, prefix) {
     $set: { 'features.boostSystem.perksAnnouncement.channel': channel.id }
   });
 
+  const problem = describeSendProblem(channel, message.guild);
   return replySuccess(message, 'Perks Channel Set',
     `${GLYPHS.SUCCESS} Booster perks announcements will be sent to ${channel}.\n\n` +
-    `Use \`${prefix}boost publish\` to send the announcement.`);
+    `Use \`${prefix}boost publish\` to send the announcement.` +
+    (problem ? `\n\n${GLYPHS.WARNING} ${problem} Publishing will fail until this is fixed.` : ''));
 }
 
 async function setPerksMessage(message, args, guildConfig, prefix) {
@@ -1633,19 +1806,32 @@ async function togglePerksTierList(message, args, prefix) {
 async function previewPerksAnnouncement(message, guildConfig) {
   const embed = buildPerksEmbed(message.guild, guildConfig);
 
+  if (!message.channel) {
+    return replyError(message, 'Preview Failed', 'I cannot post in this channel, Master.');
+  }
+
   await replyInfo(message, 'Perks Preview', 'Here is how your booster perks announcement will look, Master:');
 
   try {
-    await message.channel.send({ embeds: [embed] });
+    await message.channel.send({ embeds: [embed], allowedMentions: { parse: [] } });
   } catch (error) {
     console.error('[BOOST PERKS] Preview failed:', error);
     return replyError(message, 'Preview Failed', `The preview could not be sent here, Master: ${error.message}`);
   }
 }
 
-async function publishPerksAnnouncement(message, guildConfig, prefix) {
+// The announcement posted by the last publish, if it is still in `channel`
+async function findPublishedPerks(channel, messageId) {
+  if (!messageId) return null;
+  const existing = await channel.messages.fetch(messageId).catch(() => null);
+  return existing?.author?.id === channel.client.user.id ? existing : null;
+}
+
+// option "new" posts a fresh announcement; otherwise the last one is updated when it still exists
+async function publishPerksAnnouncement(message, option, guildConfig, prefix) {
   const perks = guildConfig.features?.boostSystem?.perksAnnouncement || {};
   const channelId = perks.channel;
+  const forceNew = isKeyword(option, ['new', 'repost']);
 
   if (!channelId) {
     return replyError(message, 'No Channel Set',
@@ -1659,15 +1845,18 @@ async function publishPerksAnnouncement(message, guildConfig, prefix) {
       `${GLYPHS.ERROR} The configured perks channel no longer exists. Please set a new one, Master.`);
   }
 
-  if (cannotSendIn(channel, message.guild.members.me)) {
-    return replyError(message, 'Missing Permissions',
-      `${GLYPHS.ERROR} I do not have permission to send embeds in ${channel}, Master.`);
+  const problem = describeSendProblem(channel, message.guild);
+  if (problem) {
+    return replyError(message, 'Missing Permissions', `${GLYPHS.ERROR} ${problem} Please fix this first, Master.`);
   }
 
   const embed = buildPerksEmbed(message.guild, guildConfig);
+  const payload = { content: null, embeds: [embed], allowedMentions: { parse: [] } };
+  const existing = forceNew ? null : await findPublishedPerks(channel, perks.messageId);
 
+  let posted;
   try {
-    await channel.send({ embeds: [embed] });
+    posted = existing ? await existing.edit(payload) : await channel.send(payload);
   } catch (error) {
     console.error('[BOOST PERKS] Error publishing announcement:', error);
     return replyError(message, 'Failed to Publish',
@@ -1675,11 +1864,16 @@ async function publishPerksAnnouncement(message, guildConfig, prefix) {
   }
 
   await Guild.updateGuild(message.guild.id, {
-    $set: { 'features.boostSystem.perksAnnouncement.lastPublished': new Date() }
+    $set: {
+      'features.boostSystem.perksAnnouncement.lastPublished': new Date(),
+      'features.boostSystem.perksAnnouncement.messageId': posted.id
+    }
   });
 
-  return replySuccess(message, 'Announcement Published',
-    `${GLYPHS.SUCCESS} Booster perks announcement has been sent to ${channel}.`);
+  return replySuccess(message, existing ? 'Announcement Updated' : 'Announcement Published', existing
+    ? `${GLYPHS.SUCCESS} The booster perks announcement in ${channel} has been updated: ${posted.url}\n\n` +
+      `Use \`${prefix}boost publish new\` to post a new one instead.`
+    : `${GLYPHS.SUCCESS} Booster perks announcement has been sent to ${channel}: ${posted.url}`);
 }
 
 async function resetPerksSettings(message) {
@@ -1697,7 +1891,8 @@ async function resetPerksSettings(message) {
       [`${base}.footerText`]: null,
       [`${base}.showTimestamp`]: true,
       [`${base}.showTierList`]: true,
-      [`${base}.lastPublished`]: null
+      [`${base}.lastPublished`]: null,
+      [`${base}.messageId`]: null
     }
   });
 
@@ -1705,47 +1900,73 @@ async function resetPerksSettings(message) {
     `${GLYPHS.SUCCESS} All booster perks announcement settings have been reset to defaults.`);
 }
 
+// The public tier list: whole lines only, tiers whose role was deleted left out
+function formatPerksTierList(guild, tiers, maxLength) {
+  const lines = [...tiers]
+    .sort((a, b) => a.boostCount - b.boostCount)
+    .map(tier => ({ tier, role: guild.roles.cache.get(tier.roleId) }))
+    .filter(({ role }) => role)
+    .map(({ tier, role }) => `◆ **${tier.boostCount}+ Boost${tier.boostCount === 1 ? '' : 's'}** — ${role}`);
+
+  const kept = [];
+  let length = 0;
+  for (const [index, line] of lines.entries()) {
+    // Room for this line and, when more follow, the "and N more" line
+    const moreLength = index < lines.length - 1 ? 30 : 0;
+    if (length + line.length + 1 + moreLength > maxLength) {
+      kept.push(`› and ${lines.length - index} more`);
+      break;
+    }
+    kept.push(line);
+    length += line.length + 1;
+  }
+  return kept.join('\n');
+}
+
 function buildPerksEmbed(guild, guildConfig) {
   const perks = guildConfig.features?.boostSystem?.perksAnnouncement || {};
   const tiers = guildConfig.features?.boostSystem?.tierRewards || [];
 
+  const title = clampText(getPerksTitle(perks), LIMITS.title);
+  const footer = perks.footerText?.trim()
+    ? clampText(perks.footerText, LIMITS.footer)
+    : `Server Boost Level: ${guild.premiumTier} • ${guild.premiumSubscriptionCount || 0} Boosts`;
+
   const embed = new EmbedBuilder()
     .setColor(isValidColor(perks.embedColor) ? perks.embedColor : DEFAULT_BOOST_COLOR)
-    .setTitle(clampText(getPerksTitle(perks), LIMITS.title));
+    .setTitle(title)
+    .setFooter({ text: footer });
 
   // Parse message with variables (replacer functions keep "$" in names literal)
-  let description = getPerksMessage(perks)
+  const text = getPerksMessage(perks)
     .replace(/{server}/gi, () => guild.name)
-    .replace(/{boostcount}/gi, () => (guild.premiumSubscriptionCount || 0).toString())
-    .replace(/{boostlevel}/gi, () => guild.premiumTier.toString())
-    .replace(/{membercount}/gi, () => guild.memberCount.toString())
+    .replace(/{boostcount}/gi, () => String(guild.premiumSubscriptionCount || 0))
+    .replace(/{boostlevel}/gi, () => String(guild.premiumTier ?? 0))
+    .replace(/{membercount}/gi, () => String(guild.memberCount ?? 0))
     .replace(/\\n/g, '\n');
 
-  // Add tier list if enabled
+  // Keep the whole embed under Discord's 6000 character limit
+  const room = Math.min(LIMITS.description, LIMITS.embed - title.length - footer.length);
+  let description = clampText(text, room);
+
   if (perks.showTierList !== false && tiers.length > 0) {
-    description += `\n\n**Tier Rewards:**\n${formatTierLines(guild, tiers, { showStackable: false })}`;
+    const heading = '\n\n**Tier Rewards:**\n';
+    const tierList = formatPerksTierList(guild, tiers, room - description.length - heading.length);
+    if (tierList) description += heading + tierList;
   }
 
-  embed.setDescription(clampText(description, 4096));
+  embed.setDescription(description);
 
   // Thumbnail
   if (perks.thumbnailType === 'server' || !perks.thumbnailType) {
     embed.setThumbnail(guild.iconURL({ size: 256 }));
-  } else if (perks.thumbnailType === 'custom' && perks.thumbnailUrl) {
-    embed.setThumbnail(perks.thumbnailUrl);
+  } else if (perks.thumbnailType === 'custom') {
+    embed.setThumbnail(toImageUrl(perks.thumbnailUrl));
   }
 
   // Banner
-  if (perks.bannerUrl) {
-    embed.setImage(perks.bannerUrl);
-  }
-
-  // Footer
-  if (perks.footerText) {
-    embed.setFooter({ text: clampText(perks.footerText, LIMITS.footer) });
-  } else {
-    embed.setFooter({ text: `Server Boost Level: ${guild.premiumTier} • ${guild.premiumSubscriptionCount || 0} Boosts` });
-  }
+  const banner = toImageUrl(perks.bannerUrl);
+  if (banner) embed.setImage(banner);
 
   // Timestamp
   if (perks.showTimestamp !== false) {
@@ -1783,7 +2004,8 @@ async function showPerksHelp(message, prefix) {
         name: '▸ Publishing',
         value: [
           `\`${p} preview\` - Preview announcement`,
-          `\`${prefix}boost publish\` - Send to channel`
+          `\`${prefix}boost publish\` - Post it, or update the one posted last`,
+          `\`${prefix}boost publish new\` - Post a new announcement`
         ].join('\n')
       },
       { name: '▸ Variables', value: '`{server}` `{boostcount}` `{boostlevel}` `{membercount}` `\\n` (new line)' }

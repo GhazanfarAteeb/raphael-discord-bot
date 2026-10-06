@@ -60,11 +60,10 @@ const COMMAND_EXAMPLES = {
   daily: ['daily'],
   balance: ['balance', 'balance @user'],
   level: ['level', 'level @user'],
-  shop: ['shop', 'shop buy 1'],
-  inventory: ['inventory', 'inventory @user'],
+  shop: ['shop'],
+  inventory: ['inventory', 'inventory badges', 'setbg Sunset'],
   profile: ['profile', 'profile @user'],
   setprofile: ['setprofile bio Hello world!', 'setprofile title Warrior'],
-  setbackground: ['setbackground <url>', 'setbackground reset'],
   rep: ['rep @user'],
   claim: ['claim'],
   adventure: ['adventure'],
@@ -84,7 +83,7 @@ const COMMAND_EXAMPLES = {
   goodbye: ['goodbye enable', 'goodbye disable', 'goodbye channel #goodbye', 'goodbye message Goodbye {user}!', 'goodbye status', 'goodbye test', 'goodbye reset'],
 
   // Config - Boost
-  boost: ['boost status', 'boost channel #boosts', 'boost message Thanks {user} for boosting!', 'boost title New Booster', 'boost color #f47fff', 'boost embed on', 'boost mention on', 'boost image <url>', 'boost thumbnail avatar', 'boost author username', 'boost test', 'boost preview', 'boost reset', 'boost role @BoosterRole', 'boost give @user', 'boost take @user', 'boost duration 24', 'boost list', 'boost addtier 1 @Tier1Role', 'boost removetier 1', 'boost listtiers', 'boost cleartiers'],
+  boost: ['boost status', 'boost enable', 'boost channel #boosts', 'boost message Thanks {user} for boosting!', 'boost title New Booster', 'boost color #f47fff', 'boost embed on', 'boost mention on', 'boost image <url>', 'boost thumbnail avatar', 'boost author username', 'boost test', 'boost preview', 'boost reset', 'boost role @BoosterRole', 'boost give @user', 'boost take @user', 'boost duration 24', 'boost list', 'boost addtier 1 @Tier1Role', 'boost removetier 1', 'boost listtiers', 'boost cleartiers', 'boost tiermessage off', 'boost perks channel #perks', 'boost publish'],
 
   // Config - Auto Role
   autorole: ['autorole enable', 'autorole disable', 'autorole add @Member', 'autorole remove @Member', 'autorole delay 5', 'autorole bot add @BotRole', 'autorole bot remove @BotRole', 'autorole list'],
@@ -127,7 +126,7 @@ const COMMAND_EXAMPLES = {
   birthdayrequests: ['birthdayrequests', 'birthdayrequests all', 'birthdayrequests approved'],
 
   // Community - Events & Giveaways
-  giveaway: ['giveaway start 1h 1 Discord Nitro', 'giveaway start 1d 3 Steam Gift Card', 'giveaway end <messageId>', 'giveaway reroll <messageId>', 'giveaway list'],
+  giveaway: ['giveaway start 1h 1 Discord Nitro', 'giveaway start 1d 3 @Members Steam Gift Card', 'giveaway end <messageId>', 'giveaway reroll <messageId>', 'giveaway list'],
   createevent: ['createevent 2h | Movie Night | Join us in VC!', 'createevent 1d12h | Tournament | Registration required', 'createevent 30m | Quick Meeting'],
   events: ['events'],
   joinevent: ['joinevent <event_id>'],
@@ -163,7 +162,6 @@ const COMMAND_EXAMPLES = {
   tictactoe: ['tictactoe @user'],
   trivia: ['trivia', 'trivia science'],
   meme: ['meme'],
-  gif: ['gif cat', 'gif dance']
 };
 
 // ---------------------------------------------------------------------------

@@ -2081,37 +2081,6 @@ async function handleManageshopCommand(interaction, guildConfig) {
     }
   }
 }
-// Verification panel, matching the one the prefix verify command sends: a button for the
-// button and captcha types (custom IDs handled by verificationHandler.js), a reaction otherwise
-async function sendVerificationPanel(channel, type) {
-  const { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = await import('discord.js');
-
-  const instructions = {
-    button: '**Activate the button below to proceed.**',
-    captcha: '**Activate the button below to receive a verification code.**',
-    reaction: '**Apply the reaction below to verify.**'
-  };
-  const embed = new EmbedBuilder()
-    .setColor(COLORS.RAPHAEL)
-    .setTitle('『 Server Verification 』')
-    .setDescription(`**Notice:** Access to this server requires verification, Master.\n\n${instructions[type] || instructions.button}`)
-    .setFooter({ text: 'Security protocol active.' });
-
-  if (type === 'reaction') {
-    const panel = await channel.send({ embeds: [embed] });
-    await panel.react('✅');
-    return;
-  }
-
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(type === 'captcha' ? 'verify_captcha' : 'verify_button')
-      .setLabel(type === 'captcha' ? 'Get Captcha' : 'Verify')
-      .setStyle(ButtonStyle.Success)
-  );
-  await channel.send({ embeds: [embed], components: [row] });
-}
-
 // Handle verify command
 async function handleVerifyCommand(interaction, guildConfig) {
   const { successEmbed, errorEmbed, infoEmbed, GLYPHS } = await import('../../utils/embeds.js');
@@ -2145,6 +2114,16 @@ async function handleVerifyCommand(interaction, guildConfig) {
             `${GLYPHS.ERROR} Please set a verified role first with \`/verify setrole\`, Master.`)]
         });
         return;
+      }
+
+      // Shared with the prefix command: posts the panel and records it, so reaction-type
+      // panels are recognised by the reaction handler
+      const { sendVerificationPanel, getPanelChannelError } = await import('../../commands/moderation/verify.js');
+      const channelError = getPanelChannelError(channel, vs.type || 'button');
+      if (channelError) {
+        return interaction.editReply({
+          embeds: [await errorEmbed(interaction.guild.id, 'Invalid Channel', channelError)]
+        });
       }
 
       try {
@@ -2719,90 +2698,26 @@ async function handleFeatureCommand(interaction, client, guildConfig) {
   await featureCommand.execute(createDeferredCommandMessage(interaction, client, { args }), args, client);
 }
 
-// Giveaway durations offered by /giveaway start
-const GIVEAWAY_DURATION_UNITS = { s: 1000, m: 60000, h: 3600000, d: 86400000, w: 604800000 };
-
-// /giveaway start posts the shared giveaway message (buildGiveawayMessage, also used by the
-// prefix command and the entry button handler); end, reroll, list and delete run the prefix
-// command, so winners are drawn the same way (members only, no repeat winners on reroll)
+// /giveaway runs the prefix command's code: start goes through createGiveaway (same
+// validation, message, required role and stored fields as the prefix start), and end,
+// reroll, list and delete run the prefix sub-commands, so winners are drawn the same way
 async function handleGiveawayCommand(interaction, client) {
-  const { successEmbed, errorEmbed, GLYPHS } = await import('../../utils/embeds.js');
-  const Giveaway = (await import('../../models/Giveaway.js')).default;
   const giveawayModule = await import('../../commands/community/giveaway.js');
-
   const subcommand = interaction.options.getSubcommand();
 
-  if (subcommand !== 'start') {
-    const messageId = interaction.options.getString('message_id');
-    const count = interaction.options.getInteger('count');
-    const args = [subcommand, ...(messageId ? [messageId] : []), ...(count ? [String(count)] : [])];
-    return giveawayModule.default.execute(createDeferredCommandMessage(interaction, client, { args }), args, client);
-  }
-
-  const durationStr = interaction.options.getString('duration');
-  const winners = interaction.options.getInteger('winners');
-  const prize = interaction.options.getString('prize').trim();
-  const requiredRole = interaction.options.getRole('required_role');
-
-  const durationMatch = durationStr.match(/^(\d+)([smhdw])$/i);
-  if (!durationMatch) {
-    return interaction.editReply({
-      embeds: [await errorEmbed(interaction.guild.id, 'Invalid Duration', 'Please provide a valid duration, Master.')]
-    });
-  }
-  if (!prize || prize.length > 256) {
-    return interaction.editReply({
-      embeds: [await errorEmbed(interaction.guild.id, 'Invalid Prize', 'The prize must be between 1 and 256 characters, Master.')]
+  if (subcommand === 'start') {
+    return giveawayModule.createGiveaway(createDeferredCommandMessage(interaction, client), {
+      duration: interaction.options.getString('duration'),
+      winners: interaction.options.getInteger('winners'),
+      prize: interaction.options.getString('prize'),
+      roleId: interaction.options.getRole('required_role')?.id ?? null
     });
   }
 
-  const duration = parseInt(durationMatch[1], 10) * GIVEAWAY_DURATION_UNITS[durationMatch[2].toLowerCase()];
-  const endsAt = new Date(Date.now() + duration);
-  const draft = {
-    guildId: interaction.guild.id,
-    hostId: interaction.user.id,
-    prize,
-    winners,
-    endsAt,
-    participants: [],
-    requirements: requiredRole ? { roleId: requiredRole.id } : undefined
-  };
-
-  const payload = await giveawayModule.buildGiveawayMessage(draft);
-  // The entry handler enforces the role; show it on the announcement too
-  const [embed] = payload.embeds;
-  if (requiredRole && !embed.data.description?.includes(requiredRole.id)) {
-    embed.addFields({ name: '▸ Required Role', value: `${requiredRole}` });
-  }
-
-  let giveawayMessage;
-  try {
-    giveawayMessage = await interaction.channel.send(payload);
-  } catch (error) {
-    console.error('Error posting giveaway:', error);
-    return interaction.editReply({
-      embeds: [await errorEmbed(interaction.guild.id, 'Giveaway Not Started',
-        `${GLYPHS.ERROR} I could not post the giveaway in this channel. Please check my permissions here, Master.`)]
-    });
-  }
-
-  try {
-    await Giveaway.create({
-      ...draft,
-      channelId: interaction.channel.id,
-      messageId: giveawayMessage.id
-    });
-  } catch (error) {
-    // Without a record the buttons would only answer "no longer exists"
-    await giveawayMessage.delete().catch(() => { });
-    throw error;
-  }
-
-  return interaction.editReply({
-    embeds: [await successEmbed(interaction.guild.id, 'Lottery Initiated',
-      `**Confirmed:** Lottery for **${prize}** has been activated, Master.\n` +
-      `Concludes <t:${Math.floor(endsAt.getTime() / 1000)}:R>`)]
-  });
+  const messageId = interaction.options.getString('message_id');
+  const count = interaction.options.getInteger('count');
+  const args = [subcommand, ...(messageId ? [messageId] : []), ...(count ? [String(count)] : [])];
+  return giveawayModule.default.execute(createDeferredCommandMessage(interaction, client, { args }), args, client);
 }
 
 // Matches the /award reason option's max length

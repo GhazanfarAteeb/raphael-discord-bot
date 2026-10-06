@@ -329,108 +329,92 @@ export function startBirthdayRoleRemover(client) {
   console.log('[RAPHAEL] Birthday role removal scheduler initialized.');
 }
 
-// Remove expired temporary booster roles - runs every 24 hours at 1 AM
-export function startBoosterRoleRemover(client) {
-  cron.schedule('0 1 * * *', async () => {
-    console.log('🎁 Checking for expired booster roles...');
+// Remove expired temporary booster roles. Checked every minute, so a role is removed within
+// about a minute of expiring; the first check runs shortly after startup and catches roles
+// that expired while the bot was offline. A failed removal (missing permissions, API errors)
+// is retried later with a growing delay instead of being forgotten.
+const BOOSTER_ROLE_CHECK_INTERVAL_MS = 60 * 1000;
+const BOOSTER_ROLE_STARTUP_DELAY_MS = 15 * 1000;
+// Unknown Guild, Unknown Member, Unknown Role, Unknown User: there is nothing left to remove
+const BOOSTER_ROLE_GONE_CODES = new Set([10004, 10007, 10011, 10013]);
 
+export async function removeExpiredBoosterRoles(client) {
+  if (!client.isReady()) return;
+
+  const expiredRoles = await BoosterRole.getExpiredRoles();
+  let removedCount = 0;
+  let failedCount = 0;
+
+  for (const entry of expiredRoles) {
     try {
-      // Get all expired booster roles
-      const expiredRoles = await BoosterRole.getExpiredRoles();
+      const guild = client.guilds.cache.get(entry.guildId);
+      if (!guild) {
+        // The bot is no longer in the server
+        await BoosterRole.deleteIfExpired(entry);
+        continue;
+      }
+      // Server outage: try again on a later run
+      if (!guild.available) continue;
 
-      if (expiredRoles.length === 0) {
-        console.log('[RAPHAEL] No expired booster roles to remove.');
-        return;
+      const role = guild.roles.cache.get(entry.roleId);
+      if (!role) {
+        await BoosterRole.deleteIfExpired(entry);
+        continue;
       }
 
-      let removedCount = 0;
-      let failedCount = 0;
+      // Only a member who left ends the record here; other fetch errors are retried
+      const member = await guild.members.fetch(entry.userId).catch(error => {
+        if (BOOSTER_ROLE_GONE_CODES.has(error.code)) return null;
+        throw error;
+      });
 
-      for (const entry of expiredRoles) {
-        try {
-          const guild = client.guilds.cache.get(entry.guildId);
-          if (!guild) {
-            // Guild not found, remove the database entry
-            await BoosterRole.removeBoosterRole(entry.guildId, entry.userId, entry.roleId);
-            continue;
-          }
+      // Renewed with "boost give" or removed with "boost take" since the query ran
+      if (!(await BoosterRole.isStillExpired(entry))) continue;
 
-          const member = await guild.members.fetch(entry.userId).catch(() => null);
-          if (!member) {
-            // Member not found, remove the database entry
-            await BoosterRole.removeBoosterRole(entry.guildId, entry.userId, entry.roleId);
-            continue;
-          }
-
-          const role = guild.roles.cache.get(entry.roleId);
-          if (!role) {
-            // Role no longer exists, remove the database entry
-            await BoosterRole.removeBoosterRole(entry.guildId, entry.userId, entry.roleId);
-            continue;
-          }
-
-          // Check if member still has the role
-          if (member.roles.cache.has(entry.roleId)) {
-            await member.roles.remove(role, 'Temporary booster role expired');
-            console.log(`[RAPHAEL] Removed expired booster role from ${member.user.tag} in ${guild.name}`);
-            removedCount++;
-          }
-
-          // Remove the database entry
-          await BoosterRole.removeBoosterRole(entry.guildId, entry.userId, entry.roleId);
-
-        } catch (error) {
-          console.error(`[RAPHAEL] Error removing booster role for ${entry.userId}:`, error.message);
-          failedCount++;
-          // Still try to remove the database entry
-          await BoosterRole.removeBoosterRole(entry.guildId, entry.userId, entry.roleId).catch(() => {});
-        }
+      if (member?.roles.cache.has(role.id)) {
+        await member.roles.remove(role, 'Temporary booster role expired');
+        console.log(`[RAPHAEL] Removed expired booster role ${role.name} from ${member.user.tag} in ${guild.name}`);
+        removedCount++;
       }
 
-      console.log(`[RAPHAEL] Booster role cleanup complete. Removed: ${removedCount}, Failed: ${failedCount}`);
+      await BoosterRole.deleteIfExpired(entry);
+    } catch (error) {
+      if (BOOSTER_ROLE_GONE_CODES.has(error.code)) {
+        await BoosterRole.deleteIfExpired(entry).catch(() => {});
+        continue;
+      }
+      failedCount++;
+      console.error(`[RAPHAEL] Could not remove expired booster role ${entry.roleId} from ${entry.userId} in ${entry.guildId}:`, error.message);
+      await BoosterRole.markRemovalFailed(entry, error).catch(() => {});
+    }
+  }
 
+  if (removedCount || failedCount) {
+    console.log(`[RAPHAEL] Booster role cleanup complete. Removed: ${removedCount}, Failed: ${failedCount}`);
+  }
+}
+
+export function startBoosterRoleRemover(client) {
+  let running = false;
+  const run = async () => {
+    // A slow run (many records, rate limits) must not overlap the next one
+    if (running) return;
+    running = true;
+    try {
+      await removeExpiredBoosterRoles(client);
     } catch (error) {
       console.error('[RAPHAEL] Error in booster role remover:', error);
+    } finally {
+      running = false;
     }
-  });
+  };
 
-  // Also run on startup to catch any missed removals
-  setTimeout(async () => {
-    console.log('[RAPHAEL] Running initial booster role check on startup...');
-    try {
-      const expiredRoles = await BoosterRole.getExpiredRoles();
-      
-      for (const entry of expiredRoles) {
-        try {
-          const guild = client.guilds.cache.get(entry.guildId);
-          if (!guild) {
-            await BoosterRole.removeBoosterRole(entry.guildId, entry.userId, entry.roleId);
-            continue;
-          }
+  setTimeout(() => {
+    run();
+    setInterval(run, BOOSTER_ROLE_CHECK_INTERVAL_MS);
+  }, BOOSTER_ROLE_STARTUP_DELAY_MS);
 
-          const member = await guild.members.fetch(entry.userId).catch(() => null);
-          if (!member) {
-            await BoosterRole.removeBoosterRole(entry.guildId, entry.userId, entry.roleId);
-            continue;
-          }
-
-          const role = guild.roles.cache.get(entry.roleId);
-          if (role && member.roles.cache.has(entry.roleId)) {
-            await member.roles.remove(role, 'Temporary booster role expired');
-            console.log(`[RAPHAEL] Startup cleanup: Removed expired booster role from ${member.user.tag}`);
-          }
-
-          await BoosterRole.removeBoosterRole(entry.guildId, entry.userId, entry.roleId);
-        } catch (error) {
-          console.error(`[RAPHAEL] Startup cleanup error for ${entry.userId}:`, error.message);
-        }
-      }
-    } catch (error) {
-      console.error('[RAPHAEL] Error in startup booster role check:', error);
-    }
-  }, 10000); // Run 10 seconds after startup
-
-  console.log('[RAPHAEL] Booster role removal scheduler initialized (runs daily at 1 AM).');
+  console.log('[RAPHAEL] Booster role removal scheduler initialized (checks every minute).');
 }
 
 // Check giveaways every 15 seconds

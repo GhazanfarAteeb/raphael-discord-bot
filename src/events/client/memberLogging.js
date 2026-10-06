@@ -2,6 +2,7 @@ import { Events, EmbedBuilder, AuditLogEvent } from 'discord.js';
 import Guild from '../../models/Guild.js';
 import { COLORS, GLYPHS } from '../../utils/embeds.js';
 import { sleep, truncate } from '../../utils/helpers.js';
+import { getBoostChange } from './boostHandler.js';
 
 // Audit log entries appear shortly after the gateway event
 const AUDIT_LOG_DELAY_MS = 500;
@@ -110,8 +111,11 @@ async function logMemberUpdate(oldMember, newMember) {
   try {
     if (newMember.user.bot) return;
 
-    // Skip if oldMember is partial (cache incomplete) - this causes false positives
-    if (oldMember.partial) return;
+    // An uncached (partial) old member's fields are unknown, so comparing them gives false
+    // positives. A fresh boost can still be detected (see getBoostChange): log only that.
+    const boostChange = getBoostChange(oldMember, newMember);
+    if (oldMember.partial && boostChange !== 'start') return;
+    const boostOnly = oldMember.partial;
 
     const guildConfig = await Guild.getGuild(newMember.guild.id, newMember.guild.name);
 
@@ -124,92 +128,94 @@ async function logMemberUpdate(oldMember, newMember) {
     const username = newMember.user.username;
     const embeds = [];
 
-    // Nickname change
-    if (oldMember.nickname !== newMember.nickname) {
-      const executor = await findExecutor(guild, newMember.id, AuditLogEvent.MemberUpdate, 'nick');
+    if (!boostOnly) {
+      // Nickname change
+      if (oldMember.nickname !== newMember.nickname) {
+        const executor = await findExecutor(guild, newMember.id, AuditLogEvent.MemberUpdate, 'nick');
 
-      embeds.push(memberEmbed(newMember, 'Nickname Changed', COLOR.update,
-        `${GLYPHS.ARROW_RIGHT} **${username}**'s nickname was changed.`)
-        .addFields(
-          field('Before', oldMember.nickname || '*None*'),
-          field('After', newMember.nickname || '*None*'),
-          field('Changed By', describeExecutor(executor, newMember.id))
-        ));
-    }
-
-    // Role changes. A cached member holding only @everyone may simply not have had its
-    // roles cached yet (e.g. after a restart); comparing would report every role as new.
-    const rolesComparable = !(oldMember.roles.cache.size <= 1 && newMember.roles.cache.size > 1);
-    const guildId = guild.id;
-    const addedRoles = rolesComparable
-      ? newMember.roles.cache.filter(role => role.id !== guildId && !oldMember.roles.cache.has(role.id))
-      : null;
-    const removedRoles = rolesComparable
-      ? oldMember.roles.cache.filter(role => role.id !== guildId && !newMember.roles.cache.has(role.id))
-      : null;
-
-    if (addedRoles?.size || removedRoles?.size) {
-      const executor = await findExecutor(guild, newMember.id, AuditLogEvent.MemberRoleUpdate);
-      const by = describeExecutor(executor, newMember.id);
-
-      if (addedRoles.size > 0) {
-        embeds.push(memberEmbed(newMember, 'Roles Added', COLOR.added,
-          `${GLYPHS.ARROW_RIGHT} **${username}** received ${addedRoles.size === 1 ? 'a role' : `${addedRoles.size} roles`}.`)
+        embeds.push(memberEmbed(newMember, 'Nickname Changed', COLOR.update,
+          `${GLYPHS.ARROW_RIGHT} **${username}**'s nickname was changed.`)
           .addFields(
-            field('Member', `${newMember.user.tag} (${newMember})`),
-            field('Assigned By', by),
-            field('Roles Added', joinWithinLimit(addedRoles.map(r => r.toString())), false)
+            field('Before', oldMember.nickname || '*None*'),
+            field('After', newMember.nickname || '*None*'),
+            field('Changed By', describeExecutor(executor, newMember.id))
           ));
       }
 
-      if (removedRoles.size > 0) {
-        embeds.push(memberEmbed(newMember, 'Roles Removed', COLOR.removed,
-          `${GLYPHS.ARROW_RIGHT} **${username}** lost ${removedRoles.size === 1 ? 'a role' : `${removedRoles.size} roles`}.`)
-          .addFields(
-            field('Member', `${newMember.user.tag} (${newMember})`),
-            field('Removed By', by),
-            field('Roles Removed', joinWithinLimit(removedRoles.map(r => r.toString())), false)
-          ));
+      // Role changes. A cached member holding only @everyone may simply not have had its
+      // roles cached yet (e.g. after a restart); comparing would report every role as new.
+      const rolesComparable = !(oldMember.roles.cache.size <= 1 && newMember.roles.cache.size > 1);
+      const guildId = guild.id;
+      const addedRoles = rolesComparable
+        ? newMember.roles.cache.filter(role => role.id !== guildId && !oldMember.roles.cache.has(role.id))
+        : null;
+      const removedRoles = rolesComparable
+        ? oldMember.roles.cache.filter(role => role.id !== guildId && !newMember.roles.cache.has(role.id))
+        : null;
+
+      if (addedRoles?.size || removedRoles?.size) {
+        const executor = await findExecutor(guild, newMember.id, AuditLogEvent.MemberRoleUpdate);
+        const by = describeExecutor(executor, newMember.id);
+
+        if (addedRoles.size > 0) {
+          embeds.push(memberEmbed(newMember, 'Roles Added', COLOR.added,
+            `${GLYPHS.ARROW_RIGHT} **${username}** received ${addedRoles.size === 1 ? 'a role' : `${addedRoles.size} roles`}.`)
+            .addFields(
+              field('Member', `${newMember.user.tag} (${newMember})`),
+              field('Assigned By', by),
+              field('Roles Added', joinWithinLimit(addedRoles.map(r => r.toString())), false)
+            ));
+        }
+
+        if (removedRoles.size > 0) {
+          embeds.push(memberEmbed(newMember, 'Roles Removed', COLOR.removed,
+            `${GLYPHS.ARROW_RIGHT} **${username}** lost ${removedRoles.size === 1 ? 'a role' : `${removedRoles.size} roles`}.`)
+            .addFields(
+              field('Member', `${newMember.user.tag} (${newMember})`),
+              field('Removed By', by),
+              field('Roles Removed', joinWithinLimit(removedRoles.map(r => r.toString())), false)
+            ));
+        }
       }
-    }
 
-    // Timeout changes. Compare timestamps: the Date getters return a new object each
-    // time, so comparing them directly reported a timeout on every member update.
-    const oldTimeout = oldMember.communicationDisabledUntilTimestamp ?? null;
-    const newTimeout = newMember.communicationDisabledUntilTimestamp ?? null;
-    if (oldTimeout !== newTimeout) {
-      const executor = await findExecutor(guild, newMember.id, AuditLogEvent.MemberUpdate, 'communication_disabled_until');
-      const by = describeExecutor(executor, newMember.id);
+      // Timeout changes. Compare timestamps: the Date getters return a new object each
+      // time, so comparing them directly reported a timeout on every member update.
+      const oldTimeout = oldMember.communicationDisabledUntilTimestamp ?? null;
+      const newTimeout = newMember.communicationDisabledUntilTimestamp ?? null;
+      if (oldTimeout !== newTimeout) {
+        const executor = await findExecutor(guild, newMember.id, AuditLogEvent.MemberUpdate, 'communication_disabled_until');
+        const by = describeExecutor(executor, newMember.id);
 
-      if (newTimeout && newTimeout > Date.now()) {
-        const until = Math.floor(newTimeout / 1000);
-        embeds.push(memberEmbed(newMember, 'Member Timed Out', COLOR.warning,
-          `${GLYPHS.ARROW_RIGHT} **${username}** was timed out.`)
-          .addFields(
-            field('Member', `${newMember.user.tag} (${newMember})`),
-            field('Until', `<t:${until}:F> (<t:${until}:R>)`),
-            field('Timed Out By', by)
-          ));
-      } else if (oldTimeout && oldTimeout > Date.now()) {
-        // Lifted before it ran out (an expired timeout sends no update)
-        embeds.push(memberEmbed(newMember, 'Timeout Lifted', COLOR.added,
-          `${GLYPHS.ARROW_RIGHT} **${username}**'s timeout restriction has been removed.`)
-          .addFields(
-            field('Member', `${newMember.user.tag} (${newMember})`),
-            field('Lifted By', by)
-          ));
+        if (newTimeout && newTimeout > Date.now()) {
+          const until = Math.floor(newTimeout / 1000);
+          embeds.push(memberEmbed(newMember, 'Member Timed Out', COLOR.warning,
+            `${GLYPHS.ARROW_RIGHT} **${username}** was timed out.`)
+            .addFields(
+              field('Member', `${newMember.user.tag} (${newMember})`),
+              field('Until', `<t:${until}:F> (<t:${until}:R>)`),
+              field('Timed Out By', by)
+            ));
+        } else if (oldTimeout && oldTimeout > Date.now()) {
+          // Lifted before it ran out (an expired timeout sends no update)
+          embeds.push(memberEmbed(newMember, 'Timeout Lifted', COLOR.added,
+            `${GLYPHS.ARROW_RIGHT} **${username}**'s timeout restriction has been removed.`)
+            .addFields(
+              field('Member', `${newMember.user.tag} (${newMember})`),
+              field('Lifted By', by)
+            ));
+        }
       }
     }
 
     // Boost changes
-    if (!oldMember.premiumSince && newMember.premiumSince) {
+    if (boostChange === 'start') {
       embeds.push(memberEmbed(newMember, 'New Server Booster', COLOR.added,
         `${GLYPHS.ARROW_RIGHT} **${username}** boosted the server.`)
         .addFields(
           field('Member', `${newMember.user.tag} (${newMember})`),
           field('Boost Count', `${guild.premiumSubscriptionCount ?? 'Unknown'}`)
         ));
-    } else if (oldMember.premiumSince && !newMember.premiumSince) {
+    } else if (boostChange === 'end') {
       embeds.push(memberEmbed(newMember, 'Boost Removed', COLOR.muted,
         `${GLYPHS.ARROW_RIGHT} **${username}** is no longer boosting the server.`)
         .addFields(
@@ -217,15 +223,17 @@ async function logMemberUpdate(oldMember, newMember) {
         ));
     }
 
-    // Avatar change (server specific)
-    if (oldMember.avatar !== newMember.avatar && newMember.avatar) {
-      embeds.push(memberEmbed(newMember, 'Server Avatar Changed', COLOR.update,
-        `${GLYPHS.ARROW_RIGHT} **${username}** changed their server avatar.`)
-        .addFields(
-          field('Member', `${newMember.user.tag} (${newMember})`)
-        )
-        .setThumbnail(newMember.displayAvatarURL())
-        .setImage(newMember.displayAvatarURL({ size: 256 })));
+    if (!boostOnly) {
+      // Avatar change (server specific)
+      if (oldMember.avatar !== newMember.avatar && newMember.avatar) {
+        embeds.push(memberEmbed(newMember, 'Server Avatar Changed', COLOR.update,
+          `${GLYPHS.ARROW_RIGHT} **${username}** changed their server avatar.`)
+          .addFields(
+            field('Member', `${newMember.user.tag} (${newMember})`)
+          )
+          .setThumbnail(newMember.displayAvatarURL())
+          .setImage(newMember.displayAvatarURL({ size: 256 })));
+      }
     }
 
     // Send all embeds

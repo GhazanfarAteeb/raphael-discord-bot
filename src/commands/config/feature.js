@@ -12,7 +12,7 @@ const STATUS_LEGEND = `${STATUS.on} enabled  ${STATUS.off} disabled  ${STATUS.pa
 const featureCategories = {
   economy: {
     name: 'Economy',
-    commands: ['balance', 'daily', 'claim', 'shop', 'inventory', 'profile', 'setprofile', 'setbackground', 'rep']
+    commands: ['balance', 'daily', 'claim', 'shop', 'inventory', 'profile', 'setprofile', 'rep']
   },
   gambling: {
     name: 'Gambling',
@@ -28,7 +28,7 @@ const featureCategories = {
   },
   fun: {
     name: 'Fun',
-    commands: ['meme', 'gif', 'poll']
+    commands: ['meme', 'poll']
   },
   birthdays: {
     name: 'Birthdays',
@@ -315,7 +315,7 @@ async function showFeatureStatus(message, guildConfig, feature, client, prefix) 
         `\`${prefix}feature enable|disable boost\` - Toggle boost announcements\n` +
         `\`${prefix}boost channel #channel\` - Set the boost channel\n` +
         `\`${prefix}boost message <text>\` - Set the thank-you message\n` +
-        `\`${prefix}boost embed\` - Toggle embed format\n` +
+        `\`${prefix}boost embed on|off\` - Toggle embed format\n` +
         `\`${prefix}boost test\` - Preview the boost message`
     });
     return message.reply({ embeds: [embed] });
@@ -423,7 +423,7 @@ async function toggleFeature(message, guildConfig, target, isEnabling, client, p
           `**Configure with:**\n` +
           `${GLYPHS.DOT} \`${prefix}boost channel #channel\` - Set the boost channel\n` +
           `${GLYPHS.DOT} \`${prefix}boost message <text>\` - Set the thank-you message\n` +
-          `${GLYPHS.DOT} \`${prefix}boost embed\` - Toggle embed format`
+          `${GLYPHS.DOT} \`${prefix}boost embed on|off\` - Toggle embed format`
           : 'Boost thank-you messages have been disabled.'))]
     });
   }

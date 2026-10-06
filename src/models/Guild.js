@@ -195,7 +195,8 @@ const guildSchema = new mongoose.Schema({
         footerText: String,
         showTimestamp: { type: Boolean, default: true },
         showTierList: { type: Boolean, default: true }, // Auto-show tier list in announcement
-        lastPublished: Date // Track when last published
+        lastPublished: Date, // Track when last published
+        messageId: String // Last published announcement, edited in place by "boost publish"
       }
     },
     boosterRoleSystem: {
@@ -223,7 +224,10 @@ const guildSchema = new mongoose.Schema({
       channel: String,
       role: String, // Verified role
       unverifiedRole: String, // Role to remove on verification
-      type: { type: String, enum: ['button', 'reaction', 'captcha'], default: 'button' }
+      type: { type: String, enum: ['button', 'reaction', 'captcha'], default: 'button' },
+      // The posted verification panel, so reaction-type panels can be recognised
+      panelMessageId: String,
+      panelChannelId: String
     },
     reactionRoles: {
       enabled: { type: Boolean, default: false },
