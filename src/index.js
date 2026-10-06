@@ -470,11 +470,8 @@ async function registerSlashCommandsOnReady(client) {
       await clearGuildSlashCommands(client, guild.id);
     }
 
-    // Register globally only
-    const commandCount = await registerSlashCommands(client);
-    console.log(
-      `[RAPHAEL] Slash commands registered globally: ${commandCount}`,
-    );
+    // Register globally only (registerSlashCommands logs the count)
+    await registerSlashCommands(client);
   } catch (error) {
     console.error("[RAPHAEL] Slash command registration failure:", error);
     logger.error("Failed to register slash commands", error);
