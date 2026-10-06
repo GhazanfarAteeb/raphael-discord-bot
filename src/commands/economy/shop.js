@@ -6,6 +6,44 @@ import { errorEmbed, COLORS } from '../../utils/embeds.js';
 import { getPrefix, formatNumber } from '../../utils/helpers.js';
 import { getRandomFooter } from '../../utils/raphael.js';
 
+// How long the "Activate Now" button stays on a purchase confirmation
+const ACTIVATE_TIMEOUT = 120_000;
+
+// Lets the buyer apply a just-bought background with one click. The inventory's
+// Activate button does the same later.
+function offerActivation(confirmation, embed, { userId, guildId, listing, prefix }) {
+  const collector = confirmation.createMessageComponentCollector({
+    componentType: ComponentType.Button,
+    idle: ACTIVATE_TIMEOUT
+  });
+
+  collector.on('collect', async (interaction) => {
+    try {
+      if (interaction.user.id !== userId) {
+        return await interaction.reply({ content: 'Only the buyer can activate this background, Master.', flags: MessageFlags.Ephemeral });
+      }
+      const result = await Economy.updateOne(
+        { userId, guildId, 'inventory.backgrounds.id': listing.id },
+        { $set: { 'profile.background': listing.id } }
+      );
+      if (result.matchedCount === 0) {
+        return await interaction.reply({ content: 'That background is no longer in your inventory, Master.', flags: MessageFlags.Ephemeral });
+      }
+      collector.stop('activated');
+      embed.setDescription(`**Confirmed:** **${listing.name}** is now active on your \`${prefix}profile\` and \`${prefix}level\` cards, Master.`);
+      await interaction.update({ embeds: [embed], components: [] });
+    } catch (error) {
+      console.error('[Shop] Error activating background:', error);
+      await interaction.reply({ content: 'The background could not be activated, Master. Use the Activate button in your inventory instead.', flags: MessageFlags.Ephemeral }).catch(() => {});
+    }
+  });
+
+  collector.on('end', (_collected, reason) => {
+    if (reason === 'activated') return;
+    confirmation.edit({ components: [] }).catch(() => {});
+  });
+}
+
 // The catalog closes after this long without a button press
 const IDLE_TIMEOUT = 120_000;
 const MAX_TRANSACTIONS = 50;
@@ -265,15 +303,23 @@ export default {
         const purchaseEmbed = new EmbedBuilder()
           .setColor(COLORS.RAPHAEL_SUCCESS)
           .setTitle('『 Acquisition Complete 』')
-          .setDescription(`**Confirmed:** **${listing.name}** has been added to your inventory, Master.`)
+          .setDescription(
+            `**Confirmed:** **${listing.name}** has been added to your inventory, Master.\n` +
+            `Press **Activate Now** to use it on your profile and level cards, or activate it later from \`${prefix}inventory\`.`
+          )
           .addFields(
             { name: '▸ Expended', value: `**${formatNumber(listing.price)}** ${coinName}`, inline: true },
             { name: '▸ Updated Balance', value: `**${formatNumber(updated.coins)}** ${coinName}`, inline: true }
           )
-          .setFooter({ text: `${getRandomFooter()} | Use ${prefix}setbg ${listing.id} to apply` })
+          .setFooter({ text: getRandomFooter() })
           .setTimestamp();
 
-        return interaction.editReply({ embeds: [purchaseEmbed], components: [] });
+        const activateRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('shop_activate').setLabel('Activate Now').setStyle(ButtonStyle.Success)
+        );
+        const confirmation = await interaction.editReply({ embeds: [purchaseEmbed], components: [activateRow] });
+        offerActivation(confirmation, purchaseEmbed, { userId, guildId, listing, prefix });
+        return confirmation;
       };
 
       collector.on('collect', async (interaction) => {

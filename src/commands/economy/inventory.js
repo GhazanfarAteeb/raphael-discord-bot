@@ -1,9 +1,10 @@
 import { EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, MessageFlags } from 'discord.js';
 import Economy from '../../models/Economy.js';
 import Guild from '../../models/Guild.js';
-import { errorEmbed, infoEmbed, COLORS } from '../../utils/embeds.js';
+import { errorEmbed, COLORS } from '../../utils/embeds.js';
 import { getPrefix } from '../../utils/helpers.js';
 import { getRandomFooter } from '../../utils/raphael.js';
+import { getBackground } from '../../utils/shopItems.js';
 
 // The inventory closes after this long without a button press
 const IDLE_TIMEOUT = 120_000;
@@ -30,9 +31,10 @@ function joinWithinLimit(entries, separator = '\n\n') {
 export default {
   name: 'inventory',
   description: 'View your purchased items',
-  usage: 'inventory [backgrounds/badges/items]',
+  usage: 'inventory [backgrounds/badges/items] [background]',
   category: 'economy',
-  aliases: ['inv', 'bag', 'items'],
+  // setbg/bg open the backgrounds view: backgrounds are chosen with its Activate button
+  aliases: ['inv', 'bag', 'items', 'backgrounds', 'bg', 'setbg', 'setbackground', 'background'],
   cooldown: 3,
 
   execute: async (message, args) => {
@@ -44,29 +46,40 @@ export default {
       const guildConfig = await Guild.getGuild(guildId);
       const prefix = await getPrefix(guildId);
 
-      const category = args[0]?.toLowerCase() || 'backgrounds';
+      // Anything that isn't another category opens the backgrounds view, and is treated as
+      // a background to jump to (e.g. "setbg sunset")
+      const firstArg = args[0]?.toLowerCase();
+      const category = firstArg === 'badges' || firstArg === 'items' ? firstArg : 'backgrounds';
+      const jumpTo = ['backgrounds', 'background', 'bg'].includes(firstArg) ? args.slice(1).join(' ') : args.join(' ');
       const author = {
         name: `${message.author.tag}'s Inventory`,
         iconURL: message.author.displayAvatarURL()
       };
 
-      if (category === 'backgrounds' || category === 'bg') {
-        // Filter out the default background from display
-        const ownedBackgrounds = economy.inventory.backgrounds.filter(bg => bg.id !== 'default');
-
-        if (ownedBackgrounds.length === 0) {
-          return message.reply({
-            embeds: [await infoEmbed(guildId, 'Inventory Vacant',
-              `Your inventory is vacant, Master. Visit \`${prefix}shop\` to acquire assets.`)]
-          });
-        }
+      if (category === 'backgrounds') {
+        // The default background is always listed first so members can switch back to it
+        const defaultBackground = {
+          id: 'default',
+          name: 'Default',
+          image: getBackground('default')?.image || guildConfig.economy?.fallbackBackground?.image || ''
+        };
+        const ownedBackgrounds = [
+          defaultBackground,
+          ...economy.inventory.backgrounds.filter(bg => bg.id !== 'default')
+        ];
 
         // Get shop items to find images
         const shopItems = guildConfig.customShopItems || [];
 
-        let currentPage = 0;
-        let equippedId = economy.profile.background;
+        let equippedId = economy.profile.background || 'default';
         const maxPages = ownedBackgrounds.length;
+
+        // Open on the requested background, else the active one
+        const query = jumpTo.trim().toLowerCase();
+        const requested = query
+          ? ownedBackgrounds.findIndex(bg => bg.id.toLowerCase() === query || bg.name.toLowerCase() === query)
+          : -1;
+        let currentPage = Math.max(0, requested >= 0 ? requested : ownedBackgrounds.findIndex(bg => bg.id === equippedId));
 
         const generateEmbed = (page) => {
           const bg = ownedBackgrounds[page];
@@ -80,13 +93,15 @@ export default {
             .setColor(COLORS.RAPHAEL)
             .setAuthor(author)
             .setTitle(`『 ${bg.name} 』`)
+            .setDescription(isEquipped
+              ? `This background is shown on your \`${prefix}profile\` and \`${prefix}level\` cards, Master.`
+              : `Press **Activate** to show this background on your \`${prefix}profile\` and \`${prefix}level\` cards, Master.` +
+                (maxPages === 1 ? `\nVisit \`${prefix}shop\` to acquire more backgrounds.` : ''))
             .addFields(
               { name: '▸ Status', value: isEquipped ? '◉ **ACTIVE**' : '◇ Inactive', inline: true },
-              { name: '▸ Acquired', value: relativeTime(bg.purchasedAt), inline: true }
+              { name: '▸ Acquired', value: bg.id === 'default' ? 'Always available' : relativeTime(bg.purchasedAt), inline: true }
             )
-            .setFooter({
-              text: `${getRandomFooter()} | Item ${page + 1} of ${maxPages} | Use ${prefix}setbg ${bg.id} to equip`
-            })
+            .setFooter({ text: `${getRandomFooter()} | Background ${page + 1} of ${maxPages}` })
             .setTimestamp();
 
           if (imageUrl) {
@@ -145,11 +160,11 @@ export default {
               currentPage = Math.min(maxPages - 1, currentPage + 1);
             } else if (interaction.customId === 'inventory_equip') {
               const bg = ownedBackgrounds[currentPage];
-              // Only equips a background the member still owns
-              const result = await Economy.updateOne(
-                { userId, guildId, 'inventory.backgrounds.id': bg.id },
-                { $set: { 'profile.background': bg.id } }
-              );
+              // Only equips a background the member still owns (the default needs no purchase)
+              const filter = bg.id === 'default'
+                ? { userId, guildId }
+                : { userId, guildId, 'inventory.backgrounds.id': bg.id };
+              const result = await Economy.updateOne(filter, { $set: { 'profile.background': bg.id } });
               if (result.matchedCount === 0) {
                 return await interaction.reply({
                   content: 'That background is no longer in your inventory, Master.',
