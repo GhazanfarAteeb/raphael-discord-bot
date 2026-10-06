@@ -74,10 +74,22 @@ function aceSwitchNote(handBefore, hand) {
   return `◈ An ace now counts as 1 (11 would take you over 21), so your hand is **${total}**.`;
 }
 
+// Deals the top card into a hand. Like OwO, only cards dealt during the current move
+// flip in; cards already on the table show their static face, so they don't flip again
+// every time the message is edited.
+function deal(game, hand) {
+  const card = game.deck.pop();
+  hand.push(card);
+  game.fresh.add(card);
+  return card;
+}
+
 // Card emojis (text cards until the emojis are uploaded)
-function getHandDisplay(hand, emojis, hideHoleCard = false) {
+function getHandDisplay(game, hand, hideHoleCard = false) {
   return hand
-    .map((card, i) => (hideHoleCard && i === 1 ? cardBackEmoji(emojis) : cardEmoji(card, emojis)))
+    .map((card, i) => (hideHoleCard && i === 1
+      ? cardBackEmoji(game.emojis)
+      : cardEmoji(card, game.emojis, game.fresh.has(card))))
     .join(' ');
 }
 
@@ -92,8 +104,8 @@ function buildGameEmbed(game, { reveal = false, footer = '◇ ~ Game in progress
       iconURL: game.avatarURL
     })
     .addFields(
-      { name: `Dealer \`[${dealerValue}]\``, value: getHandDisplay(game.dealerHand, game.emojis, !reveal), inline: true },
-      { name: `${game.playerName} \`[${formatTotal(game.playerHand, reveal)}]\``, value: getHandDisplay(game.playerHand, game.emojis), inline: true }
+      { name: `Dealer \`[${dealerValue}]\``, value: getHandDisplay(game, game.dealerHand, !reveal), inline: true },
+      { name: `${game.playerName} \`[${formatTotal(game.playerHand, reveal)}]\``, value: getHandDisplay(game, game.playerHand), inline: true }
     )
     .setFooter({ text: footer });
   if (notes.length) embed.setDescription(notes.join('\n'));
@@ -119,7 +131,7 @@ function buildButtons(game, canDouble) {
 // Dealer draws to 17, then the hands are compared
 function resolveStand(game) {
   while (calculateHand(game.dealerHand) < 17) {
-    game.dealerHand.push(game.deck.pop());
+    deal(game, game.dealerHand);
   }
   const dealer = calculateHand(game.dealerHand);
   const player = calculateHand(game.playerHand);
@@ -167,6 +179,8 @@ const RESULT_COLORS = {
 // over (synchronously) before calling, so a game can only ever be settled once.
 async function settleGame(game, result, notes = []) {
   activeGames.delete(game.userId);
+  // The dealer's hidden card is turned over now, so it flips in with the result
+  game.fresh.add(game.dealerHand[1]);
 
   const payout = getPayout(result, game.bet);
   const economy = await Economy.getEconomy(game.userId, game.guildId);
@@ -256,12 +270,17 @@ export default {
         bet,
         originalBet: bet,
         deck,
-        playerHand: [deck.pop(), deck.pop()],
-        dealerHand: [deck.pop(), deck.pop()],
+        playerHand: [],
+        dealerHand: [],
+        fresh: new Set(),
         emojis: await getCardEmojis(client),
         over: false,
         busy: false
       };
+      deal(game, game.playerHand);
+      deal(game, game.playerHand);
+      deal(game, game.dealerHand);
+      deal(game, game.dealerHand);
       activeGames.set(userId, game);
 
       // Naturals end the hand at once (the dealer checks for blackjack before play)
@@ -302,13 +321,15 @@ export default {
         // One action at a time; ignore clicks while busy or after the game ended
         if (game.over || game.busy) return interaction.deferUpdate().catch(() => {});
         game.busy = true;
+        // Cards dealt by an earlier move are on the table now: only this move's cards flip
+        game.fresh.clear();
 
         try {
           await interaction.deferUpdate();
 
           if (interaction.customId === 'blackjack_hit') {
             const handBefore = [...game.playerHand];
-            game.playerHand.push(game.deck.pop());
+            deal(game, game.playerHand);
             const aceNote = aceSwitchNote(handBefore, game.playerHand);
             const value = calculateHand(game.playerHand);
             if (value > 21) return await finish(interaction, 'bust');
@@ -334,7 +355,7 @@ export default {
             await economy.removeCoins(game.originalBet, 'Blackjack double down');
             game.bet += game.originalBet;
             const handBefore = [...game.playerHand];
-            game.playerHand.push(game.deck.pop());
+            deal(game, game.playerHand);
             const aceNote = aceSwitchNote(handBefore, game.playerHand);
             const result = calculateHand(game.playerHand) > 21 ? 'bust' : resolveStand(game);
             return await finish(interaction, result, ['◈ Wager doubled.', aceNote].filter(Boolean));
@@ -351,6 +372,7 @@ export default {
       collector.on('end', async (_collected, reason) => {
         if (game.over) return;
         game.over = true;
+        game.fresh.clear();
         try {
           const note = reason === 'idle' ? `◈ No action for ${IDLE_TIMEOUT / 1000} seconds: the hand stood automatically.` : null;
           const embed = await settleGame(game, resolveStand(game), note ? [note] : []);

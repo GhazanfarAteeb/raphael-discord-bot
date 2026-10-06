@@ -1,7 +1,9 @@
 /**
  * Generates the blackjack card emojis in assets/cards/:
  *   - 52 animated GIF faces ({value}_{suit}.gif) that flip over from the card
- *     back to the face once, then stay face-up
+ *     back to the face once, then stay face-up: shown only for a card just dealt
+ *   - 52 static faces ({value}_{suit}_static.png) for cards already on the table,
+ *     so only the new card flips when the game message is edited
  *   - card_back.png, the static back used for the dealer's hidden card
  * Upload them as application emojis in the Discord Developer Portal (your app >
  * Emojis). Discord names each emoji after its file, e.g. A_spades.gif ->
@@ -177,9 +179,14 @@ for (let i = FLIP_STEPS - 1; i >= 1; i--) {
 
 for (const suit of SUITS) {
   for (const value of VALUES) {
-    const size = saveFlipGif(`${value}_${suit}.gif`, backFrames, (ctx) => drawFace(ctx, value, suit));
-    largest = Math.max(largest, size);
+    const drawFaceFn = (ctx) => drawFace(ctx, value, suit);
+    const size = saveFlipGif(`${value}_${suit}.gif`, backFrames, drawFaceFn);
+
+    const faceCanvas = createCanvas(W, H);
+    drawFaceFn(faceCanvas.getContext('2d'));
+    const staticSize = writeFile(`${value}_${suit}_static.png`, faceCanvas.toBuffer('image/png'));
+    largest = Math.max(largest, size, staticSize);
   }
 }
 
-console.log(`Wrote 52 flip GIFs + card_back.png to ${path.relative(ROOT, OUT_DIR)}/ (largest ${Math.round(largest / 1024)} KiB)`);
+console.log(`Wrote 52 flip GIFs, 52 static faces + card_back.png to ${path.relative(ROOT, OUT_DIR)}/ (largest ${Math.round(largest / 1024)} KiB)`);

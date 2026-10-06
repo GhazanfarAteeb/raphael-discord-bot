@@ -27,9 +27,15 @@ export async function getCardEmojis(client) {
   return cache;
 }
 
-/** Emoji for a { value, suit } card, or a text card if it isn't uploaded. */
-export function cardEmoji(card, emojis) {
-  return emojis.get(`${card.value}_${SUIT_NAMES[card.suit]}`) ?? `\`${card.value}${card.suit}\``;
+/**
+ * Emoji for a { value, suit } card: the flip animation for a card just dealt
+ * (`flip`), otherwise the static face, so only new cards flip when a message is
+ * edited. Falls back to the other version, then to a text card if neither is uploaded.
+ */
+export function cardEmoji(card, emojis, flip = false) {
+  const name = `${card.value}_${SUIT_NAMES[card.suit]}`;
+  const [preferred, fallback] = flip ? [name, `${name}_static`] : [`${name}_static`, name];
+  return emojis.get(preferred) ?? emojis.get(fallback) ?? `\`${card.value}${card.suit}\``;
 }
 
 export function cardBackEmoji(emojis) {
