@@ -395,7 +395,7 @@ async function showMainHelp(ctx) {
     new ButtonBuilder().setCustomId('help_home').setLabel('Home').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('help_slash').setLabel('Slash Commands').setStyle(ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId('help_features').setLabel('Features').setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setLabel('Support').setStyle(ButtonStyle.Link).setURL('https://github.com/GhazanfarAteeb/jura-bot')
+    new ButtonBuilder().setLabel('Support').setStyle(ButtonStyle.Link).setURL('https://github.com/GhazanfarAteeb/raphael-discord-bot')
   );
 
   const reply = await message.reply({
