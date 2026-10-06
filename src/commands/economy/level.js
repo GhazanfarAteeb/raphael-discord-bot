@@ -6,7 +6,7 @@ import { errorEmbed } from '../../utils/embeds.js';
 import { formatNumber } from '../../utils/helpers.js';
 import { createCanvas, loadImage } from '@napi-rs/canvas';
 import '../../utils/fonts.js';
-import { getBackground } from '../../utils/shopItems.js';
+import { getCardBackground, loadCardBackground } from '../../utils/backgroundImages.js';
 
 // Helper function to convert hex to rgba
 function hexToRgba(hex, opacity) {
@@ -42,9 +42,7 @@ export default {
       const economy = (await Economy.findOne({ userId: targetUser.id, guildId }))
         ?? new Economy({ userId: targetUser.id, guildId });
 
-      // Get guild config for fallback background
       const guildConfig = await Guild.getGuild(guildId);
-      const fallbackBg = guildConfig.economy?.fallbackBackground;
 
       // Check if user customization is enabled (default: true)
       const customizationEnabled = guildConfig.economy?.profileCustomization?.enabled !== false;
@@ -65,26 +63,9 @@ export default {
         overlayOpacity = cardOverlay.opacity ?? 0.5;
       }
 
-      // Get background - check user's background, then custom shop items, then fallback
-      let background = getBackground(economy.profile.background || 'default');
-
-      // If user has a custom background from shop, find it in custom items
-      if (!background || !background.image) {
-        const customBg = (guildConfig.customShopItems || []).find(
-          item => item.type === 'background' && item.id === economy.profile.background
-        );
-        if (customBg) {
-          background = {
-            id: customBg.id,
-            name: customBg.name,
-            image: customBg.image || '',
-            color: customBg.color || '#2C2F33'
-          };
-        }
-      }
-
-      // Use fallback if no image
-      const bgImage = background?.image || fallbackBg?.image || '';
+      // The member's active background, else the server's fallback image, drawn from its
+      // stored copy (null: no image, or it can't be loaded, so the card uses a gradient)
+      const loadedBg = await loadCardBackground(guildId, getCardBackground(guildConfig, economy.profile.background));
 
       // Rank by total XP; members without level data are unranked
       const rankText = levelData
@@ -96,32 +77,12 @@ export default {
       const ctx = canvas.getContext('2d');
 
       // Draw background
-      if (bgImage) {
-        try {
-          const loadedBg = await loadImage(bgImage).catch(() => null);
-          if (loadedBg) {
-            ctx.drawImage(loadedBg, 0, 0, canvas.width, canvas.height);
-            // Add overlay for readability (uses user or guild customization)
-            ctx.fillStyle = hexToRgba(overlayColor, overlayOpacity);
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
-          } else {
-            // Background gradient fallback
-            const gradient = ctx.createLinearGradient(0, 0, 900, 300);
-            gradient.addColorStop(0, '#2C2F33');
-            gradient.addColorStop(1, '#23272A');
-            ctx.fillStyle = gradient;
-            ctx.fillRect(0, 0, 900, 300);
-          }
-        } catch {
-          // Background gradient fallback
-          const gradient = ctx.createLinearGradient(0, 0, 900, 300);
-          gradient.addColorStop(0, '#2C2F33');
-          gradient.addColorStop(1, '#23272A');
-          ctx.fillStyle = gradient;
-          ctx.fillRect(0, 0, 900, 300);
-        }
+      if (loadedBg) {
+        ctx.drawImage(loadedBg, 0, 0, canvas.width, canvas.height);
+        // Add overlay for readability (uses user or guild customization)
+        ctx.fillStyle = hexToRgba(overlayColor, overlayOpacity);
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
       } else {
-        // Background gradient
         const gradient = ctx.createLinearGradient(0, 0, 900, 300);
         gradient.addColorStop(0, '#2C2F33');
         gradient.addColorStop(1, '#23272A');

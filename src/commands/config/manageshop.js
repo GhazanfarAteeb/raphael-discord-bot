@@ -1,7 +1,8 @@
 import { PermissionFlagsBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, ComponentType, MessageFlags } from 'discord.js';
 import Guild from '../../models/Guild.js';
-import { successEmbed, errorEmbed, infoEmbed, GLYPHS } from '../../utils/embeds.js';
+import { successEmbed, errorEmbed, infoEmbed, warningEmbed, GLYPHS } from '../../utils/embeds.js';
 import { getPrefix, formatNumber, hasModPerms } from '../../utils/helpers.js';
+import { saveBackgroundFromMessage, deleteBackgroundImage, FALLBACK_KEY } from '../../utils/backgroundImages.js';
 
 const MAX_NAME_LENGTH = 100; // Names are used as embed field names (limit 256)
 const MAX_DESCRIPTION_LENGTH = 500;
@@ -37,6 +38,18 @@ function updateItem(guildId, itemId, fields) {
     Object.entries(fields).map(([key, value]) => [`customShopItems.$[item].${key}`, value])
   );
   return Guild.updateGuild(guildId, { $set: set }, { arrayFilters: [{ 'item.id': itemId }] });
+}
+
+// Cards are drawn from a stored copy of each background image (utils/backgroundImages.js).
+// `reply` shows the image in its embed, so the copy can come from Discord's proxy even when
+// the bot can't reach the image host. Tells the admin when no copy could be made.
+async function saveImageCopy(message, reply, guildId, key, imageUrl) {
+  if (await saveBackgroundFromMessage(reply, guildId, key, imageUrl)) return;
+  await message.reply({
+    embeds: [await warningEmbed(guildId, 'Image Not Saved',
+      `${GLYPHS.WARN} Raphael could not download this image, so it may not appear on profile and level cards. ` +
+      'Check that the link opens the image itself, or upload the image to Discord and use that link.')]
+  }).catch(() => {});
 }
 
 export default {
@@ -196,7 +209,9 @@ async function addItem({ message, guildId, prefix, coinEmoji }, args) {
   );
   embed.setImage(imageUrl);
 
-  return message.reply({ embeds: [embed] });
+  const reply = await message.reply({ embeds: [embed] });
+  await saveImageCopy(message, reply, guildId, itemId, imageUrl);
+  return reply;
 }
 
 async function findItemOrReply({ message, guildId, prefix, items }, itemId, usage) {
@@ -226,6 +241,7 @@ async function removeItem(ctx, itemId) {
   if (!item) return null;
 
   await Guild.updateGuild(guildId, { $pull: { customShopItems: { id: itemId } } });
+  await deleteBackgroundImage(guildId, itemId).catch(() => {});
 
   return message.reply({
     embeds: [await successEmbed(guildId, 'Item Removed',
@@ -413,7 +429,9 @@ async function editItem(ctx, itemId, field, value) {
     `${GLYPHS.SUCCESS} Updated the ${label} of **${update.name || item.name}** to: **${shorten(cleanValue, 1000)}**`);
   if (update.image) embed.setImage(update.image);
 
-  return message.reply({ embeds: [embed] });
+  const reply = await message.reply({ embeds: [embed] });
+  if (update.image) await saveImageCopy(message, reply, guildId, itemId, update.image);
+  return reply;
 }
 
 async function setStock(ctx, itemId, stockArg) {
@@ -444,6 +462,7 @@ async function setFallback({ message, guildId, prefix, guildConfig }, type, valu
   // `clear` takes no value, so it is handled before the usage check
   if (type === 'clear' || type === 'reset') {
     await Guild.updateGuild(guildId, { $set: { 'economy.fallbackBackground': { ...DEFAULT_FALLBACK } } });
+    await deleteBackgroundImage(guildId, FALLBACK_KEY).catch(() => {});
     return message.reply({
       embeds: [await successEmbed(guildId, 'Fallback Reset',
         `${GLYPHS.SUCCESS} The default background has been reset to the standard dark theme (${DEFAULT_FALLBACK.color}).`)]
@@ -479,7 +498,9 @@ async function setFallback({ message, guildId, prefix, guildConfig }, type, valu
     const embed = await successEmbed(guildId, 'Fallback Background Updated',
       `${GLYPHS.SUCCESS} Default background image set.\n\n**URL:** ${shorten(value, 200)}`);
     embed.setImage(value);
-    return message.reply({ embeds: [embed] });
+    const reply = await message.reply({ embeds: [embed] });
+    await saveImageCopy(message, reply, guildId, FALLBACK_KEY, value);
+    return reply;
   }
 
   if (type === 'color') {

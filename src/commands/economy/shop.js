@@ -5,6 +5,7 @@ import { DEFAULT_COIN_NAME } from '../../utils/gameConfig.js';
 import { errorEmbed, COLORS } from '../../utils/embeds.js';
 import { getPrefix, formatNumber } from '../../utils/helpers.js';
 import { getRandomFooter } from '../../utils/raphael.js';
+import { rememberBackgroundFromMessage } from '../../utils/backgroundImages.js';
 
 // How long the "Activate Now" button stays on a purchase confirmation
 const ACTIVATE_TIMEOUT = 120_000;
@@ -299,6 +300,8 @@ export default {
         }
 
         collector.stop('purchased');
+        // Keep a copy of the image for the buyer's cards; the clicked page shows it in its embed
+        rememberBackgroundFromMessage(interaction.message, guildId, listing.id, listing.image);
 
         const purchaseEmbed = new EmbedBuilder()
           .setColor(COLORS.RAPHAEL_SUCCESS)

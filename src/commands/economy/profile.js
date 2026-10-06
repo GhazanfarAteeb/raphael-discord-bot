@@ -4,7 +4,7 @@ import '../../utils/fonts.js';
 import Economy from '../../models/Economy.js';
 import Level from '../../models/Level.js';
 import Guild from '../../models/Guild.js';
-import { getBackground } from '../../utils/shopItems.js';
+import { getCardBackground, loadCardBackground } from '../../utils/backgroundImages.js';
 import { DEFAULT_COIN_NAME } from '../../utils/gameConfig.js';
 import { errorEmbed, COLORS } from '../../utils/embeds.js';
 import { getPrefix, formatNumber } from '../../utils/helpers.js';
@@ -155,9 +155,7 @@ export default {
       const messagesCount = level.messageCount || economy.stats?.messagesCount || 0;
       const neededXP = level.xpForNextLevel();
 
-      // Get guild config for fallback background
       const guildConfig = await Guild.getGuild(guildId);
-      const fallbackBg = guildConfig.economy?.fallbackBackground;
       const coinName = guildConfig.economy?.coinName || DEFAULT_COIN_NAME;
 
       // Check if user customization is enabled (default: true)
@@ -179,26 +177,9 @@ export default {
         overlayOpacity = cardOverlay.opacity ?? 0.5;
       }
 
-      // Get background - check user's background, then custom shop items, then fallback
-      let background = getBackground(economy.profile.background || 'default');
-
-      // If user has a custom background from shop, find it in custom items
-      if (!background || !background.image) {
-        const customBg = (guildConfig.customShopItems || []).find(
-          item => item.type === 'background' && item.id === economy.profile.background
-        );
-        if (customBg) {
-          background = {
-            id: customBg.id,
-            name: customBg.name,
-            image: customBg.image || '',
-            color: customBg.color || '#2C2F33'
-          };
-        }
-      }
-
-      // Use fallback if no image
-      const bgImage = background?.image || fallbackBg?.image || '';
+      // The member's active background, else the server's fallback image, drawn from its
+      // stored copy (null: no image, or it can't be loaded, so the card uses a gradient)
+      const loadedBg = await loadCardBackground(guildId, getCardBackground(guildConfig, economy.profile.background));
 
       // Create canvas - taller for profile (rank is ~220, profile is ~420)
       const canvas = createCanvas(900, 420);
@@ -213,7 +194,6 @@ export default {
       };
 
       // Draw background
-      const loadedBg = bgImage ? await loadImage(bgImage).catch(() => null) : null;
       if (loadedBg) {
         ctx.drawImage(loadedBg, 0, 0, canvas.width, canvas.height);
         // Add overlay for readability (uses user or guild customization)

@@ -5,6 +5,7 @@ import { errorEmbed, COLORS } from '../../utils/embeds.js';
 import { getPrefix } from '../../utils/helpers.js';
 import { getRandomFooter } from '../../utils/raphael.js';
 import { getBackground } from '../../utils/shopItems.js';
+import { getCardBackground, rememberBackgroundFromMessage } from '../../utils/backgroundImages.js';
 
 // The inventory closes after this long without a button press
 const IDLE_TIMEOUT = 120_000;
@@ -135,10 +136,18 @@ export default {
             );
         };
 
+        // Saves a copy of the background on a page the member is looking at (if it has none
+        // yet), so their cards don't depend on the original link staying reachable
+        const rememberPage = (shownMessage, page) => {
+          const background = getCardBackground(guildConfig, ownedBackgrounds[page].id);
+          if (background) rememberBackgroundFromMessage(shownMessage, guildId, background.key, background.url);
+        };
+
         const invMessage = await message.reply({
           embeds: [generateEmbed(currentPage)],
           components: [generateButtons(currentPage)]
         });
+        rememberPage(invMessage, currentPage);
 
         const collector = invMessage.createMessageComponentCollector({
           componentType: ComponentType.Button,
@@ -172,6 +181,8 @@ export default {
                 });
               }
               equippedId = bg.id;
+              // The clicked message shows this background, with Discord's copy of its image
+              rememberPage(interaction.message, currentPage);
             }
 
             await interaction.update({
