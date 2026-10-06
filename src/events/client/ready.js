@@ -30,7 +30,5 @@ export default {
         }
       })
     ).then(() => console.log('[RAPHAEL] Invite cache complete.'));
-
-    console.log('[RAPHAEL] All systems operational. Awaiting commands, Master.');
   }
 };
