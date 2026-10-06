@@ -3,7 +3,6 @@ import Economy from '../../models/Economy.js';
 import Guild from '../../models/Guild.js';
 import { errorEmbed, COLORS } from '../../utils/embeds.js';
 import { getPrefix, formatNumber } from '../../utils/helpers.js';
-import { getRandomFooter } from '../../utils/raphael.js';
 import { getCardEmojis, cardEmoji, cardBackEmoji } from '../../utils/cardEmojis.js';
 import { BLACKJACK_MIN, BLACKJACK_MAX } from '../../utils/gameConfig.js';
 
@@ -82,17 +81,23 @@ function getHandDisplay(hand, emojis, hideHoleCard = false) {
     .join(' ');
 }
 
-function buildGameEmbed(game, { reveal = false, status, color = COLORS.RAPHAEL }) {
+// Compact table: the bet as the header, both hands side by side with their totals,
+// the state or result in the footer. Notes (an ace switching to 1, etc.) appear only when needed.
+function buildGameEmbed(game, { reveal = false, footer = '◇ ~ Game in progress, Master', notes = [], color = COLORS.RAPHAEL }) {
   const dealerValue = reveal ? formatTotal(game.dealerHand, true) : `${formatTotal([game.dealerHand[0]])}+?`;
-  return new EmbedBuilder()
-    .setTitle('『 Strategic Card Analysis 』')
+  const embed = new EmbedBuilder()
     .setColor(color)
-    .setDescription(status)
+    .setAuthor({
+      name: `${game.playerName}, you bet ${formatNumber(game.bet)} ${game.currency} to play blackjack`,
+      iconURL: game.avatarURL
+    })
     .addFields(
-      { name: `▸ Dealer (${dealerValue})`, value: getHandDisplay(game.dealerHand, game.emojis, !reveal) },
-      { name: `▸ ${game.playerName} (${formatTotal(game.playerHand, reveal)})`, value: getHandDisplay(game.playerHand, game.emojis) }
+      { name: `Dealer \`[${dealerValue}]\``, value: getHandDisplay(game.dealerHand, game.emojis, !reveal), inline: true },
+      { name: `${game.playerName} \`[${formatTotal(game.playerHand, reveal)}]\``, value: getHandDisplay(game.playerHand, game.emojis), inline: true }
     )
-    .setFooter({ text: `${getRandomFooter()} | Wager: ${formatNumber(game.bet)} ${game.currency}` });
+    .setFooter({ text: footer });
+  if (notes.length) embed.setDescription(notes.join('\n'));
+  return embed;
 }
 
 function buildButtons(game, canDouble) {
@@ -135,27 +140,20 @@ function getPayout(result, bet) {
   }
 }
 
-function getResultText(result, game, payout) {
-  const amount = (n) => `**${formatNumber(n)}** ${game.currency}`;
-  const net = payout - game.bet;
-  const player = calculateHand(game.playerHand);
-  const dealer = calculateHand(game.dealerHand);
-  switch (result) {
-    case 'blackjack':
-      return `◉ **OPTIMAL HAND ACHIEVED** — Natural 21 detected. Net gain: ${amount(net)}, Master.`;
-    case 'win':
-      return `◉ **VICTORY CONFIRMED** — Your **${player}** beats the dealer's **${dealer}**. Net gain: ${amount(net)}, Master.`;
-    case 'dealer_bust':
-      return `◉ **DEALER EXCEEDED** — The dealer reached **${dealer}**, over 21. Net gain: ${amount(net)}, Master.`;
-    case 'push':
-      return `◈ **DRAW DETECTED** — Both hands total **${player}**. Your wager of ${amount(game.bet)} has been returned, Master.`;
-    case 'bust':
-      return `◆ **THRESHOLD EXCEEDED** — Your hand reached **${player}**, over 21. Loss: ${amount(game.bet)}, Master.`;
-    case 'dealer_blackjack':
-      return `◆ **DEALER NATURAL 21** — The dealer holds blackjack. Loss: ${amount(game.bet)}, Master.`;
-    default:
-      return `◆ **DEFEAT RECORDED** — The dealer's **${dealer}** beats your **${player}**. Loss: ${amount(game.bet)}, Master.`;
-  }
+// One-line result for the footer (the totals are already in the field names)
+function getResultFooter(result, game, payout, balance) {
+  const coins = (n) => `${formatNumber(n)} ${game.currency}`;
+  const won = coins(payout - game.bet);
+  const lost = coins(game.bet);
+  const text = {
+    blackjack: `◉ ~ Blackjack! You won ${won}`,
+    win: `◉ ~ You won ${won}`,
+    dealer_bust: `◉ ~ The dealer went over 21! You won ${won}`,
+    push: `◈ ~ Tie! Your ${lost} were returned`,
+    bust: `◆ ~ Over 21! You lost ${lost}`,
+    dealer_blackjack: `◆ ~ The dealer has blackjack. You lost ${lost}`
+  }[result] ?? `◆ ~ You lost ${lost}`;
+  return `${text}, Master | Balance: ${coins(balance)}`;
 }
 
 const RESULT_COLORS = {
@@ -180,9 +178,12 @@ async function settleGame(game, result, notes = []) {
   economy.gamblingTotal = (economy.gamblingTotal || 0) + game.bet;
   await economy.save();
 
-  const status = [getResultText(result, game, payout), ...notes].join('\n');
-  return buildGameEmbed(game, { reveal: true, status, color: RESULT_COLORS[result] ?? COLORS.RAPHAEL_ERROR })
-    .addFields({ name: '▸ Updated Balance', value: `**${formatNumber(economy.coins)}** ${game.currency}` });
+  return buildGameEmbed(game, {
+    reveal: true,
+    footer: getResultFooter(result, game, payout, economy.coins),
+    notes,
+    color: RESULT_COLORS[result] ?? COLORS.RAPHAEL_ERROR
+  });
 }
 
 // Parses "100", "all" or "max" into a wager, or returns an error message
@@ -250,6 +251,7 @@ export default {
         userId,
         guildId,
         playerName: message.author.username,
+        avatarURL: message.author.displayAvatarURL?.(),
         currency,
         bet,
         originalBet: bet,
@@ -272,12 +274,8 @@ export default {
       }
 
       const canDouble = economy.coins >= bet;
-      const opening = ['◇ **Hit** to draw a card, **Stand** to hold, or **Double Down** to double your wager and draw one final card.'];
-      if (getHandTotal(game.playerHand).soft) {
-        opening.push('◇ Aces count as 11, or as 1 whenever 11 would take you over 21.');
-      }
       const gameMessage = await message.reply({
-        embeds: [buildGameEmbed(game, { status: opening.join('\n') })],
+        embeds: [buildGameEmbed(game, {})],
         components: [buildButtons(game, canDouble)]
       });
 
@@ -315,10 +313,8 @@ export default {
             const value = calculateHand(game.playerHand);
             if (value > 21) return await finish(interaction, 'bust');
             if (value === 21) return await finish(interaction, resolveStand(game), aceNote ? [aceNote] : []);
-            const drawn = game.playerHand[game.playerHand.length - 1];
-            const status = [`◇ You drew ${cardEmoji(drawn, game.emojis)}`, aceNote].filter(Boolean).join('\n');
             return await interaction.editReply({
-              embeds: [buildGameEmbed(game, { status })],
+              embeds: [buildGameEmbed(game, { notes: aceNote ? [aceNote] : [] })],
               components: [buildButtons(game, false)]
             });
           }
