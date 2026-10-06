@@ -16,7 +16,6 @@ import { fileURLToPath } from "url";
 import { readdirSync } from "fs";
 import { initializeSchedulers } from "./utils/schedulers.js";
 import { startPollScheduler } from "./events/client/pollButtonHandler.js";
-import readyEvent from "./events/client/ready.js";
 import { setupGlobalErrorHandlers } from "./utils/errorHandlers.js";
 import { refundActiveGames } from "./commands/economy/blackjack.js";
 import express from "express";
@@ -274,23 +273,26 @@ async function loadEvents() {
           const EventClass = EventModule.default || EventModule;
 
           // Handle both Event class format and plain object format
-          let evt, eventName, eventHandler;
+          let evt, eventName, eventHandler, once;
 
           if (typeof EventClass === "function") {
             // Event class format (player events)
             evt = new EventClass(client, file);
             eventName = evt.name;
             eventHandler = (...args) => evt.run(...args);
+            once = evt.one;
           } else if (typeof EventClass === "object" && EventClass.execute) {
             // Plain object format (client events)
             eventName = EventClass.name;
             eventHandler = (...args) => EventClass.execute(...args, client);
+            once = EventClass.once;
           } else {
             throw new Error(`Invalid event format in ${file}`);
           }
 
           // Register event with client
-          client.on(eventName, eventHandler);
+          if (once) client.once(eventName, eventHandler);
+          else client.on(eventName, eventHandler);
 
           totalEvents++;
         } catch (error) {
@@ -373,29 +375,19 @@ async function initialize() {
     );
   }
 
-  // Login to Discord first
-  await client.login(process.env.DISCORD_TOKEN);
+  // Event handlers are registered before login, so nothing Discord sends once the
+  // bot connects is missed: commands and button clicks that arrive during startup
+  // are handled, and ready.js runs on clientReady like any other event file.
+  await loadEvents();
+  await loadMusicEvents();
 
-  const duration = Date.now() - startTime;
-  logger.performance("Bot initialization", duration);
-  logger.startup(`Bot started successfully in ${duration}ms`);
-
-  // Initialize events after client is ready
+  // Startup steps that need the logged-in client and its guild cache. Registered
+  // before login too, so clientReady can't fire before anyone is listening.
   client.once("clientReady", async () => {
     console.log("[RAPHAEL] Client connection established.");
     console.log(`   Logged in as: ${client.user.tag}`);
     console.log(`   Guilds: ${client.guilds.cache.size}`);
     console.log(`   WS Status: ${client.ws.status}, Ping: ${client.ws.ping}ms`);
-
-    // Load event handlers
-    await loadEvents();
-
-    // Event files are registered only now, after clientReady has fired, so ready.js
-    // (presence, invite cache for invite tracking) is run directly rather than awaited
-    await readyEvent.execute(client);
-
-    // Load music events
-    await loadMusicEvents();
 
     // Initialize security systems
     await initializeSecuritySystems(client);
@@ -418,6 +410,12 @@ async function initialize() {
       "[RAPHAEL] All systems operational. Awaiting commands, Master.",
     );
   });
+
+  await client.login(process.env.DISCORD_TOKEN);
+
+  const duration = Date.now() - startTime;
+  logger.performance("Bot initialization", duration);
+  logger.startup(`Bot started successfully in ${duration}ms`);
 }
 
 // Initialize security systems (anti-nuke, anti-raid, message logging)
