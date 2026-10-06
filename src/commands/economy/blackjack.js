@@ -15,7 +15,11 @@ const IDLE_TIMEOUT = 60_000;
 
 // Active games by user ID. The entry is reserved before the first await, so a second
 // command (e.g. !bj and !21 at once) can't start a parallel game with the same coins.
+// Games live only in memory: on shutdown, unfinished ones are refunded (refundActiveGames).
 const activeGames = new Map();
+
+// Payouts in progress, awaited at shutdown so none is cut off halfway
+const pendingSettlements = new Set();
 
 // Create a shuffled deck of cards
 function createDeck() {
@@ -178,6 +182,16 @@ const RESULT_COLORS = {
 // Pays out, records gambling stats and returns the final embed. Callers mark the game
 // over (synchronously) before calling, so a game can only ever be settled once.
 async function settleGame(game, result, notes = []) {
+  const settlement = payOut(game, result, notes);
+  pendingSettlements.add(settlement);
+  try {
+    return await settlement;
+  } finally {
+    pendingSettlements.delete(settlement);
+  }
+}
+
+async function payOut(game, result, notes) {
   activeGames.delete(game.userId);
   // The dealer's hidden card is turned over now, so it flips in with the result
   game.fresh.add(game.dealerHand[1]);
@@ -198,6 +212,45 @@ async function settleGame(game, result, notes = []) {
     notes,
     color: RESULT_COLORS[result] ?? COLORS.RAPHAEL_ERROR
   });
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Called on shutdown. Games can't resume after a restart (they live in memory and
+ * the wager was taken up front), so every unfinished game is closed and its wager
+ * returned, and payouts already under way are awaited. Resolves to the number of
+ * games refunded.
+ */
+export async function refundActiveGames() {
+  const open = [...activeGames.values()].filter((game) => !game.over && game.bet > 0);
+  for (const game of open) {
+    game.over = true; // any move still in flight stops at its next game.over check
+    activeGames.delete(game.userId);
+    game.collector?.stop('shutdown');
+  }
+
+  await Promise.all(open.map(async (game) => {
+    try {
+      const economy = await Economy.getEconomy(game.userId, game.guildId);
+      await economy.addCoins(game.bet, 'Blackjack refund (bot restart)');
+    } catch (error) {
+      // Logged with what's needed to return the coins by hand
+      console.error(`[Blackjack] Could not refund ${game.bet} to user ${game.userId} in guild ${game.guildId}:`, error);
+      return;
+    }
+    if (!game.message) return;
+    game.fresh.clear();
+    const embed = buildGameEmbed(game, {
+      footer: `◈ ~ Raphael is restarting. Your ${formatNumber(game.bet)} ${game.currency} were returned, Master`,
+      color: COLORS.RAPHAEL_WARNING
+    });
+    // Best effort: shutdown doesn't wait on a slow edit
+    await Promise.race([game.message.edit({ embeds: [embed], components: [] }).catch(() => {}), sleep(3000)]);
+  }));
+
+  await Promise.allSettled([...pendingSettlements]);
+  return open.length;
 }
 
 // Parses "100", "all" or "max" into a wager, or returns an error message
@@ -225,7 +278,10 @@ export default {
         embeds: [await errorEmbed(guildId, 'Game In Progress', 'You already have an active game at the table, Master. Finish it first.')]
       });
     }
-    activeGames.set(userId, { pending: true });
+    // The seat is the game itself, filled in as it is set up, so a shutdown at any
+    // point finds it. `bet` is recorded before the wager is taken for the same reason.
+    const game = { userId, guildId, bet: 0, over: false, busy: false };
+    activeGames.set(userId, game);
 
     let wagerTaken = 0;
     try {
@@ -257,31 +313,26 @@ export default {
         });
       }
 
+      game.bet = bet;
       await economy.removeCoins(bet, 'Blackjack wager');
       wagerTaken = bet;
 
-      const deck = createDeck();
-      const game = {
-        userId,
-        guildId,
+      Object.assign(game, {
         playerName: message.author.username,
         avatarURL: message.author.displayAvatarURL?.(),
         currency,
-        bet,
         originalBet: bet,
-        deck,
+        deck: createDeck(),
         playerHand: [],
         dealerHand: [],
         fresh: new Set(),
-        emojis: await getCardEmojis(client),
-        over: false,
-        busy: false
-      };
+        emojis: await getCardEmojis(client)
+      });
+      if (game.over) return; // refunded by a shutdown during setup
       deal(game, game.playerHand);
       deal(game, game.playerHand);
       deal(game, game.dealerHand);
       deal(game, game.dealerHand);
-      activeGames.set(userId, game);
 
       // Naturals end the hand at once (the dealer checks for blackjack before play)
       if (isNatural(game.playerHand) || isNatural(game.dealerHand)) {
@@ -297,14 +348,18 @@ export default {
         embeds: [buildGameEmbed(game, {})],
         components: [buildButtons(game, canDouble)]
       });
+      game.message = gameMessage;
+      if (game.over) return;
 
       // Ends when the game finishes, or after IDLE_TIMEOUT without a move
       const collector = gameMessage.createMessageComponentCollector({
         filter: (i) => i.customId.startsWith('blackjack_'),
         idle: IDLE_TIMEOUT
       });
+      game.collector = collector;
 
       const finish = async (interaction, result, notes) => {
+        if (game.over) return; // refunded by a shutdown meanwhile
         game.over = true;
         collector.stop('finished');
         const embed = await settleGame(game, result, notes);
@@ -326,6 +381,7 @@ export default {
 
         try {
           await interaction.deferUpdate();
+          if (game.over) return; // refunded by a shutdown meanwhile
 
           if (interaction.customId === 'blackjack_hit') {
             const handBefore = [...game.playerHand];
@@ -349,11 +405,19 @@ export default {
               return await interaction.followUp({ content: 'Double Down is only available on your first two cards, Master.', flags: MessageFlags.Ephemeral });
             }
             const economy = await Economy.getEconomy(userId, guildId);
+            if (game.over) return;
             if (economy.coins < game.originalBet) {
               return await interaction.followUp({ content: `You lack the ${currency} to double down, Master.`, flags: MessageFlags.Ephemeral });
             }
-            await economy.removeCoins(game.originalBet, 'Blackjack double down');
+            // Counted before the await, so a shutdown refund during it returns both wagers
             game.bet += game.originalBet;
+            try {
+              await economy.removeCoins(game.originalBet, 'Blackjack double down');
+            } catch (error) {
+              game.bet -= game.originalBet;
+              throw error;
+            }
+            if (game.over) return;
             const handBefore = [...game.playerHand];
             deal(game, game.playerHand);
             const aceNote = aceSwitchNote(handBefore, game.playerHand);
@@ -383,15 +447,17 @@ export default {
       });
     } catch (error) {
       console.error('[Blackjack] Error starting game:', error);
-      // The game never reached the table: return the wager and free the seat
-      const game = activeGames.get(userId);
-      activeGames.delete(userId);
-      if (wagerTaken && !game?.over) {
+      // The game never reached the table: free the seat and return the wager
+      if (activeGames.get(userId) === game) activeGames.delete(userId);
+      const refund = wagerTaken > 0 && !game.over;
+      game.over = true;
+      if (refund) {
         const economy = await Economy.getEconomy(userId, guildId).catch(() => null);
         await economy?.addCoins(wagerTaken, 'Blackjack refund').catch(() => {});
       }
       return message.reply({
-        embeds: [await errorEmbed(guildId, 'Table Error', 'The game could not be started and your wager has been returned, Master.')]
+        embeds: [await errorEmbed(guildId, 'Table Error',
+          `The game could not be started${refund ? ' and your wager has been returned' : ''}, Master.`)]
       }).catch(() => {});
     }
   }

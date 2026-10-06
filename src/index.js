@@ -18,6 +18,7 @@ import { initializeSchedulers } from "./utils/schedulers.js";
 import { startPollScheduler } from "./events/client/pollButtonHandler.js";
 import readyEvent from "./events/client/ready.js";
 import { setupGlobalErrorHandlers } from "./utils/errorHandlers.js";
+import { refundActiveGames } from "./commands/economy/blackjack.js";
 import express from "express";
 import Guild from "./models/Guild.js";
 import logger from "./utils/logger.js";
@@ -29,8 +30,8 @@ import redis from "./utils/redis.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Setup global error handlers
-setupGlobalErrorHandlers();
+// Setup global error handlers (a fatal error shuts down cleanly, refunds included)
+setupGlobalErrorHandlers({ onFatal: () => shutdown("Uncaught exception", 1) });
 
 // Express app for health checks
 const app = express();
@@ -494,40 +495,41 @@ process.on("uncaughtException", (error) => {
   process.exit(1);
 });
 
-// Graceful shutdown
-process.on("SIGINT", async () => {
-  console.log("\n🛑 Shutting down gracefully...");
-  logger.info("Bot shutting down (SIGINT)");
+// Graceful shutdown: docker stop/restart sends SIGTERM, Ctrl+C sends SIGINT, and a
+// fatal error comes through setupGlobalErrorHandlers. Runs once, whatever triggers it.
+async function shutdown(reason, exitCode = 0) {
+  if (shutdown.started) return;
+  shutdown.started = true;
+  console.log(`\n[RAPHAEL] ${reason}: initiating graceful shutdown...`);
+  logger.info(`Bot shutting down (${reason})`);
 
-  // Stop Spotify token refresh
-  // spotifyTokenManager.stop();
+  // Docker kills the container 10 seconds after SIGTERM: finish (or give up) before that
+  setTimeout(() => {
+    console.error("[RAPHAEL] Shutdown timed out, exiting.");
+    process.exit(exitCode || 1);
+  }, 8000).unref();
 
-  // Disconnect from Discord
-  client.destroy();
+  try {
+    // Blackjack wagers are taken up front and games can't resume after a restart
+    const refunded = await refundActiveGames();
+    if (refunded) console.log(`[RAPHAEL] Refunded ${refunded} unfinished blackjack game(s).`);
+  } catch (error) {
+    logger.error("Failed to refund unfinished games during shutdown", error);
+  }
 
-  // Close database connection
-  await mongoose.connection.close();
-
-  console.log("[RAPHAEL] Shutdown sequence complete.");
-  process.exit(0);
-});
-
-process.on("SIGTERM", async () => {
-  console.log("\n[RAPHAEL] Initiating graceful shutdown...");
-  logger.info("Bot shutting down (SIGTERM)");
-
-  // Stop Spotify token refresh
-  // spotifyTokenManager.stop();
-
-  // Disconnect from Discord
-  client.destroy();
-
-  // Close database connection
-  await mongoose.connection.close();
+  try {
+    await client.destroy();
+    await mongoose.connection.close();
+  } catch (error) {
+    logger.error("Error while disconnecting during shutdown", error);
+  }
 
   console.log("[RAPHAEL] Shutdown sequence complete.");
-  process.exit(0);
-});
+  process.exit(exitCode);
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 // Health check endpoint
 app.get("/health", (req, res) => {

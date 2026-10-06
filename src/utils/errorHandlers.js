@@ -5,9 +5,11 @@
 import logger from './logger.js';
 
 /**
- * Handle uncaught exceptions
+ * Handle uncaught exceptions. `onFatal(error)` runs instead of exiting outright on a
+ * fatal one, so the caller can clean up (refunds, connections) and exit itself.
+ * Shutdown signals are handled in index.js.
  */
-export function setupGlobalErrorHandlers() {
+export function setupGlobalErrorHandlers({ onFatal } = {}) {
   // Handle uncaught exceptions
   process.on('uncaughtException', (error) => {
     if (error.code === 10062) {
@@ -30,7 +32,8 @@ export function setupGlobalErrorHandlers() {
     
     if (!isKnownError) {
       console.error('[RAPHAEL] Process will exit due to uncaught exception');
-      process.exit(1);
+      if (onFatal) onFatal(error);
+      else process.exit(1);
     }
   });
 
@@ -49,18 +52,6 @@ export function setupGlobalErrorHandlers() {
     if (reason?.stack) {
       console.error('Stack:', reason.stack);
     }
-  });
-
-  // Handle SIGINT (Ctrl+C)
-  process.on('SIGINT', () => {
-    console.log('\n[RAPHAEL] Received SIGINT. Shutting down gracefully...');
-    process.exit(0);
-  });
-
-  // Handle SIGTERM
-  process.on('SIGTERM', () => {
-    console.log('\n[RAPHAEL] Received SIGTERM. Shutting down gracefully...');
-    process.exit(0);
   });
 
   console.log('[RAPHAEL] Global error handlers initialized');
