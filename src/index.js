@@ -15,6 +15,8 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { readdirSync } from "fs";
 import { initializeSchedulers } from "./utils/schedulers.js";
+import { startPollScheduler } from "./events/client/pollButtonHandler.js";
+import readyEvent from "./events/client/ready.js";
 import { setupGlobalErrorHandlers } from "./utils/errorHandlers.js";
 import express from "express";
 import Guild from "./models/Guild.js";
@@ -387,6 +389,10 @@ async function initialize() {
     // Load event handlers
     await loadEvents();
 
+    // Event files are registered only now, after clientReady has fired, so ready.js
+    // (presence, invite cache for invite tracking) is run directly rather than awaited
+    await readyEvent.execute(client);
+
     // Load music events
     await loadMusicEvents();
 
@@ -398,6 +404,8 @@ async function initialize() {
 
     // Initialize schedulers
     initializeSchedulers(client);
+    // Ends overdue polls even when nobody interacts with them
+    startPollScheduler(client);
 
     // Start status monitoring
     startStatusMonitoring();

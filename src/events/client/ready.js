@@ -12,7 +12,7 @@ export default {
     // Set bot presence
     client.user.setPresence({
       activities: [{
-        name: 'Analyzing... | !help',
+        name: `Analyzing... | ${process.env.DEFAULT_PREFIX || '!'}help`,
         type: ActivityType.Watching
       }],
       status: 'online'

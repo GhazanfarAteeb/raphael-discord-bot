@@ -19,6 +19,11 @@ const VERIFICATION_TYPES = [
 const TYPE_NAMES = VERIFICATION_TYPES.map(t => t.type);
 const PANEL_PERMISSIONS = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks];
 
+// Shared with verificationReactionHandler.js. The reaction is a Discord reaction on the panel,
+// never bot text; the title identifies panels posted before panels were recorded.
+export const VERIFICATION_REACTION = '✅';
+export const VERIFICATION_PANEL_TITLE = '『 Server Verification 』';
+
 export default {
   name: 'verify',
   description: 'Setup or manage the verification system',
@@ -69,7 +74,15 @@ export default {
             return message.reply({ embeds: [await errorEmbed(guildId, 'Invalid Channel', channelError)] });
           }
 
-          await sendVerificationPanel(channel, vs.type);
+          try {
+            await sendVerificationPanel(channel, vs.type);
+          } catch (error) {
+            logger.error(`[Verify] Could not post the verification panel in ${channel.id} (${guildId})`, error);
+            return message.reply({
+              embeds: [await errorEmbed(guildId, 'Panel Not Sent',
+                `I could not post the panel in ${channel}, Master. Please check my permissions there.`)]
+            });
+          }
 
           if (channel.id !== message.channel.id) {
             return message.reply({
@@ -90,6 +103,9 @@ export default {
           const role = vs?.role ? message.guild.roles.cache.get(vs.role) : null;
           const unverifiedRole = vs?.unverifiedRole ? message.guild.roles.cache.get(vs.unverifiedRole) : null;
           const channel = vs?.channel ? message.guild.channels.cache.get(vs.channel) : null;
+          const panel = vs?.panelMessageId && vs?.panelChannelId
+            ? `[View panel](https://discord.com/channels/${guildId}/${vs.panelChannelId}/${vs.panelMessageId}) in <#${vs.panelChannelId}>`
+            : 'Not recorded';
 
           const embed = new EmbedBuilder()
             .setColor(vs?.enabled ? COLORS.RAPHAEL_SUCCESS : COLORS.RAPHAEL_ERROR)
@@ -99,7 +115,8 @@ export default {
               { name: `${GLYPHS.ARROW_RIGHT} Type`, value: vs?.type || 'Not configured', inline: true },
               { name: `${GLYPHS.ARROW_RIGHT} Verified Role`, value: role ? role.toString() : 'Not configured', inline: true },
               { name: `${GLYPHS.ARROW_RIGHT} Unverified Role`, value: unverifiedRole ? unverifiedRole.toString() : 'Not configured', inline: true },
-              { name: `${GLYPHS.ARROW_RIGHT} Channel`, value: channel ? channel.toString() : 'Not configured', inline: true }
+              { name: `${GLYPHS.ARROW_RIGHT} Channel`, value: channel ? channel.toString() : 'Not configured', inline: true },
+              { name: `${GLYPHS.ARROW_RIGHT} Panel`, value: panel, inline: true }
             )
             .setFooter({ text: getRandomFooter() })
             .setTimestamp();
@@ -324,7 +341,8 @@ async function configure(message, args, prefix) {
         return reject('Invalid Usage', 'The type must be `button`, `captcha` or `reaction`, Master.');
       }
       await Guild.updateGuild(guildId, { $set: { 'features.verificationSystem.type': value } });
-      return confirm('Verification Updated', `Verification type set to **${value}**, Master.`);
+      return confirm('Verification Updated',
+        `Verification type set to **${value}**, Master. Run \`${prefix}verify panel\` to deploy a matching panel.`);
     }
 
     case 'role': {
@@ -374,8 +392,8 @@ async function configure(message, args, prefix) {
   }
 }
 
-// Why the panel cannot be posted in `channel`, or null if it can
-function getPanelChannelError(channel, type) {
+// Why the panel cannot be posted in `channel`, or null if it can (also for the /verify slash command)
+export function getPanelChannelError(channel, type) {
   if (!channel?.isTextBased?.()) return `${channel ?? 'That channel'} is not a text channel, Master.`;
   const me = channel.guild.members.me;
   const needed = type === 'reaction' ? [...PANEL_PERMISSIONS, PermissionFlagsBits.AddReactions] : PANEL_PERMISSIONS;
@@ -385,29 +403,65 @@ function getPanelChannelError(channel, type) {
   return null;
 }
 
-async function sendVerificationPanel(channel, type = 'button') {
+/**
+ * Posts the verification panel for `type` in `channel` and records it as the guild's panel
+ * (features.verificationSystem.panelMessageId / panelChannelId); reaction verification only
+ * accepts the recorded panel. Buttons for the button and captcha types (custom IDs handled by
+ * verificationHandler.js), a reaction for the reaction type (verificationReactionHandler.js).
+ * Throws when the panel cannot be posted. A reaction panel that cannot be completed (the
+ * reaction or the record failed) is deleted again before throwing, so it never sits there
+ * unanswered; a button panel works without the record, so that failure is only logged.
+ * @param {import('discord.js').GuildTextBasedChannel} channel
+ * @param {'button'|'captcha'|'reaction'} [type]
+ * @returns {Promise<import('discord.js').Message>} the posted panel
+ */
+export async function sendVerificationPanel(channel, type = 'button') {
+  const panelType = TYPE_NAMES.includes(type) ? type : 'button';
+  const instructions = {
+    button: '**Activate the button below to proceed.**',
+    captcha: '**Activate the button below to receive a verification code.**',
+    reaction: '**Apply the reaction below to verify.**'
+  };
+
   const embed = new EmbedBuilder()
     .setColor(COLORS.RAPHAEL)
-    .setTitle('『 Server Verification 』')
-    .setDescription('**Notice:** Access to this server requires verification, Master.\n\n' +
-      (type === 'button' ? '**Activate the button below to proceed.**' :
-        type === 'captcha' ? '**Activate the button below to receive a verification code.**' :
-          '**Apply the reaction below to verify.**'))
+    .setTitle(VERIFICATION_PANEL_TITLE)
+    .setDescription(`**Notice:** Access to this server requires verification, Master.\n\n${instructions[panelType]}`)
     .setFooter({ text: 'Security protocol active.' });
 
-  if (type === 'button' || type === 'captcha') {
-    const row = new ActionRowBuilder()
-      .addComponents(
-        new ButtonBuilder()
-          .setCustomId(`verify_${type}`)
-          .setLabel(type === 'captcha' ? 'Get Captcha' : 'Verify')
-          .setStyle(ButtonStyle.Success)
-      );
-
-    return channel.send({ embeds: [embed], components: [row] });
+  let panel;
+  if (panelType === 'reaction') {
+    panel = await channel.send({ embeds: [embed] });
+    try {
+      await panel.react(VERIFICATION_REACTION);
+    } catch (error) {
+      await panel.delete().catch(() => { });
+      throw error;
+    }
+  } else {
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`verify_${panelType}`)
+        .setLabel(panelType === 'captcha' ? 'Get Captcha' : 'Verify')
+        .setStyle(ButtonStyle.Success)
+    );
+    panel = await channel.send({ embeds: [embed], components: [row] });
   }
 
-  const msg = await channel.send({ embeds: [embed] });
-  await msg.react('✅');
-  return msg;
+  try {
+    await Guild.updateGuild(channel.guild.id, {
+      $set: {
+        'features.verificationSystem.panelMessageId': panel.id,
+        'features.verificationSystem.panelChannelId': channel.id
+      }
+    });
+  } catch (error) {
+    if (panelType === 'reaction') {
+      await panel.delete().catch(() => { });
+      throw error;
+    }
+    logger.error(`[Verify] Could not record the verification panel ${panel.id} in ${channel.guild.id}`, error);
+  }
+
+  return panel;
 }

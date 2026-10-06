@@ -95,8 +95,17 @@ async function logManualVerification(member, executor, guildConfig) {
   }
 }
 
-// Export the manual verification logger for use in verify command
-export { logManualVerification };
+// Export the manual verification logger for use in verify command, and the shared
+// verification steps for the reaction panel (verificationReactionHandler.js)
+export {
+  logManualVerification,
+  logVerification,
+  getVerifiedRoleProblem,
+  runSecurityChecks,
+  securityBlockedEmbed,
+  grantVerifiedRoles,
+  NOT_CONFIGURED
+};
 
 export default {
   name: 'interactionCreate',
