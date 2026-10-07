@@ -1815,6 +1815,23 @@ function isHttpUrl(value) {
   }
 }
 
+// Saves the stored copy that profile and level cards draw a background from
+// (utils/backgroundImages.js). `reply` shows the image in its embed, so the copy can come
+// from Discord's proxy even when the bot can't reach the host. Warns the admin otherwise.
+async function saveShopImageCopy(interaction, reply, key, imageUrl) {
+  const { saveBackgroundFromMessage, IMAGE_NOT_SAVED } = await import('../../utils/backgroundImages.js');
+  if (await saveBackgroundFromMessage(reply, interaction.guild.id, key, imageUrl)) return;
+  const { warningEmbed, GLYPHS } = await import('../../utils/embeds.js');
+  await interaction.followUp({
+    embeds: [await warningEmbed(interaction.guild.id, 'Image Not Saved', `${GLYPHS.WARN} ${IMAGE_NOT_SAVED}`)]
+  }).catch(() => {});
+}
+
+async function deleteShopImageCopy(guildId, key) {
+  const { deleteBackgroundImage } = await import('../../utils/backgroundImages.js');
+  await deleteBackgroundImage(guildId, key).catch(() => {});
+}
+
 // Handle manageshop slash command (Backgrounds only)
 async function handleManageshopCommand(interaction, guildConfig) {
   const { successEmbed, errorEmbed, infoEmbed, GLYPHS } = await import('../../utils/embeds.js');
@@ -1873,7 +1890,8 @@ async function handleManageshopCommand(interaction, guildConfig) {
         { name: '▸ ID', value: `\`${itemId}\``, inline: true }
       ).setImage(image);
 
-      await interaction.editReply({ embeds: [embed] });
+      const reply = await interaction.editReply({ embeds: [embed] });
+      await saveShopImageCopy(interaction, reply, itemId, image);
       break;
     }
 
@@ -1891,6 +1909,7 @@ async function handleManageshopCommand(interaction, guildConfig) {
 
       const removedItem = guildConfig.customShopItems[index];
       await Guild.updateGuild(interaction.guild.id, { $pull: { customShopItems: { id: itemId } } });
+      await deleteShopImageCopy(interaction.guild.id, itemId);
 
       await interaction.editReply({
         embeds: [await successEmbed(interaction.guild.id, 'Item Removed',
@@ -1983,7 +2002,8 @@ async function handleManageshopCommand(interaction, guildConfig) {
       const embed = await successEmbed(interaction.guild.id, 'Background Updated',
         `${GLYPHS.SUCCESS} Updated the ${field} of **${item.name}** to: ${field === 'image' ? newValue : `**${newValue}**`}`);
       if (field === 'image') embed.setImage(newValue);
-      await interaction.editReply({ embeds: [embed] });
+      const reply = await interaction.editReply({ embeds: [embed] });
+      if (field === 'image') await saveShopImageCopy(interaction, reply, itemId, newValue);
       break;
     }
 
@@ -2040,7 +2060,9 @@ async function handleManageshopCommand(interaction, guildConfig) {
         const embed = await successEmbed(interaction.guild.id, 'Fallback Background Updated',
           `${GLYPHS.SUCCESS} Default background image set. Preview below, Master.`);
         embed.setImage(value);
-        await interaction.editReply({ embeds: [embed] });
+        const reply = await interaction.editReply({ embeds: [embed] });
+        const { FALLBACK_KEY } = await import('../../utils/backgroundImages.js');
+        await saveShopImageCopy(interaction, reply, FALLBACK_KEY, value);
 
       } else if (type === 'color') {
         if (!value) {
@@ -2071,6 +2093,8 @@ async function handleManageshopCommand(interaction, guildConfig) {
         await Guild.updateGuild(interaction.guild.id, {
           $set: { 'economy.fallbackBackground': { image: '', color: '#2C2F33' } }
         });
+        const { FALLBACK_KEY } = await import('../../utils/backgroundImages.js');
+        await deleteShopImageCopy(interaction.guild.id, FALLBACK_KEY);
 
         await interaction.editReply({
           embeds: [await successEmbed(interaction.guild.id, 'Fallback Reset',

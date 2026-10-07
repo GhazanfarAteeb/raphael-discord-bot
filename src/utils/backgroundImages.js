@@ -24,6 +24,14 @@ const JPEG_QUALITY = 90;
 // Stored-copy key for the server's default background (shop items use their own id)
 export const FALLBACK_KEY = 'fallback';
 
+// Card color when the server hasn't set one (manageshop fallback color)
+export const DEFAULT_CARD_COLOR = '#2C2F33';
+
+// Told to an admin whose background image couldn't be saved
+export const IMAGE_NOT_SAVED =
+  'Raphael could not download this image, so it may not appear on profile and level cards. ' +
+  'Check that the link opens the image itself, or upload the image to Discord and use that link.';
+
 // Links already reported as unloadable, so a broken background is logged once, not per card
 const reportedFailures = new Set();
 
@@ -50,7 +58,7 @@ async function storeCopy(guildId, key, sourceUrl, buffer) {
 
   const canvas = createCanvas(width, height);
   const ctx = canvas.getContext('2d');
-  ctx.fillStyle = '#2C2F33'; // JPEG has no transparency: transparent areas get the cards' dark base
+  ctx.fillStyle = DEFAULT_CARD_COLOR; // JPEG has no transparency: transparent areas get the default card color
   ctx.fillRect(0, 0, width, height);
   ctx.drawImage(image, 0, 0, width, height);
   const data = await canvas.encode('jpeg', JPEG_QUALITY);
@@ -66,7 +74,7 @@ async function storeCopy(guildId, key, sourceUrl, buffer) {
 function reportFailure(guildId, key, url, error) {
   if (reportedFailures.has(url)) return;
   reportedFailures.add(url);
-  logger.warn(`[Backgrounds] ${key} in guild ${guildId} could not be loaded (${error.message}); cards use the plain background: ${url}`);
+  logger.warn(`[Backgrounds] ${key} in guild ${guildId} could not be loaded (${error.message}); cards use the fallback color: ${url}`);
 }
 
 /**
@@ -132,7 +140,7 @@ export async function deleteBackgroundImage(guildId, key) {
 /**
  * Which background a member's cards show: their active background (built in, or one of
  * the server's custom shop items), else the server's fallback image.
- * Resolves to { key, url }, or null when there is no image (the cards draw a gradient).
+ * Resolves to { key, url }, or null when there is no image (the cards draw the fallback color).
  */
 export function getCardBackground(guildConfig, backgroundId) {
   const id = backgroundId || 'default';
@@ -146,10 +154,32 @@ export function getCardBackground(guildConfig, backgroundId) {
   return fallback ? { key: FALLBACK_KEY, url: fallback } : null;
 }
 
+// `hex` with each channel scaled by `factor`
+function shade(hex, factor) {
+  const value = parseInt(hex.slice(1), 16);
+  const channel = (shift) => Math.round(((value >> shift) & 0xff) * factor);
+  return `rgb(${channel(16)}, ${channel(8)}, ${channel(0)})`;
+}
+
+/**
+ * Fills a card with the server's fallback color (manageshop fallback color), shaded from
+ * the color at the top left to a slightly darker tone at the bottom right. Drawn when a
+ * card has no background image, or its image can't be loaded.
+ */
+export function fillCardColor(ctx, width, height, guildConfig) {
+  const configured = guildConfig.economy?.fallbackBackground?.color;
+  const color = /^#[0-9a-f]{6}$/i.test(configured ?? '') ? configured : DEFAULT_CARD_COLOR;
+  const gradient = ctx.createLinearGradient(0, 0, width, height);
+  gradient.addColorStop(0, color);
+  gradient.addColorStop(1, shade(color, 0.8));
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, width, height);
+}
+
 /**
  * The image to draw for a card background ({ key, url } from getCardBackground): the
  * stored copy made from this link, else the link itself (saving a copy for next time).
- * Resolves to null when neither loads, and the card draws its plain gradient.
+ * Resolves to null when neither loads, and the card draws the fallback color.
  */
 export async function loadCardBackground(guildId, background) {
   if (!background) return null;

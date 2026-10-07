@@ -919,7 +919,7 @@ const slashCommands = [
             .setRequired(true)
             .addChoices(
               { name: 'Image URL', value: 'url' },
-              { name: 'Solid Color', value: 'color' },
+              { name: 'Color', value: 'color' },
               { name: 'Clear/Reset', value: 'clear' }
             ))
         .addStringOption(option =>

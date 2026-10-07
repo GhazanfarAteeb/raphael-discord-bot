@@ -4,7 +4,7 @@ import '../../utils/fonts.js';
 import Economy from '../../models/Economy.js';
 import Level from '../../models/Level.js';
 import Guild from '../../models/Guild.js';
-import { getCardBackground, loadCardBackground } from '../../utils/backgroundImages.js';
+import { getCardBackground, loadCardBackground, fillCardColor } from '../../utils/backgroundImages.js';
 import { DEFAULT_COIN_NAME } from '../../utils/gameConfig.js';
 import { errorEmbed, COLORS } from '../../utils/embeds.js';
 import { getPrefix, formatNumber } from '../../utils/helpers.js';
@@ -185,14 +185,6 @@ export default {
       const canvas = createCanvas(900, 420);
       const ctx = canvas.getContext('2d');
 
-      const drawGradientBackground = () => {
-        const bgGradient = ctx.createLinearGradient(0, 0, 900, 420);
-        bgGradient.addColorStop(0, '#2C2F33');
-        bgGradient.addColorStop(1, '#23272A');
-        ctx.fillStyle = bgGradient;
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-      };
-
       // Draw background
       if (loadedBg) {
         ctx.drawImage(loadedBg, 0, 0, canvas.width, canvas.height);
@@ -200,7 +192,8 @@ export default {
         ctx.fillStyle = hexToRgba(overlayColor, overlayOpacity);
         ctx.fillRect(0, 0, canvas.width, canvas.height);
       } else {
-        drawGradientBackground();
+        // No image, or it couldn't be loaded: the server's fallback color
+        fillCardColor(ctx, canvas.width, canvas.height, guildConfig);
       }
 
       // Accent bar at TOP with gradient (same as rank card)

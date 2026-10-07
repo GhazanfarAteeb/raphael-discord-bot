@@ -2,7 +2,7 @@ import { PermissionFlagsBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, Comp
 import Guild from '../../models/Guild.js';
 import { successEmbed, errorEmbed, infoEmbed, warningEmbed, GLYPHS } from '../../utils/embeds.js';
 import { getPrefix, formatNumber, hasModPerms } from '../../utils/helpers.js';
-import { saveBackgroundFromMessage, deleteBackgroundImage, FALLBACK_KEY } from '../../utils/backgroundImages.js';
+import { saveBackgroundFromMessage, deleteBackgroundImage, FALLBACK_KEY, IMAGE_NOT_SAVED } from '../../utils/backgroundImages.js';
 
 const MAX_NAME_LENGTH = 100; // Names are used as embed field names (limit 256)
 const MAX_DESCRIPTION_LENGTH = 500;
@@ -46,9 +46,7 @@ function updateItem(guildId, itemId, fields) {
 async function saveImageCopy(message, reply, guildId, key, imageUrl) {
   if (await saveBackgroundFromMessage(reply, guildId, key, imageUrl)) return;
   await message.reply({
-    embeds: [await warningEmbed(guildId, 'Image Not Saved',
-      `${GLYPHS.WARN} Raphael could not download this image, so it may not appear on profile and level cards. ` +
-      'Check that the link opens the image itself, or upload the image to Discord and use that link.')]
+    embeds: [await warningEmbed(guildId, 'Image Not Saved', `${GLYPHS.WARN} ${IMAGE_NOT_SAVED}`)]
   }).catch(() => {});
 }
 
@@ -472,14 +470,14 @@ async function setFallback({ message, guildId, prefix, guildConfig }, type, valu
   if (!type || !value) {
     const currentFallback = guildConfig.economy?.fallbackBackground;
     const embed = await infoEmbed(guildId, 'Fallback Background',
-      `${GLYPHS.INFO} The default background for profiles without one.\n\n` +
+      `${GLYPHS.INFO} The default background for profiles without one: the image if one is set, otherwise the color.\n\n` +
       `${GLYPHS.ARROW_RIGHT} **Image:** ${currentFallback?.image ? shorten(currentFallback.image, 200) : 'None'}\n` +
       `${GLYPHS.ARROW_RIGHT} **Color:** ${currentFallback?.color || DEFAULT_FALLBACK.color}`);
     embed.addFields({
       name: `${GLYPHS.ARROW_RIGHT} Usage`,
       value:
         `\`${prefix}manageshop fallback url <image_url>\` - Set an image\n` +
-        `\`${prefix}manageshop fallback color <hex_color>\` - Set a solid color\n` +
+        `\`${prefix}manageshop fallback color <hex_color>\` - Set the color\n` +
         `\`${prefix}manageshop fallback clear\` - Reset to default`
     });
     return message.reply({ embeds: [embed] });

@@ -6,7 +6,7 @@ import { errorEmbed } from '../../utils/embeds.js';
 import { formatNumber } from '../../utils/helpers.js';
 import { createCanvas, loadImage } from '@napi-rs/canvas';
 import '../../utils/fonts.js';
-import { getCardBackground, loadCardBackground } from '../../utils/backgroundImages.js';
+import { getCardBackground, loadCardBackground, fillCardColor } from '../../utils/backgroundImages.js';
 
 // Helper function to convert hex to rgba
 function hexToRgba(hex, opacity) {
@@ -83,11 +83,8 @@ export default {
         ctx.fillStyle = hexToRgba(overlayColor, overlayOpacity);
         ctx.fillRect(0, 0, canvas.width, canvas.height);
       } else {
-        const gradient = ctx.createLinearGradient(0, 0, 900, 300);
-        gradient.addColorStop(0, '#2C2F33');
-        gradient.addColorStop(1, '#23272A');
-        ctx.fillStyle = gradient;
-        ctx.fillRect(0, 0, 900, 300);
+        // No image, or it couldn't be loaded: the server's fallback color
+        fillCardColor(ctx, canvas.width, canvas.height, guildConfig);
       }
 
       // Accent bar at TOP with gradient
